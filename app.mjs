@@ -106,13 +106,13 @@ async function refresh() {
   $('balance').textContent = (a.balance || 0).toLocaleString();
   $('registered').textContent = a.registered ? '' : ' (hit the faucet to join)';
   if (a.registered) ME.registeryIndex = a.registery_index;
-  $('participants').textContent = `${st.participants} / ${st.min_participants}`;
+  $('participants').textContent = `${st.participants}`;
   $('roundpot').textContent = st.round_pot.toLocaleString();
   $('yourodds').textContent = (a.odds_pct ? a.odds_pct.toFixed(1) : '0.0') + '%';
   $('yourin').textContent = (a.your_contribution || 0).toLocaleString();
   // status
   let status, cls = '';
-  if (st.participants < st.min_participants) status = `waiting for players (need ${st.min_participants})`;
+  if (st.participants < st.min_participants) status = 'waiting for the first entry';
   else if (st.time_left > 0) status = `drawing in ${st.time_left}s`;
   else status = 'settling…';
   if (st.final_round) { status = '🔥 FINAL ROUND — guaranteed winner!'; cls = 'final'; }
@@ -121,6 +121,15 @@ async function refresh() {
   $('status').className = 'status ' + cls;
   $('winner').textContent = st.last_winner ? short(st.last_winner) : '—';
   $('enterbtn').disabled = !a.registered;
+  // recent draws feed
+  const mine = ME.accountKey.toLowerCase();
+  const feed = (st.recent_draws || []).map((dr) => {
+    if (dr.kind === 'rollover')
+      return `<div class="draw roll">round ${dr.round} · 🎲 no winner — ${Number(dr.amount).toLocaleString()} rolled over</div>`;
+    const won = (dr.winner || '').toLowerCase() === mine;
+    return `<div class="draw ${won ? 'mywin' : 'win'}">round ${dr.round} · 🏆 ${won ? 'YOU' : short(dr.winner)} won ${Number(dr.amount).toLocaleString()}</div>`;
+  }).join('');
+  $('draws').innerHTML = feed || '<div class="draw empty">no draws yet</div>';
 }
 
 async function doFaucet() {

@@ -40,6 +40,12 @@
   .logline { padding: 6px 10px; border-left: 2px solid #2b3545; margin-bottom: 4px; color: #9aa4b5; background: #0f141d; border-radius: 0 6px 6px 0; }
   .logline.ok { border-color: #5ee08a; color: #bfe9cd; }
   .logline.err { border-color: #f6614f; color: #f3b6ae; }
+  .feedtitle { font-size: 11px; color: #6b7689; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+  .draw { font-size: 13px; padding: 7px 10px; border-radius: 8px; margin-bottom: 5px; background: #0f141d; border: 1px solid #1d2531; }
+  .draw.win { color: #cdd6e5; }
+  .draw.mywin { color: #1a1300; background: #ffd75e; font-weight: 700; border-color: #ffd75e; }
+  .draw.roll { color: #9fb0ff; }
+  .draw.empty { color: #4b5468; }
   .foot { color: #4b5468; font-size: 11px; margin-top: 16px; line-height: 1.5; }
 </style>
 </head>
@@ -73,6 +79,11 @@
         <span class="chip" onclick="document.getElementById('amount').value=10000">10k</span>
       </div>
       <div style="margin-top:12px;font-size:12px;color:#6b7689">you've put in <b id="yourin" style="color:#d7dce5">0</b> this round · last winner: <span id="winner">—</span></div>
+    </div>
+
+    <div class="card">
+      <div class="feedtitle">recent draws</div>
+      <div id="draws"><div class="draw empty">no draws yet</div></div>
     </div>
 
     <div class="card me">
