@@ -16,6 +16,7 @@ const enc = new TextEncoder();
 const hx = (u) => Array.from(u).map((b) => b.toString(16).padStart(2, '0')).join('');
 const fromHex = (h) => Uint8Array.from(h.match(/.{1,2}/g).map((x) => parseInt(x, 16)));
 const beToBig = (u) => { let x = 0n; for (const c of u) x = (x << 8n) | BigInt(c); return x; };
+const leToBig = (u) => { let x = 0n; for (let i = u.length - 1; i >= 0; i--) x = (x << 8n) | BigInt(u[i]); return x; };
 const cat = (...a) => {
   const arr = a.map((x) => (x instanceof Uint8Array ? x : Uint8Array.from(x)));
   const n = arr.reduce((s, x) => s + x.length, 0);
@@ -73,6 +74,10 @@ function encCall(c) {
 }
 const sighash = (c) => tag256('Cube/sighash/entry/call', encCall(c));
 const sign = (secp, h) => bls.G2.hashToCurve(h, { DST: enc.encode('Cube/bls/message') }).multiply(blsScalar(secp)).toBytes();
+// Withdraw authorization sighash: tag(account_key ‖ u64le(amount) ‖ utf8(address)).
+// Must match the server's post_withdraw preimage byte-for-byte.
+const withdrawSighash = (accountKeyHex, amount, address) =>
+  tag256('Cube/sighash/arcade/withdraw', cat(fromHex(accountKeyHex), u64le(amount), enc.encode(address)));
 
 // ---- API ----
 const api = async (p, b) => {
@@ -158,11 +163,12 @@ function render(st) {
   if (st.explorer_url) { exp.href = st.explorer_url; exp.style.display = ''; }
   else { exp.style.display = 'none'; }
   const mine = ME.accountKey.toLowerCase();
+  const rlink = (n) => `<a class="rlink" href="#round/${n}">round ${n}</a>`;
   const feed = (st.recent_draws || []).map((dr) => {
     if (dr.kind === 'rollover')
-      return `<div class="draw roll">round ${dr.round} · 🎲 no winner — ${Number(dr.amount).toLocaleString()} rolled over</div>`;
+      return `<div class="draw roll">${rlink(dr.round)} · 🎲 no winner — ${Number(dr.amount).toLocaleString()} rolled over</div>`;
     const won = (dr.winner || '').toLowerCase() === mine;
-    return `<div class="draw ${won ? 'mywin' : 'win'}">round ${dr.round} · 🏆 ${won ? 'YOU' : short(dr.winner)} won ${Number(dr.amount).toLocaleString()}</div>`;
+    return `<div class="draw ${won ? 'mywin' : 'win'}">${rlink(dr.round)} · 🏆 ${won ? 'YOU' : short(dr.winner)} won ${Number(dr.amount).toLocaleString()}</div>`;
   }).join('');
   $('draws').innerHTML = feed || '<div class="draw empty">no draws yet</div>';
   renderStatus();
@@ -207,6 +213,94 @@ async function doEnter() {
     if (r.ok) flash(`Entered ${amount.toLocaleString()} into the jackpot!`, 'ok');
     else flash('Enter failed: ' + friendly(r.error), 'err');
   } catch (e) { flash('Enter error: ' + e.message, 'err'); }
+}
+
+async function doWithdraw() {
+  const address = ($('wdaddr').value || '').trim();
+  const amount = Math.max(0, parseInt($('wdamount').value || '0', 10));
+  if (!address) return flash('enter a destination address', 'err');
+  if (!amount) return flash('enter an amount', 'err');
+  $('withdrawbtn').disabled = true;
+  flash(`Withdrawing ${amount.toLocaleString()} to ${address.slice(0, 14)}…`);
+  try {
+    const sig = sign(fromHex(ME.secp), withdrawSighash(ME.accountKey, amount, address));
+    const r = await api('/api/withdraw', {
+      account_key: ME.accountKey, bls_key: ME.blsKey, address, amount, bls_signature: hx(sig),
+    });
+    if (r.ok) { flash(`Withdrew ${amount.toLocaleString()}! tx ${short(r.txid)}`, 'ok'); $('wdamount').value = ''; }
+    else flash('Withdraw failed: ' + friendly(r.error), 'err');
+  } catch (e) { flash('Withdraw error: ' + e.message, 'err'); }
+  $('withdrawbtn').disabled = false;
+}
+
+// ---- round details (provably-fair page, hash-routed: #round/<n>) ----
+function bandRow(label, lo, hi, space, cls, note) {
+  const pct = space > 0 ? Math.max(0.5, ((hi - lo) * 100) / space) : 0;
+  return `<div class="seg ${cls || ''}">
+    <div class="segbar" style="width:${pct.toFixed(2)}%"></div>
+    <div class="seginfo"><span>${label}</span><span class="segrange">[${lo.toLocaleString()}, ${hi.toLocaleString()})${note ? ' · ' + note : ''}</span></div>
+  </div>`;
+}
+function renderRound(d) {
+  if (d.error) return `<div class="card"><a class="back" href="#">← back</a><p>${d.error}</p></div>`;
+  const mine = ME.accountKey.toLowerCase();
+  // Client-side recompute of the draw from the public seed (LE, as the VM reads it).
+  let recomputed = null, ok = false;
+  try {
+    const r = leToBig(fromHex(d.seed_hex)) % BigInt(d.space);
+    recomputed = r.toString();
+    ok = Number(r) === d.r;
+  } catch (e) {}
+  const segs = (d.segments || []).map((s) => {
+    const isMe = (s.key || '').toLowerCase() === mine;
+    const who = isMe ? 'YOU' : short(s.key);
+    const note = s.winner ? '🏆 winner' : '';
+    return bandRow(`${who} · ${Number(s.contribution).toLocaleString()}`, s.lower, s.upper, d.space, (s.winner ? 'win' : '') + (isMe ? ' me' : ''), note);
+  }).join('');
+  const houseRow = d.house > 0
+    ? bandRow('house / rollover zone', d.round_total, d.space, d.space, 'house', d.rollover ? '🎲 landed here → rollover' : 'no winner if r lands here')
+    : '';
+  const outcome = d.rollover
+    ? `🎲 <b>No winner</b> — the draw landed in the rollover zone, so the entire ${Number(d.amount).toLocaleString()}-sat jackpot rolled into the next round.`
+    : `🏆 <b>${(d.winner || '').toLowerCase() === mine ? 'You' : short(d.winner)}</b> won the ${Number(d.amount).toLocaleString()}-sat jackpot.`;
+  return `<div class="card round">
+    <a class="back" href="#">← back to the jackpot</a>
+    <h2>Round ${d.round} ${d.final_round ? '<span class="finaltag">FINAL</span>' : ''}</h2>
+    <p class="rsum">${outcome}</p>
+    <div class="feedtitle">how the winner was chosen — provably fair</div>
+    <p class="rexp">Every entry claims a slice of the number line sized to its contribution. At close, the contract
+    snapshots a <b>Bitcoin block hash</b> as the random seed — nobody (not even the operator) can predict or
+    pick it. The draw is <code>r = seed mod space</code>; whichever slice contains <code>r</code> wins the whole
+    pot. A <b>house zone</b> (⅓ of the round, zero in a final round) sits past the entries, so ~25% of rounds
+    land there and roll over into a bigger jackpot. You can recompute it all yourself from the values below.</p>
+    <div class="kv"><span class="kvk">seed</span><code class="kvv">${d.seed_hex}</code></div>
+    <div class="rmath">
+      <div>round contributions = <b>${Number(d.round_total).toLocaleString()}</b></div>
+      <div>house zone = <b>${Number(d.house).toLocaleString()}</b></div>
+      <div>space = contributions + house = <b>${Number(d.space).toLocaleString()}</b></div>
+      <div>draw <code>r = seed mod space</code> = <b>${Number(d.r).toLocaleString()}</b>
+        ${recomputed !== null ? `<span class="${ok ? 'okv' : 'errv'}">${ok ? '✓ recomputed in your browser' : '✗ recompute=' + recomputed}</span>` : ''}</div>
+    </div>
+    <div class="feedtitle" style="margin-top:14px">the number line (${Number(d.space).toLocaleString()} wide)</div>
+    <div class="segs">${segs}${houseRow}</div>
+  </div>`;
+}
+async function showRound(n) {
+  if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; } // pause home updates
+  $('home').style.display = 'none';
+  const el = $('round'); el.style.display = '';
+  el.innerHTML = `<div class="card">loading round ${n}…</div>`;
+  try { el.innerHTML = renderRound(await api('/api/round/' + n)); }
+  catch (e) { el.innerHTML = `<div class="card"><a class="back" href="#">← back</a><p>failed to load round ${n}</p></div>`; }
+}
+function showHome() {
+  $('round').style.display = 'none';
+  $('home').style.display = '';
+  if (!ws) connectWS(); // resume push updates
+}
+function route() {
+  const m = (location.hash || '').match(/^#round\/(\d+)/);
+  if (m) showRound(parseInt(m[1], 10)); else showHome();
 }
 
 function hideBackup() {
@@ -257,9 +351,11 @@ function main() {
   $('newbtn').onclick = newPlayer;
   $('exportbtn').onclick = toggleExport;
   $('restorebtn').onclick = doRestore;
+  $('withdrawbtn').onclick = doWithdraw;
   $('copyphrase').onclick = () => copyText($('phraseout').textContent);
   flash('Welcome, ' + short(ME.accountKey) + '. Keys generated in your browser — back them up to restore later.', 'ok');
-  connectWS();
+  window.addEventListener('hashchange', route);
+  route(); // connects the WS on the home view, or shows a round-details page
   setInterval(() => { if (displayTimeLeft > 0 && lastState && lastState.participants >= lastState.min_participants) displayTimeLeft--; renderStatus(); }, 1000);
 }
 main();

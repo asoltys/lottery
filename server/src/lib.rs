@@ -29,10 +29,11 @@ use cube::inscriptive::state_manager::state_manager::STATE_MANAGER;
 use cube::inscriptive::sync_manager::sync_manager::SYNC_MANAGER;
 use cube::inscriptive::utxo_set::utxo_set::UTXO_SET;
 use cube::operative::run_args::chain::Chain;
-use cube::transmutative::hash::sha256;
+use cube::transmutative::bls::verify::bls_verify;
+use cube::transmutative::hash::{sha256, Hash, HashTag};
 use cube::transmutative::key::KeyHolder;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
@@ -91,6 +92,9 @@ struct ArcadeState {
     settler_reg_index: u64,
     last_winner: Arc<tokio::sync::Mutex<Option<String>>>,
     recent_draws: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    // Full per-round settlement records (seed, ranges, draw) for the
+    // provably-fair details page, keyed by round number.
+    round_details: Arc<tokio::sync::Mutex<HashMap<u64, Value>>>,
     exec_lock: Arc<tokio::sync::Mutex<()>>,
     tx: broadcast::Sender<()>, // "state changed" signal -> WebSocket push
 }
@@ -433,6 +437,75 @@ async fn post_call(State(s): State<ArcadeState>, Json(body): Json<CallReq>) -> J
     }
 }
 
+// Full provably-fair breakdown for one settled round.
+async fn get_round(State(s): State<ArcadeState>, Path(n): Path<u64>) -> Json<Value> {
+    match s.round_details.lock().await.get(&n) {
+        Some(v) => Json(v.clone()),
+        None => Json(json!({ "error": "unknown or not-yet-settled round" })),
+    }
+}
+
+// Withdraw an account's in-game balance to an arbitrary regtest address. This is
+// a custodial bridge: we verify the owner's BLS signature, debit the L2 balance,
+// and pay the equivalent on-chain from the engine's bitcoind wallet.
+#[derive(Deserialize)]
+struct WithdrawReq {
+    account_key: String,
+    bls_key: String,
+    address: String,
+    amount: u64,
+    bls_signature: String,
+}
+async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawReq>) -> Json<Value> {
+    let err = |m: &str| Json(json!({ "ok": false, "error": m }));
+    let account_key = match parse_hex::<32>(&body.account_key) { Some(a) => a, None => return err("bad account key") };
+    let bls_key = match parse_hex::<48>(&body.bls_key) { Some(b) => b, None => return err("bad bls key") };
+    let signature = match parse_hex::<96>(&body.bls_signature) { Some(x) => x, None => return err("bad signature") };
+    if body.amount == 0 {
+        return err("amount must be positive");
+    }
+    let address = match bitcoin::Address::from_str(&body.address) {
+        Ok(a) => a.assume_checked(),
+        Err(_) => return err("invalid address"),
+    };
+
+    // Authorize: BLS-verify a sighash over (account_key ‖ amount ‖ address) so
+    // only the key owner can move their balance.
+    let mut preimage = Vec::with_capacity(32 + 8 + body.address.len());
+    preimage.extend_from_slice(&account_key);
+    preimage.extend_from_slice(&body.amount.to_le_bytes());
+    preimage.extend_from_slice(body.address.as_bytes());
+    let sighash = preimage.hash(Some(HashTag::CustomString("Cube/sighash/arcade/withdraw".to_string())));
+    if !bls_verify(&bls_key, sighash, signature) {
+        return err("signature verification failed");
+    }
+
+    let _guard = s.exec_lock.lock().await;
+    let balance = match s.coin_manager.lock().await.get_account_balance(account_key) {
+        Some(b) => b,
+        None => return err("account has no balance"),
+    };
+    if body.amount > balance {
+        return err("insufficient balance");
+    }
+    let rpc = match s.rpc() { Some(r) => r, None => return err("bitcoin rpc unavailable") };
+    let txid = match rpc.send_to_address(&address, bitcoin::Amount::from_sat(body.amount), None, None, Some(false), None, None, None) {
+        Ok(t) => t,
+        Err(e) => return Json(json!({ "ok": false, "error": format!("payout failed: {}", e) })),
+    };
+    {
+        let mut cm = s.coin_manager.lock().await;
+        if cm.account_balance_down(account_key, body.amount).is_err() {
+            return err("debit failed");
+        }
+        let _ = cm.apply_changes();
+    }
+    s.mine(1); // confirm the payout
+    s.notify();
+    let new_balance = { s.coin_manager.lock().await.get_account_balance(account_key).unwrap_or(0) };
+    Json(json!({ "ok": true, "txid": txid.to_string(), "balance": new_balance }))
+}
+
 // The round-lifecycle loop: close + settle when a round is ripe.
 async fn lifecycle(s: ArcadeState) {
     loop {
@@ -457,7 +530,7 @@ async fn lifecycle(s: ArcadeState) {
         let streak = d.saturating_sub(w);
         let house = if streak >= 3 { 0 } else { round_total / 3 };
         let space = (round_total + house).max(1);
-        let seed_su = StackItem::new(seed).to_stack_uint().unwrap_or_else(|| StackUint::from(0u64));
+        let seed_su = StackItem::new(seed.clone()).to_stack_uint().unwrap_or_else(|| StackUint::from(0u64));
         let r = (seed_su % StackUint::from(space)).to_u64().unwrap_or(0);
         let rg = r + b2;
         let rollover = rg >= total2;
@@ -479,11 +552,51 @@ async fn lifecycle(s: ArcadeState) {
         let winner_key = if rollover { None } else { s.read_participant(idx).await.map(hex::encode) };
         let pot = { s.coin_manager.lock().await.get_contract_balance(s.contract_id).unwrap_or(0) };
         let round_no = d + 1;
+        // Capture the full settlement breakdown (entry bands + the draw) for the
+        // provably-fair details page, before settle advances the round markers.
+        let mut segments: Vec<Value> = Vec::new();
+        for i in rs..g {
+            let upper = s.read_cum(i).await;
+            let lower = if i == 0 { 0 } else { s.read_cum(i - 1).await };
+            segments.push(json!({
+                "key": s.read_participant(i).await.map(hex::encode).unwrap_or_default(),
+                "contribution": upper - lower,
+                "lower": lower.saturating_sub(b2), // round-local band start
+                "upper": upper.saturating_sub(b2), // round-local band end
+                "winner": !rollover && i == idx,
+            }));
+        }
+        let detail = json!({
+            "round": round_no,
+            "ts": now,
+            "kind": if rollover { "rollover" } else { "win" },
+            "winner": winner_key.clone(),
+            "amount": pot,
+            "seed_hex": hex::encode(&seed), // little-endian, as the VM reads it
+            "round_total": round_total,
+            "house": house,
+            "space": space,
+            "r": r,    // draw position within [0, space)
+            "rg": rg,  // global position (r + b)
+            "b": b2,
+            "total": total2,
+            "rollover": rollover,
+            "final_round": streak >= 3,
+            "duration": ROUND_DURATION,
+            "segments": segments,
+        });
         // 3) settle
         let settle_call = s.settler_call(contract, 2, vec![CalldataElement::U32(idx as u32)], target);
         match run_call(&s, &settle_call).await {
             Ok(_) => {
                 s.mine(1);
+                {
+                    let mut rd = s.round_details.lock().await;
+                    rd.insert(round_no, detail);
+                    while rd.len() > 500 {
+                        if let Some(&min) = rd.keys().min() { rd.remove(&min); } else { break; }
+                    }
+                }
                 let event = if rollover {
                     println!("arcade: round {} rolled over (jackpot grows to {})", round_no, pot);
                     json!({ "round": round_no, "kind": "rollover", "amount": pot, "ts": now })
@@ -595,6 +708,7 @@ pub async fn run_arcade(
         settler_reg_index,
         last_winner: Arc::new(tokio::sync::Mutex::new(None)),
         recent_draws: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        round_details: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         exec_lock: Arc::new(tokio::sync::Mutex::new(())),
         tx: tx.clone(),
     };
@@ -613,8 +727,10 @@ pub async fn run_arcade(
         .route("/", get(serve_index))
         .route("/bundle.js", get(serve_bundle))
         .route("/api/state", get(get_state))
+        .route("/api/round/:n", get(get_round))
         .route("/api/faucet", post(post_faucet))
         .route("/api/call", post(post_call))
+        .route("/api/withdraw", post(post_withdraw))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
