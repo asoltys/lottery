@@ -49,6 +49,15 @@
   .foot { color: #4b5468; font-size: 11px; margin-top: 16px; line-height: 1.5; }
   .foot a { color: #6b8cff; text-decoration: none; }
   .foot a:hover { text-decoration: underline; }
+  #exportbtn { background: #222b39; color: #aab4c4; font-size: 12px; padding: 8px 14px; }
+  .warn { color: #f3b6ae; font-size: 11px; margin: 10px 0 8px; }
+  .kv { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 6px; font-size: 12px; }
+  .kvk { color: #6b7689; width: 34px; flex: 0 0 auto; padding-top: 7px; }
+  .kvv { color: #d7dce5; word-break: break-all; flex: 1; background: #0f141d; border: 1px solid #1d2531; border-radius: 6px; padding: 6px 8px; line-height: 1.5; }
+  .mini { background: #222b39; color: #aab4c4; font-size: 11px; padding: 4px 10px; flex: 0 0 auto; align-self: flex-start; }
+  .restore-row { display: flex; gap: 8px; margin-top: 10px; }
+  .restore-row input { flex: 1; background: #0f141d; border: 1px solid #2b3545; border-radius: 8px; color: #fff; font-family: inherit; font-size: 12px; padding: 9px 10px; }
+  .restore-row button { background: #222b39; color: #aab4c4; flex: 0 0 auto; }
 </style>
 </head>
 <body>
@@ -91,6 +100,20 @@
     <div class="card me">
       <div>you are <b id="me">…</b></div>
       <button id="newbtn">new player</button>
+    </div>
+
+    <div class="card">
+      <div class="feedtitle">backup &amp; restore your key</div>
+      <button id="exportbtn">show backup</button>
+      <div id="backupbox" style="display:none">
+        <div class="warn">⚠️ Save this somewhere safe. Anyone with it controls your sats — it never leaves your browser.</div>
+        <div class="kv"><span class="kvk">nsec</span><code id="nsecout" class="kvv"></code><button id="copynsec" class="mini">copy</button></div>
+        <div class="kv"><span class="kvk">seed</span><span id="phraseout" class="kvv"></span><button id="copyphrase" class="mini">copy</button></div>
+      </div>
+      <div class="restore-row">
+        <input id="restoreinput" placeholder="paste nsec or 24-word seed phrase to restore" autocomplete="off" autocapitalize="off" spellcheck="false" />
+        <button id="restorebtn">restore</button>
+      </div>
     </div>
 
     <div id="log"></div>

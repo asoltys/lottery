@@ -6,6 +6,9 @@
 import { bls12_381 as bls } from '@noble/curves/bls12-381.js';
 import { schnorr } from '@noble/curves/secp256k1.js';
 import { sha256, sha512 } from '@noble/hashes/sha2.js';
+import { bech32 } from '@scure/base';
+import { entropyToMnemonic, mnemonicToEntropy, validateMnemonic } from '@scure/bip39';
+import { wordlist } from '@scure/bip39/wordlists/english.js';
 
 const Fr = bls.fields.Fr;
 const enc = new TextEncoder();
@@ -31,9 +34,28 @@ const tag512 = (t, m) => { const x = sha512(enc.encode(t)); return sha512(cat(x,
 const blsScalar = (secp) => beToBig(tag512('Cube/bls/secretkey', secp).slice(0, 48)) % Fr.ORDER;
 const blsPub = (secp) => bls.G1.Point.BASE.multiply(blsScalar(secp)).toBytes();
 const acctKey = (secp) => schnorr.getPublicKey(secp);
+function identityFromSecp(secpHex) {
+  const secp = fromHex(secpHex);
+  return { secp: secpHex, accountKey: hx(acctKey(secp)), blsKey: hx(blsPub(secp)) };
+}
 function newIdentity() {
-  const secp = crypto.getRandomValues(new Uint8Array(32));
-  return { secp: hx(secp), accountKey: hx(acctKey(secp)), blsKey: hx(blsPub(secp)) };
+  return identityFromSecp(hx(crypto.getRandomValues(new Uint8Array(32))));
+}
+// Backup formats for the per-tab secret key.
+const toNsec = (secpHex) => bech32.encode('nsec', bech32.toWords(fromHex(secpHex)));
+const toPhrase = (secpHex) => entropyToMnemonic(fromHex(secpHex), wordlist);
+function parseKey(input) {
+  const t = (input || '').trim();
+  if (t.toLowerCase().startsWith('nsec1')) {
+    const { prefix, words } = bech32.decode(t.toLowerCase());
+    if (prefix !== 'nsec') throw new Error('not an nsec');
+    const bytes = Uint8Array.from(bech32.fromWords(words));
+    if (bytes.length !== 32) throw new Error('bad nsec length');
+    return hx(bytes);
+  }
+  const words = t.toLowerCase().split(/\s+/).filter(Boolean).join(' ');
+  if (!validateMnemonic(words, wordlist)) throw new Error('not a valid nsec or 24-word seed phrase');
+  return hx(mnemonicToEntropy(words, wordlist));
 }
 
 // ---- Call SBE (matches Rust encode_sbe) ----
@@ -187,11 +209,46 @@ async function doEnter() {
   } catch (e) { flash('Enter error: ' + e.message, 'err'); }
 }
 
+function hideBackup() {
+  $('backupbox').style.display = 'none';
+  $('exportbtn').textContent = 'show backup';
+}
+
 function newPlayer() {
   ME = newIdentity(); saveMe();
   $('me').textContent = short(ME.accountKey);
+  hideBackup();
   flash('New player ' + short(ME.accountKey) + ' — hit the faucet to get sats.', 'ok');
   try { if (ws) ws.close(); } catch (e) {} // reconnect with the new account
+}
+
+function toggleExport() {
+  if ($('backupbox').style.display === 'none') {
+    $('nsecout').textContent = toNsec(ME.secp);
+    $('phraseout').textContent = toPhrase(ME.secp);
+    $('backupbox').style.display = '';
+    $('exportbtn').textContent = 'hide backup';
+  } else {
+    hideBackup();
+  }
+}
+
+function doRestore() {
+  const v = $('restoreinput').value;
+  if (!v.trim()) return;
+  try {
+    ME = identityFromSecp(parseKey(v)); saveMe();
+    $('me').textContent = short(ME.accountKey);
+    $('restoreinput').value = '';
+    hideBackup();
+    flash('Restored player ' + short(ME.accountKey) + '.', 'ok');
+    try { if (ws) ws.close(); } catch (e) {} // reconnect with restored account
+  } catch (e) { flash('Restore failed: ' + e.message, 'err'); }
+}
+
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); flash('copied to clipboard', 'ok'); }
+  catch (e) { flash('copy failed — select the text and copy manually', 'err'); }
 }
 
 function main() {
@@ -199,7 +256,11 @@ function main() {
   $('faucetbtn').onclick = doFaucet;
   $('enterbtn').onclick = doEnter;
   $('newbtn').onclick = newPlayer;
-  flash('Welcome, ' + short(ME.accountKey) + '. Keys generated in your browser.', 'ok');
+  $('exportbtn').onclick = toggleExport;
+  $('restorebtn').onclick = doRestore;
+  $('copynsec').onclick = () => copyText($('nsecout').textContent);
+  $('copyphrase').onclick = () => copyText($('phraseout').textContent);
+  flash('Welcome, ' + short(ME.accountKey) + '. Keys generated in your browser — back them up to restore later.', 'ok');
   connectWS();
   setInterval(() => { if (displayTimeLeft > 0 && lastState && lastState.participants >= lastState.min_participants) displayTimeLeft--; renderStatus(); }, 1000);
 }
