@@ -202,7 +202,6 @@ async function doFaucet() {
 async function doEnter() {
   const amount = Math.max(1, parseInt($('amount').value || '0', 10));
   $('enterbtn').disabled = true;
-  flash(`Signing entry of ${amount.toLocaleString()} in-browser (BLS)…`);
   try {
     const r = await enter(amount);
     if (r.ok) flash(`Entered ${amount.toLocaleString()} into the jackpot!`, 'ok');
