@@ -65,12 +65,10 @@ const KEY_K: u8 = 0x6b; // closed-at round number
 const KEY_SEED: u8 = 0x73; // seed
 const KEY_D: u8 = 0x64; // completed rounds
 const KEY_W: u8 = 0x77; // last-win round number
-const KEY_LW: u8 = 0x4c; // timestamp of the last win (for the daily guarantee)
 
 const ROUND_DURATION: u64 = 120; // seconds (must match the contract)
 const MIN_PARTICIPANTS: u64 = 1; // contract requires >= 1 entrant
 const FAUCET_GRANT: u64 = 10_000;
-const ONE_DAY: u64 = 86_400; // guaranteed winner if no win for this long (match contract)
 const ODDS_DENOM: u64 = 475; // house = round_total * 475 -> ~0.21% per-round win odds (match contract)
 const RAKE_PERCENT: u64 = 1; // operator rake taken from the pot on a win
 
@@ -78,7 +76,7 @@ const RAKE_PERCENT: u64 = 1; // operator rake taken from the pot on a win
 // 1% rake. The contract is registered on startup if not already present; the
 // operator account is registered so the rake transfers land and the operator
 // (whoever holds the phrase) can withdraw via /api/withdraw.
-const V3_BYTES_HEX: &str = "1470657270657475616c206a61636b706f74207633000305656e74657200010926000167ce0172ce8763bd0174cd680154ce9369760154cd01630167ce7ecd01700167ce7eb9757ccd0167ce5193690167cd6505636c6f736500001c000172ce0167ce946951a269bd0174ce01789369a269d30173cd0164ce519369016bcd6506736574746c6500010297006b016bce0164ce51936987690142ce0154ce946976014ccebd946903805101a26375006702db0195696893690173ce9669750142ce9369760154cea263750164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd676c009369766b7601637c7ece7c76008763750067517c946901637c7ece687ca5690164cb96697c7576008763756720a55068222783355b755993fe7e1ac0b190d29fa2689a9ebc041ff7252617dd0400cc686c01707c7ececb7c00cc0164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd0164ce0177cdbd014ccd6865";
+const V3_BYTES_HEX: &str = "1470657270657475616c206a61636b706f74207633000305656e74657200010926000167ce0172ce8763bd0174cd680154ce9369760154cd01630167ce7ecd01700167ce7eb9757ccd0167ce5193690167cd6505636c6f736500001c000172ce0167ce946951a269bd0174ce01789369a269d30173cd0164ce519369016bcd6506736574746c6500010288006b016bce0164ce51936987690142ce0154ce94697602db01956993690173ce9669750142ce9369760154cea263750164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd676c009369766b7601637c7ece7c76008763750067517c946901637c7ece687ca5690164cb96697c7576008763756720a55068222783355b755993fe7e1ac0b190d29fa2689a9ebc041ff7252617dd0400cc686c01707c7ececb7c00cc0164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd0164ce0177cd6865";
 const OPERATOR_ACCOUNT_HEX: &str = "a55068222783355b755993fe7e1ac0b190d29fa2689a9ebc041ff7252617dd04";
 const OPERATOR_BLS_HEX: &str = "b6b8aa94cee6ea6012dc787a11a1c6101f83fb5eb974a00b9d1defcf2be0e3afa44c09a1b7c06c9907c6f15cb9216a45";
 
@@ -282,9 +280,7 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
     let treasury = { s.coin_manager.lock().await.get_contract_balance(s.contract_id).unwrap_or(0) };
     let now = Utc::now().timestamp() as u64;
     let closed = k == d + 1;
-    let streak = d.saturating_sub(w);
-    let last_win = s.read_uint(&[KEY_LW]).await;
-    let final_round = now.saturating_sub(last_win) >= ONE_DAY; // guaranteed-winner round
+    let streak = d.saturating_sub(w); // rounds since the last win (rollover streak)
     let time_left = if count == 0 { ROUND_DURATION } else { (t + ROUND_DURATION).saturating_sub(now) };
     let tip = { s.sync_manager.lock().await.cube_batch_sync_height_tip() };
     let contract_ri = s.contract_registery_index().await;
@@ -301,10 +297,9 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
         "time_left": time_left,
         "closed": closed,
         "rollover_streak": streak,
-        "final_round": final_round,
-        // per-round chance that the pot is won (vs. rolls over): 100% on a
-        // guaranteed round, otherwise round_total / (round_total*(99+1)) = 1%.
-        "round_win_odds_pct": if final_round { 100.0 } else { 100.0 / (ODDS_DENOM as f64 + 1.0) },
+        // per-round chance that the pot is won (vs. rolls over):
+        // round_total / (round_total*(ODDS_DENOM+1)) = 1/(ODDS_DENOM+1).
+        "round_win_odds_pct": 100.0 / (ODDS_DENOM as f64 + 1.0),
         "rake_percent": RAKE_PERCENT,
         "last_winner": s.last_winner.lock().await.clone(),
         "recent_draws": s.recent_draws.lock().await.clone(),
@@ -545,10 +540,7 @@ async fn lifecycle(s: ArcadeState) {
         // 2) compute winner / rollover from the stored seed (mirror the contract)
         let (_g2, _rs2, _t2, _k2, _d2, _w2, total2, b2, _c2, seed) = round_view(&s).await;
         let round_total = total2.saturating_sub(b2);
-        let streak = d.saturating_sub(w);
-        let last_win = s.read_uint(&[KEY_LW]).await;
-        let guaranteed = now.saturating_sub(last_win) >= ONE_DAY; // >=1 day since last win
-        let house = if guaranteed { 0 } else { round_total * ODDS_DENOM };
+        let house = round_total * ODDS_DENOM; // win region is 1/(ODDS_DENOM+1) of space
         let space = (round_total + house).max(1);
         let seed_su = StackItem::new(seed.clone()).to_stack_uint().unwrap_or_else(|| StackUint::from(0u64));
         let r = (seed_su % StackUint::from(space)).to_u64().unwrap_or(0);
@@ -601,7 +593,6 @@ async fn lifecycle(s: ArcadeState) {
             "b": b2,
             "total": total2,
             "rollover": rollover,
-            "final_round": guaranteed,
             "rake_percent": RAKE_PERCENT,
             "duration": ROUND_DURATION,
             "segments": segments,

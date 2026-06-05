@@ -137,8 +137,7 @@ function renderStatus() {
   if (st.participants < st.min_participants) status = 'waiting for the first entry';
   else if (displayTimeLeft > 0) status = `drawing in ${displayTimeLeft}s`;
   else status = 'settling…';
-  if (st.final_round) { status = '🔥 GUARANTEED ROUND — someone wins this time!'; cls = 'final'; }
-  else if (st.rollover_streak > 0) status += `  ·  ${st.rollover_streak} rollover${st.rollover_streak > 1 ? 's' : ''}`;
+  if (st.rollover_streak > 0) status += `  ·  ${st.rollover_streak} rollover${st.rollover_streak > 1 ? 's' : ''}`;
   $('status').textContent = status;
   $('status').className = 'status ' + cls;
 }
@@ -270,20 +269,19 @@ function renderRound(d) {
     : `🏆 <b>${winnerName}</b> won the round. The ${Number(d.amount).toLocaleString()}-sat pot paid out <b>${Number(winnerAmt).toLocaleString()}</b> to the winner and a ${rakePct}% operator rake of <b>${Number(rake).toLocaleString()}</b>.`;
   return `<div class="card round">
     <a class="back" href="#">← back to the jackpot</a>
-    <h2>Round ${d.round} ${d.final_round ? '<span class="finaltag">GUARANTEED</span>' : ''}</h2>
+    <h2>Round ${d.round}</h2>
     <p class="rsum">${outcome}</p>
     <div class="feedtitle">how the winner was chosen — provably fair</div>
     <p class="rexp">Every entry claims a slice of the number line sized to its contribution. At close, the contract
     snapshots a <b>Bitcoin block hash</b> as the random seed — nobody (not even the operator) can predict or
     pick it. The draw is <code>r = seed mod space</code>; whichever slice contains <code>r</code> wins the pot
     (minus a ${rakePct}% operator rake). A large <b>house zone</b> past the entries makes the per-round win
-    chance about <b>${odds.toFixed(2)}%</b> — most rounds miss and roll the pot forward — except a
-    <b>guaranteed</b> round (at least once a day) where the house zone is zero and someone always wins. You can
-    recompute it all yourself from the values below.</p>
+    chance about <b>${odds.toFixed(2)}%</b>, so most rounds miss and roll the pot forward into a bigger
+    jackpot. You can recompute it all yourself from the values below.</p>
     <div class="kv"><span class="kvk">seed</span><code class="kvv">${d.seed_hex}</code></div>
     <div class="rmath">
       <div>round contributions = <b>${Number(d.round_total).toLocaleString()}</b></div>
-      <div>house zone = <b>${Number(d.house).toLocaleString()}</b>${d.final_round ? ' (guaranteed round)' : ''}</div>
+      <div>house zone = <b>${Number(d.house).toLocaleString()}</b></div>
       <div>space = contributions + house = <b>${Number(d.space).toLocaleString()}</b> → win chance <b>${odds.toFixed(2)}%</b></div>
       <div>draw <code>r = seed mod space</code> = <b>${Number(d.r).toLocaleString()}</b>
         ${recomputed !== null ? `<span class="${ok ? 'okv' : 'errv'}">${ok ? '✓ recomputed in your browser' : '✗ recompute=' + recomputed}</span>` : ''}</div>
