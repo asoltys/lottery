@@ -178,6 +178,16 @@ function connectWS() {
   ws.onerror = () => { try { ws.close(); } catch (e) {} };
 }
 
+// Switch the live connection to the current ME right away. Used after
+// restore/new-player so the balance updates instantly instead of waiting for
+// the 1.5s auto-reconnect (and we don't double-connect via the old onclose).
+function switchAccount() {
+  if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
+  connectWS();
+  // Belt-and-suspenders: also pull state over HTTP in case the socket is slow.
+  api(`/api/state?account=${ME.accountKey}`).then(render).catch(() => {});
+}
+
 async function doFaucet() {
   $('faucetbtn').disabled = true;
   flash('Requesting 10,000 sats from the faucet…');
@@ -210,7 +220,7 @@ function newPlayer() {
   $('me').textContent = short(ME.accountKey);
   hideBackup();
   flash('New player ' + short(ME.accountKey) + ' — hit the faucet to get sats.', 'ok');
-  try { if (ws) ws.close(); } catch (e) {} // reconnect with the new account
+  switchAccount();
 }
 
 function toggleExport() {
@@ -231,8 +241,8 @@ function doRestore() {
     $('me').textContent = short(ME.accountKey);
     $('restoreinput').value = '';
     hideBackup();
-    flash('Restored player ' + short(ME.accountKey) + '.', 'ok');
-    try { if (ws) ws.close(); } catch (e) {} // reconnect with restored account
+    flash('Restored player ' + short(ME.accountKey) + ' — loading balance…', 'ok');
+    switchAccount();
   } catch (e) { flash('Restore failed: ' + e.message, 'err'); }
 }
 
