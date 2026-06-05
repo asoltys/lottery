@@ -18,9 +18,10 @@ use cube::transmutative::key::{FromNostrKeyStr, KeyHolder};
 use std::env;
 use std::io::BufRead;
 
-// Lottery v3: 2-minute rounds, ~1% per-round win odds, guaranteed winner at
-// least once a day, and a 1% operator rake on wins. Registered on startup.
-const DEFAULT_CONTRACT: &str = "e55b4ace29c3f3260fca569f2ffb487ebc4763c091723e06efa03491b52ea51a";
+// Lottery v3: 2-minute rounds (timer starts at the first entry), ~0.21%
+// per-round win odds, guaranteed winner at least once a day, and a 1% operator
+// rake on wins. Registered on startup.
+const DEFAULT_CONTRACT: &str = "33857d711d2a117284869c940dc08284920136762b4529d1a4f35a923b8000d8";
 const DEFAULT_MINE_ADDR: &str = "bcrt1q6eveccs27r8ckn76chzwz0ajhe2qje5yp8ks8t";
 
 fn main() {
