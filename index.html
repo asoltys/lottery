@@ -47,6 +47,8 @@
   .draw.roll { color: #9fb0ff; }
   .draw.empty { color: #4b5468; }
   .foot { color: #4b5468; font-size: 11px; margin-top: 16px; line-height: 1.5; }
+  .foot a { color: #6b8cff; text-decoration: none; }
+  .foot a:hover { text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -95,8 +97,12 @@
 
     <div class="foot">
       Open this page in another tab to play as a different person. Contribute any amount — your odds are your share of the
-      round's pot. A round draws on a Bitcoin block hash once it has 5+ players and the timer runs out; ~1 in 4 rounds has no
+      round's pot. A round draws on a Bitcoin block hash once the timer runs out; ~1 in 4 rounds has no
       winner and the whole jackpot rolls into the next round. After 3 rollovers the next draw is a guaranteed payout.
+      <br><br>
+      <a href="https://github.com/asoltys/lottery" target="_blank" rel="noopener">source on GitHub</a>
+      · keys &amp; signatures made in your browser · running a forked
+      <a href="https://github.com/asoltys/cube" target="_blank" rel="noopener">Cube</a> engine
     </div>
   </div>
   <script type="module" src="/bundle.js"></script>
