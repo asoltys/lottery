@@ -62,15 +62,23 @@ const sighash = (c) => tag256('Cube/sighash/entry/call', encCall(c));
 const sign = (secp, h) => bls.G2.hashToCurve(h, { DST: enc.encode('Cube/bls/message') }).multiply(blsScalar(secp)).toBytes();
 
 // ---- API ----
-const api = async (p, b) => (await fetch(p, b ? { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) } : {})).json();
+const api = async (p, b) => {
+  const headers = { 'ngrok-skip-browser-warning': 'true' }; // harmless off-ngrok
+  const opt = b
+    ? { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: JSON.stringify(b) }
+    : { headers };
+  return (await fetch(p, opt)).json();
+};
 
 // ---- identity (per tab) ----
 let ME = JSON.parse(sessionStorage.getItem('cube_player') || 'null');
 const saveMe = () => sessionStorage.setItem('cube_player', JSON.stringify(ME));
 if (!ME) { ME = newIdentity(); saveMe(); }
 
+// Uses the latest pushed state (no polling).
 async function enter(amount) {
-  const st = await api('/api/state', null);
+  const st = lastState;
+  if (!st) throw new Error('not connected yet');
   const c = {
     accountKey: ME.accountKey, registeryIndex: ME.registeryIndex, blsKey: ME.blsKey,
     contractId: st.contract_id, contractRegisteryIndex: st.contract_registery_index,
@@ -99,29 +107,39 @@ function friendly(raw) {
   return raw.length > 100 ? raw.slice(0, 100) + '…' : raw;
 }
 
-async function refresh() {
-  const st = await api('/api/state?account=' + ME.accountKey, null);
-  $('jackpot').textContent = st.jackpot.toLocaleString();
-  const a = st.account || {};
-  $('balance').textContent = (a.balance || 0).toLocaleString();
-  $('registered').textContent = a.registered ? '' : ' (hit the faucet to join)';
-  if (a.registered) ME.registeryIndex = a.registery_index;
-  $('participants').textContent = `${st.participants}`;
-  $('roundpot').textContent = st.round_pot.toLocaleString();
-  $('yourodds').textContent = (a.odds_pct ? a.odds_pct.toFixed(1) : '0.0') + '%';
-  $('yourin').textContent = (a.your_contribution || 0).toLocaleString();
-  // status
+let lastState = null;
+let displayTimeLeft = 0;
+
+// Status line is re-derived every second from the cached state + a local
+// countdown, so the timer ticks smoothly without any network traffic.
+function renderStatus() {
+  const st = lastState;
+  if (!st) return;
   let status, cls = '';
   if (st.participants < st.min_participants) status = 'waiting for the first entry';
-  else if (st.time_left > 0) status = `drawing in ${st.time_left}s`;
+  else if (displayTimeLeft > 0) status = `drawing in ${displayTimeLeft}s`;
   else status = 'settling…';
   if (st.final_round) { status = '🔥 FINAL ROUND — guaranteed winner!'; cls = 'final'; }
   else if (st.rollover_streak > 0) status += `  ·  ${st.rollover_streak} rollover${st.rollover_streak > 1 ? 's' : ''}`;
   $('status').textContent = status;
   $('status').className = 'status ' + cls;
+}
+
+// Full render on each pushed state.
+function render(st) {
+  lastState = st;
+  displayTimeLeft = st.time_left;
+  $('jackpot').textContent = st.jackpot.toLocaleString();
+  const a = st.account || {};
+  $('balance').textContent = (a.balance || 0).toLocaleString();
+  $('registered').textContent = a.registered ? '' : ' (hit the faucet to join)';
+  if (a.registered) { ME.registeryIndex = a.registery_index; saveMe(); }
+  $('participants').textContent = `${st.participants}`;
+  $('roundpot').textContent = st.round_pot.toLocaleString();
+  $('yourodds').textContent = (a.odds_pct ? a.odds_pct.toFixed(1) : '0.0') + '%';
+  $('yourin').textContent = (a.your_contribution || 0).toLocaleString();
   $('winner').textContent = st.last_winner ? short(st.last_winner) : '—';
   $('enterbtn').disabled = !a.registered;
-  // recent draws feed
   const mine = ME.accountKey.toLowerCase();
   const feed = (st.recent_draws || []).map((dr) => {
     if (dr.kind === 'rollover')
@@ -130,6 +148,17 @@ async function refresh() {
     return `<div class="draw ${won ? 'mywin' : 'win'}">round ${dr.round} · 🏆 ${won ? 'YOU' : short(dr.winner)} won ${Number(dr.amount).toLocaleString()}</div>`;
   }).join('');
   $('draws').innerHTML = feed || '<div class="draw empty">no draws yet</div>';
+  renderStatus();
+}
+
+// ---- WebSocket (push) ----
+let ws = null;
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws?account=${ME.accountKey}`);
+  ws.onmessage = (ev) => { try { render(JSON.parse(ev.data)); } catch (e) {} };
+  ws.onclose = () => { setTimeout(connectWS, 1500); };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
 }
 
 async function doFaucet() {
@@ -140,8 +169,7 @@ async function doFaucet() {
     ME.registeryIndex = r.registery_index; saveMe();
     flash(`Faucet sent 10,000. Balance: ${r.balance.toLocaleString()}.`, 'ok');
   } catch (e) { flash('Faucet error: ' + e.message, 'err'); }
-  await refresh();
-  $('faucetbtn').disabled = false;
+  $('faucetbtn').disabled = false; // state update arrives via WS push
 }
 
 async function doEnter() {
@@ -153,23 +181,22 @@ async function doEnter() {
     if (r.ok) flash(`Entered ${amount.toLocaleString()} into the jackpot!`, 'ok');
     else flash('Enter failed: ' + friendly(r.error), 'err');
   } catch (e) { flash('Enter error: ' + e.message, 'err'); }
-  await refresh();
 }
 
 function newPlayer() {
   ME = newIdentity(); saveMe();
   $('me').textContent = short(ME.accountKey);
   flash('New player ' + short(ME.accountKey) + ' — hit the faucet to get sats.', 'ok');
-  refresh();
+  try { if (ws) ws.close(); } catch (e) {} // reconnect with the new account
 }
 
-async function main() {
+function main() {
   $('me').textContent = short(ME.accountKey);
   $('faucetbtn').onclick = doFaucet;
   $('enterbtn').onclick = doEnter;
   $('newbtn').onclick = newPlayer;
   flash('Welcome, ' + short(ME.accountKey) + '. Keys generated in your browser.', 'ok');
-  await refresh();
-  setInterval(refresh, 2000);
+  connectWS();
+  setInterval(() => { if (displayTimeLeft > 0 && lastState && lastState.participants >= lastState.min_participants) displayTimeLeft--; renderStatus(); }, 1000);
 }
 main();
