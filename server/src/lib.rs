@@ -188,11 +188,20 @@ fn asset(name: &str, embedded: &'static str) -> String {
     }
     embedded.to_string()
 }
-async fn serve_index() -> Html<String> {
-    Html(asset("index.html", INDEX_HTML))
+// no-store: the UI ships often and the index/bundle must stay in lockstep, so
+// never let a browser serve a stale bundle against fresh HTML (or vice versa).
+const NO_CACHE: &str = "no-store, must-revalidate";
+async fn serve_index() -> impl IntoResponse {
+    ([(header::CACHE_CONTROL, NO_CACHE)], Html(asset("index.html", INDEX_HTML)))
 }
 async fn serve_bundle() -> impl IntoResponse {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], asset("bundle.js", BUNDLE_JS))
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, NO_CACHE),
+        ],
+        asset("bundle.js", BUNDLE_JS),
+    )
 }
 
 // Commit the execution delta to permanent storage.
