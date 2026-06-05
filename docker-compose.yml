@@ -1,0 +1,31 @@
+# Lottery stack: a regtest bitcoind + the forked Cube engine with the arcade.
+# Copy .env.example to .env and fill it in, then: docker compose up -d --build
+#
+# Expose lotto.adamsoltys.com -> 127.0.0.1:8090 (arcade) with a cloudflared
+# tunnel; the explorer is on 127.0.0.1:8080.
+
+services:
+  bitcoind:
+    image: ghcr.io/coinos/bitcoin:31.0
+    restart: unless-stopped
+    volumes:
+      - ./data/bitcoin:/home/bitcoin/.bitcoin   # holds bitcoin.conf (regtest, rpc creds) + the chain
+    expose:
+      - "18443"
+
+  engine:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - bitcoind
+    command: ["archival", "regtest", "engine", "http://bitcoind:18443", "${RPC_USER}", "${RPC_PASS}", "false"]
+    environment:
+      - CUBE_ENGINE_NSEC=${CUBE_ENGINE_NSEC}
+      - CUBE_EXPLORER_PORT=8080
+      - CUBE_EXPLORER_URL=${CUBE_EXPLORER_URL:-}
+      - CUBE_MINE_ADDRESS=${CUBE_MINE_ADDRESS:-bcrt1q6eveccs27r8ckn76chzwz0ajhe2qje5yp8ks8t}
+    volumes:
+      - ./data/cube:/data/storage   # /data/storage/regtest = cube engine state
+    ports:
+      - "127.0.0.1:8090:8090"   # arcade
+      - "127.0.0.1:8080:8080"   # explorer

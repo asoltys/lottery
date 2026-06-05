@@ -63,10 +63,15 @@ fn main() {
         _ => SyncMode::ConfirmedOnly,
     };
 
-    // Read the engine nsec from stdin.
-    println!("Enter nsec:");
+    // Engine nsec: from CUBE_ENGINE_NSEC env (headless/container) or stdin prompt.
     let mut secret = [0xffu8; 32];
-    {
+    if let Ok(nsec) = env::var("CUBE_ENGINE_NSEC") {
+        match nsec.trim().from_nsec() {
+            Some(s) => secret = s,
+            None => return eprintln!("invalid CUBE_ENGINE_NSEC"),
+        }
+    } else {
+        println!("Enter nsec:");
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
             let line = line.unwrap();
