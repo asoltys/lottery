@@ -92,6 +92,13 @@ const api = async (p, b) => {
 let ME = JSON.parse(sessionStorage.getItem('cube_player') || 'null');
 const saveMe = () => sessionStorage.setItem('cube_player', JSON.stringify(ME));
 if (!ME || !ME.mnemonic) { ME = newIdentity(); saveMe(); }
+// "new player" opens a new tab with ?new — force a fresh identity there (a
+// same-origin new tab otherwise inherits a COPY of this tab's sessionStorage),
+// then strip the flag so a later refresh keeps the new player.
+if (new URLSearchParams(location.search).has('new')) {
+  ME = newIdentity(); saveMe();
+  history.replaceState(null, '', location.pathname);
+}
 
 // Uses the latest pushed state (no polling).
 async function enter(amount) {
@@ -314,11 +321,9 @@ function hideBackup() {
 }
 
 function newPlayer() {
-  ME = newIdentity(); saveMe();
-  $('me').textContent = short(ME.accountKey);
-  hideBackup();
-  flash('New player ' + short(ME.accountKey) + ' — hit the faucet to get sats.', 'ok');
-  switchAccount();
+  // Open a fresh player in a NEW tab instead of wiping this tab's keys.
+  window.open(location.pathname + '?new', '_blank');
+  flash('Opened a new player in a new tab.', 'ok');
 }
 
 function toggleExport() {
