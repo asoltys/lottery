@@ -16,6 +16,10 @@ services:
   engine:
     build: .
     restart: unless-stopped
+    # The engine's interactive CLI reads stdin; keep it open (with a tty) so the
+    # read blocks instead of hitting EOF and exiting in a detached container.
+    stdin_open: true
+    tty: true
     depends_on:
       - bitcoind
     command: ["archival", "regtest", "engine", "http://bitcoind:18443", "${RPC_USER}", "${RPC_PASS}", "false"]
