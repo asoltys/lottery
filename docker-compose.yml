@@ -28,8 +28,13 @@ services:
       - CUBE_EXPLORER_PORT=8080
       - CUBE_EXPLORER_URL=${CUBE_EXPLORER_URL:-}
       - CUBE_MINE_ADDRESS=${CUBE_MINE_ADDRESS:-bcrt1q6eveccs27r8ckn76chzwz0ajhe2qje5yp8ks8t}
+      # Serve the UI from the mounted files below so a `git pull` updates the
+      # client without rebuilding the image (falls back to the embedded copy).
+      - CUBE_ARCADE_ASSETS=/assets
     volumes:
       - ./data/cube:/data/storage   # /data/storage/regtest = cube engine state
+      - ./index.html:/assets/index.html:ro
+      - ./bundle.js:/assets/bundle.js:ro
     ports:
       - "127.0.0.1:8090:8090"   # arcade
       - "127.0.0.1:8080:8080"   # explorer
