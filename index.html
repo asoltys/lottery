@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cube Jackpot</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+         background: #0b0e14; color: #d7dce5; display: flex; justify-content: center; }
+  .wrap { width: 100%; max-width: 560px; padding: 28px 20px 60px; }
+  h1 { font-size: 22px; margin: 0 0 4px; color: #fff; letter-spacing: .5px; }
+  .sub { color: #6b7689; font-size: 12px; margin-bottom: 20px; }
+  .card { background: #141a24; border: 1px solid #222b39; border-radius: 12px; padding: 18px 20px; margin-bottom: 14px; }
+  .jackpot { text-align: center; }
+  .jackpot .amt { font-size: 46px; font-weight: 800; color: #ffd75e; line-height: 1.1; }
+  .jackpot .lbl { color: #6b7689; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; }
+  .status { text-align: center; margin-top: 10px; font-size: 13px; color: #9fb0ff; }
+  .status.final { color: #ff8f5e; font-weight: 700; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .stat { background: #0f141d; border: 1px solid #1d2531; border-radius: 8px; padding: 10px 12px; }
+  .stat .v { font-size: 19px; color: #fff; }
+  .stat .k { font-size: 11px; color: #6b7689; text-transform: uppercase; letter-spacing: .5px; }
+  .bal { color: #5ee08a !important; }
+  .enter-row { display: flex; gap: 10px; margin-top: 4px; align-items: stretch; }
+  input { flex: 1; background: #0f141d; border: 1px solid #2b3545; border-radius: 10px; color: #fff;
+          font-family: inherit; font-size: 16px; padding: 0 14px; }
+  button { padding: 13px 16px; font-size: 15px; font-weight: 600; border: 0; border-radius: 10px; cursor: pointer; font-family: inherit; }
+  button:hover:not(:disabled) { filter: brightness(1.12); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  #faucetbtn { background: #2f6df6; color: #fff; width: 100%; margin-bottom: 12px; }
+  #enterbtn { background: #ffd75e; color: #1a1300; flex: 0 0 auto; }
+  .chips { display: flex; gap: 8px; margin-top: 8px; }
+  .chip { background: #1b2230; color: #aab4c4; border: 1px solid #2b3545; border-radius: 999px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  .me { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #8a94a6; }
+  .me b { color: #d7dce5; }
+  #newbtn { background: #222b39; color: #aab4c4; font-size: 12px; padding: 8px 14px; }
+  #log { margin-top: 16px; font-size: 12px; max-height: 200px; overflow-y: auto; }
+  .logline { padding: 6px 10px; border-left: 2px solid #2b3545; margin-bottom: 4px; color: #9aa4b5; background: #0f141d; border-radius: 0 6px 6px 0; }
+  .logline.ok { border-color: #5ee08a; color: #bfe9cd; }
+  .logline.err { border-color: #f6614f; color: #f3b6ae; }
+  .foot { color: #4b5468; font-size: 11px; margin-top: 16px; line-height: 1.5; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>🎰 Cube Jackpot</h1>
+    <div class="sub">proportional odds · rolls over until someone wins · keys &amp; signatures made in your browser</div>
+
+    <div class="card jackpot">
+      <div class="amt"><span id="jackpot">0</span></div>
+      <div class="lbl">sats in the jackpot</div>
+      <div class="status" id="status">—</div>
+    </div>
+
+    <div class="card">
+      <div class="grid" style="margin-bottom:12px">
+        <div class="stat"><div class="v bal"><span id="balance">0</span></div><div class="k">your balance<span id="registered"></span></div></div>
+        <div class="stat"><div class="v"><span id="participants">0 / 5</span></div><div class="k">players this round</div></div>
+        <div class="stat"><div class="v"><span id="yourodds">0%</span></div><div class="k">your odds</div></div>
+        <div class="stat"><div class="v"><span id="roundpot">0</span></div><div class="k">this round's pot</div></div>
+      </div>
+      <button id="faucetbtn">💧 Get 10,000 sats from faucet</button>
+      <div class="enter-row">
+        <input id="amount" type="number" min="1" value="2000" />
+        <button id="enterbtn" disabled>Enter</button>
+      </div>
+      <div class="chips">
+        <span class="chip" onclick="document.getElementById('amount').value=1000">1k</span>
+        <span class="chip" onclick="document.getElementById('amount').value=2000">2k</span>
+        <span class="chip" onclick="document.getElementById('amount').value=5000">5k</span>
+        <span class="chip" onclick="document.getElementById('amount').value=10000">10k</span>
+      </div>
+      <div style="margin-top:12px;font-size:12px;color:#6b7689">you've put in <b id="yourin" style="color:#d7dce5">0</b> this round · last winner: <span id="winner">—</span></div>
+    </div>
+
+    <div class="card me">
+      <div>you are <b id="me">…</b></div>
+      <button id="newbtn">new player</button>
+    </div>
+
+    <div id="log"></div>
+
+    <div class="foot">
+      Open this page in another tab to play as a different person. Contribute any amount — your odds are your share of the
+      round's pot. A round draws on a Bitcoin block hash once it has 5+ players and the timer runs out; ~1 in 4 rounds has no
+      winner and the whole jackpot rolls into the next round. After 3 rollovers the next draw is a guaranteed payout.
+    </div>
+  </div>
+  <script type="module" src="/bundle.js"></script>
+</body>
+</html>
