@@ -278,6 +278,7 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
         "last_winner": s.last_winner.lock().await.clone(),
         "recent_draws": s.recent_draws.lock().await.clone(),
         "entry_cost_hint": FAUCET_GRANT,
+        "explorer_url": std::env::var("CUBE_EXPLORER_URL").ok(),
     });
 
     if let Some(acct_hex) = account {

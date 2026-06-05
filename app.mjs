@@ -140,6 +140,10 @@ function render(st) {
   $('yourin').textContent = (a.your_contribution || 0).toLocaleString();
   $('winner').textContent = st.last_winner ? short(st.last_winner) : '—';
   $('enterbtn').disabled = !a.registered;
+  // optional block-explorer link (set server-side via CUBE_EXPLORER_URL)
+  const exp = $('explorerlink');
+  if (st.explorer_url) { exp.href = st.explorer_url; exp.style.display = ''; }
+  else { exp.style.display = 'none'; }
   const mine = ME.accountKey.toLowerCase();
   const feed = (st.recent_draws || []).map((dr) => {
     if (dr.kind === 'rollover')

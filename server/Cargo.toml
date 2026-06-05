@@ -12,7 +12,11 @@ name = "lottery-engine"
 path = "src/main.rs"
 
 [dependencies]
-cube = { path = "/home/adam/cube" }
+# The forked Cube engine. For local cube development, override with a path dep,
+# e.g. add to ~/.cargo/config.toml:
+#   [patch."https://github.com/asoltys/cube"]
+#   cube = { path = "/home/adam/cube" }
+cube = { git = "https://github.com/asoltys/cube", branch = "local/regtest-network" }
 axum = { version = "0.7.9", features = ["ws"] }
 tokio = { version = "1.40.0", features = ["full"] }
 serde = { version = "1.0.216", features = ["derive"] }
