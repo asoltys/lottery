@@ -100,7 +100,7 @@
       <div class="grid" style="margin-bottom:12px">
         <div class="stat"><div class="v bal"><span id="balance">0</span></div><div class="k">your balance<span id="registered"></span></div></div>
         <div class="stat"><div class="v"><span id="participants">0 / 5</span></div><div class="k">players this round</div></div>
-        <div class="stat"><div class="v"><span id="yourodds">0%</span></div><div class="k">your odds</div></div>
+        <div class="stat"><div class="v"><span id="yourodds">0%</span></div><div class="k">your share of pot</div></div>
         <div class="stat"><div class="v"><span id="roundpot">0</span></div><div class="k">this round's pot</div></div>
       </div>
       <button id="faucetbtn">💧 Get 10,000 sats from faucet</button>
@@ -155,9 +155,10 @@
     <div id="log"></div>
 
     <div class="foot">
-      Open this page in another tab to play as a different person. Contribute any amount — your odds are your share of the
-      round's pot. A round draws on a Bitcoin block hash once the timer runs out; ~1 in 4 rounds has no
-      winner and the whole jackpot rolls into the next round. After 3 rollovers the next draw is a guaranteed payout.
+      Open this page in another tab to play as a different person. Contribute any amount — your share of the
+      round's pot is your share of the win. Rounds last 2 minutes and draw on a Bitcoin block hash; only about
+      1 in 100 rounds pays out (the rest roll the jackpot forward), with a guaranteed winner at least once a day.
+      The operator takes a 1% rake on each win. Click any round number to verify the draw.
       <br><br>
       <a href="https://github.com/asoltys/lottery" target="_blank" rel="noopener">source on GitHub</a>
       · <a id="explorerlink" href="#" target="_blank" rel="noopener" style="display:none">block explorer</a>
@@ -168,6 +169,6 @@
 
     <div id="round" style="display:none"></div>
   </div>
-  <script type="module" src="/bundle.js?v=7aae5dc6"></script>
+  <script type="module" src="/bundle.js?v=1d8d043c"></script>
 </body>
 </html>

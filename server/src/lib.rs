@@ -15,6 +15,7 @@ use cube::constructive::core_types::ops_budget::ops_budget::OpsBudget;
 use cube::constructive::core_types::ops_price::ops_price::OpsPrice;
 use cube::constructive::core_types::target::target::Target;
 use cube::constructive::entry::entry_kinds::call::call::Call;
+use cube::executive::executable::compiler::compiler::ProgramCompiler;
 use cube::executive::exec_ctx::exec_ctx::{ExecCtx, EXEC_CTX};
 use cube::executive::stack::stack_item::StackItem;
 use cube::executive::stack::stack_uint::{SafeConverter, StackItemUintExt, StackUint};
@@ -64,10 +65,22 @@ const KEY_K: u8 = 0x6b; // closed-at round number
 const KEY_SEED: u8 = 0x73; // seed
 const KEY_D: u8 = 0x64; // completed rounds
 const KEY_W: u8 = 0x77; // last-win round number
+const KEY_LW: u8 = 0x4c; // timestamp of the last win (for the daily guarantee)
 
-const ROUND_DURATION: u64 = 60; // seconds (must match the contract)
+const ROUND_DURATION: u64 = 120; // seconds (must match the contract)
 const MIN_PARTICIPANTS: u64 = 1; // contract requires >= 1 entrant
 const FAUCET_GRANT: u64 = 10_000;
+const ONE_DAY: u64 = 86_400; // guaranteed winner if no win for this long (match contract)
+const ODDS_DENOM: u64 = 99; // house = round_total * 99 -> ~1% per-round win odds (match contract)
+const RAKE_PERCENT: u64 = 1; // operator rake taken from the pot on a win
+
+// Lottery v3 program (compiled bytecode) + operator account that accrues the
+// 1% rake. The contract is registered on startup if not already present; the
+// operator account is registered so the rake transfers land and the operator
+// (whoever holds the phrase) can withdraw via /api/withdraw.
+const V3_BYTES_HEX: &str = "1470657270657475616c206a61636b706f74207633000305656e7465720001091c000154ce9369760154cd01630167ce7ecd01700167ce7eb9757ccd0167ce5193690167cd6505636c6f736500001c000172ce0167ce946951a269bd0174ce01789369a269d30173cd0164ce519369016bcd6506736574746c6500010297006b016bce0164ce51936987690142ce0154ce946976014ccebd946903805101a263750067016395696893690173ce9669750142ce9369760154cea263750164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd676c009369766b7601637c7ece7c76008763750067517c946901637c7ece687ca5690164cb96697c7576008763756720a55068222783355b755993fe7e1ac0b190d29fa2689a9ebc041ff7252617dd0400cc686c01707c7ececb7c00cc0164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd0164ce0177cdbd014ccd6865";
+const OPERATOR_ACCOUNT_HEX: &str = "a55068222783355b755993fe7e1ac0b190d29fa2689a9ebc041ff7252617dd04";
+const OPERATOR_BLS_HEX: &str = "b6b8aa94cee6ea6012dc787a11a1c6101f83fb5eb974a00b9d1defcf2be0e3afa44c09a1b7c06c9907c6f15cb9216a45";
 
 #[derive(Clone)]
 struct ArcadeState {
@@ -270,7 +283,8 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
     let now = Utc::now().timestamp() as u64;
     let closed = k == d + 1;
     let streak = d.saturating_sub(w);
-    let final_round = streak >= 3;
+    let last_win = s.read_uint(&[KEY_LW]).await;
+    let final_round = now.saturating_sub(last_win) >= ONE_DAY; // guaranteed-winner round
     let time_left = if count == 0 { ROUND_DURATION } else { (t + ROUND_DURATION).saturating_sub(now) };
     let tip = { s.sync_manager.lock().await.cube_batch_sync_height_tip() };
     let contract_ri = s.contract_registery_index().await;
@@ -288,6 +302,10 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
         "closed": closed,
         "rollover_streak": streak,
         "final_round": final_round,
+        // per-round chance that the pot is won (vs. rolls over): 100% on a
+        // guaranteed round, otherwise round_total / (round_total*(99+1)) = 1%.
+        "round_win_odds_pct": if final_round { 100.0 } else { 100.0 / (ODDS_DENOM as f64 + 1.0) },
+        "rake_percent": RAKE_PERCENT,
         "last_winner": s.last_winner.lock().await.clone(),
         "recent_draws": s.recent_draws.lock().await.clone(),
         "entry_cost_hint": FAUCET_GRANT,
@@ -524,11 +542,13 @@ async fn lifecycle(s: ArcadeState) {
             eprintln!("arcade: close failed: {}", e);
             continue;
         }
-        // 2) compute winner / rollover from the stored seed
+        // 2) compute winner / rollover from the stored seed (mirror the contract)
         let (_g2, _rs2, _t2, _k2, _d2, _w2, total2, b2, _c2, seed) = round_view(&s).await;
         let round_total = total2.saturating_sub(b2);
         let streak = d.saturating_sub(w);
-        let house = if streak >= 3 { 0 } else { round_total / 3 };
+        let last_win = s.read_uint(&[KEY_LW]).await;
+        let guaranteed = now.saturating_sub(last_win) >= ONE_DAY; // >=1 day since last win
+        let house = if guaranteed { 0 } else { round_total * ODDS_DENOM };
         let space = (round_total + house).max(1);
         let seed_su = StackItem::new(seed.clone()).to_stack_uint().unwrap_or_else(|| StackUint::from(0u64));
         let r = (seed_su % StackUint::from(space)).to_u64().unwrap_or(0);
@@ -581,7 +601,8 @@ async fn lifecycle(s: ArcadeState) {
             "b": b2,
             "total": total2,
             "rollover": rollover,
-            "final_round": streak >= 3,
+            "final_round": guaranteed,
+            "rake_percent": RAKE_PERCENT,
             "duration": ROUND_DURATION,
             "segments": segments,
         });
@@ -678,6 +699,61 @@ pub async fn run_arcade(
         }
         let _ = cm.apply_changes();
     }
+
+    // Register the operator account (receives the 1% rake) if absent.
+    if let (Some(op_acct), Some(op_bls)) = (parse_hex::<32>(OPERATOR_ACCOUNT_HEX), parse_hex::<48>(OPERATOR_BLS_HEX)) {
+        let now = Utc::now().timestamp() as u64;
+        let already = { registery.lock().await.get_account_info_by_account_key(op_acct).is_some() };
+        if !already {
+            let mut reg = registery.lock().await;
+            let _ = reg.register_account(op_acct, now, Some(op_bls), None, None, None);
+            let _ = reg.apply_changes();
+        }
+        let mut cm = coin_manager.lock().await;
+        if cm.get_account_balance(op_acct).is_none() {
+            let _ = cm.register_account(op_acct, 0);
+        }
+        let _ = cm.apply_changes();
+    }
+
+    // Deploy the lottery v3 program (decompiled from embedded bytecode) if it
+    // isn't registered yet. The arcade executes calls directly against the
+    // managers, so a direct registration is all the engine needs.
+    if registery.lock().await.get_contract_by_contract_id(contract_id).is_none() {
+        match hex::decode(V3_BYTES_HEX) {
+            Ok(bytes) => {
+                let mut it = bytes.into_iter();
+                match cube::executive::executable::executable::Program::decompile(&mut it) {
+                    Ok(program) if program.contract_id() == contract_id => {
+                        let now = Utc::now().timestamp() as u64;
+                        {
+                            let mut reg = registery.lock().await;
+                            let _ = reg.register_contract(contract_id, now, program);
+                            let _ = reg.apply_changes();
+                        }
+                        {
+                            let mut cm = coin_manager.lock().await;
+                            let _ = cm.register_contract(contract_id, 0);
+                            let _ = cm.apply_changes();
+                        }
+                        {
+                            let mut sm = state_manager.lock().await;
+                            let _ = sm.register_contract(contract_id);
+                            let _ = sm.apply_changes();
+                        }
+                        println!("arcade: registered lottery v3 contract {}", hex::encode(contract_id));
+                    }
+                    Ok(program) => eprintln!(
+                        "arcade: v3 bytecode contract_id {} != configured {}; not registering",
+                        hex::encode(program.contract_id()), hex::encode(contract_id)
+                    ),
+                    Err(e) => eprintln!("arcade: failed to decompile v3 bytecode: {:?}", e),
+                }
+            }
+            Err(e) => eprintln!("arcade: bad V3 bytecode hex: {}", e),
+        }
+    }
+
     let settler_reg_index = registery
         .lock()
         .await
