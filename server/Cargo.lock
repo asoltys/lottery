@@ -728,7 +728,7 @@ dependencies = [
 [[package]]
 name = "cube"
 version = "0.1.2"
-source = "git+https://github.com/asoltys/cube?branch=local%2Fregtest-network#609381c48db6f63a271275f0129204b371b50713"
+source = "git+https://github.com/asoltys/cube?branch=local%2Fregtest-network#b201bc34deba621df572a36b5643d712280461a0"
 dependencies = [
  "async-trait",
  "axum",
