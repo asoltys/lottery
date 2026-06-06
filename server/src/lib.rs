@@ -228,8 +228,15 @@ async fn serve_bundle() -> impl IntoResponse {
 
 // Commit the execution delta to permanent storage.
 async fn commit(s: &ArcadeState) {
-    let _ = s.coin_manager.lock().await.apply_changes();
-    let _ = s.state_manager.lock().await.apply_changes();
+    // Surface apply_changes failures: a swallowed coin-manager error leaves a
+    // PARTIAL commit (e.g. balance written but shadow allocs not), which shows up
+    // as a custody gap (jackpot != Σ exitable claims) after a restart.
+    if let Err(e) = s.coin_manager.lock().await.apply_changes() {
+        eprintln!("arcade: coin_manager.apply_changes FAILED: {:?}", e);
+    }
+    if let Err(e) = s.state_manager.lock().await.apply_changes() {
+        eprintln!("arcade: state_manager.apply_changes FAILED: {:?}", e);
+    }
     let _ = s.registery.lock().await.apply_changes();
     let _ = s.graveyard.lock().await.apply_changes();
     let _ = s.privileges_manager.lock().await.apply_changes();
