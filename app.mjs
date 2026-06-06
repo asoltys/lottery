@@ -178,6 +178,32 @@ function render(st) {
   }).join('');
   $('draws').innerHTML = feed || '<div class="draw empty">no draws yet</div>';
   renderStatus();
+  refreshExitProof();
+}
+
+// Non-custodial proof: show the player that their live stake is a unilaterally
+// exitable VTXO (rendered by the engine from the contract's shadow claims).
+async function refreshExitProof() {
+  const el = $('exitproof');
+  if (!el || !ME.accountKey) return;
+  try {
+    const x = await api(`/api/exit?account=${ME.accountKey}`);
+    if (x.exitable) {
+      el.innerHTML =
+        `🔓 <b>Non-custodial</b> — your <b>${Number(x.value_sats).toLocaleString()}</b> sat stake is a ` +
+        `Projector value-bound VTXO you can sweep to Bitcoin with <b>only your key</b> ` +
+        `(CSV ${x.exit_delay_blocks} blocks); the operator can't hold it.` +
+        `<details><summary>exit proof</summary>` +
+        `<code>vtxo spk: ${x.vtxo_scriptpubkey}</code>` +
+        `<code>exit script: ${x.exit_script}</code>` +
+        `<code>control block: ${x.exit_control_block}</code></details>`;
+    } else {
+      el.innerHTML =
+        `🔓 <b>Non-custodial</b> — no live stake this round. Winnings are paid to your ` +
+        `exitable account balance; stake in a round and it becomes an exitable VTXO claim.`;
+    }
+    el.style.display = '';
+  } catch (e) {}
 }
 
 // ---- WebSocket (push) ----

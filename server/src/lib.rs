@@ -71,12 +71,19 @@ const MIN_PARTICIPANTS: u64 = 1; // contract requires >= 1 entrant
 const FAUCET_GRANT: u64 = 10_000;
 const ODDS_DENOM: u64 = 475; // house = round_total * 475 -> ~0.21% per-round win odds (match contract)
 const RAKE_PERCENT: u64 = 1; // operator rake taken from the pot on a win
+// Exit-tree params for the /api/exit non-custodial proof (VTXO unilateral exit).
+const EXIT_TREE_EXIT_DELAY: u16 = 144; // CSV blocks before a holder can sweep
+const EXIT_TREE_EXPIRY_WINDOW: u64 = 12_960; // CLTV engine-reclaim window above tip
 
 // Lottery v3 program (compiled bytecode) + operator account that accrues the
 // 1% rake. The contract is registered on startup if not already present; the
 // operator account is registered so the rake transfers land and the operator
 // (whoever holds the phrase) can withdraw via /api/withdraw.
-const V3_BYTES_HEX: &str = "1470657270657475616c206a61636b706f74207633000305656e74657200010926000167ce0172ce8763bd0174cd680154ce9369760154cd01630167ce7ecd01700167ce7eb9757ccd0167ce5193690167cd6505636c6f736500001c000172ce0167ce946951a269bd0174ce01789369a269d30173cd0164ce519369016bcd6506736574746c6500010288006b016bce0164ce51936987690142ce0154ce94697602db01956993690173ce9669750142ce9369760154cea263750164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd676c009369766b7601637c7ece7c76008763750067517c946901637c7ece687ca5690164cb96697c7576008763756720a55068222783355b755993fe7e1ac0b190d29fa2689a9ebc041ff7252617dd0400cc686c01707c7ececb7c00cc0164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd0164ce0177cd6865";
+// Lottery v4 (non-custodial): stakes are shadow-allocated claims (exitable VTXOs)
+// while the round is live; a win zeroes the claims before paying out. Same
+// draw/odds/rake rules as v3. contract_id
+// 82b2b9530ee1e22739dff2653bb95c6495f151bb3ea9b0930c852aa574a62fdd
+const V3_BYTES_HEX: &str = "2470657270657475616c206a61636b706f7420763420286e6f6e2d637573746f6469616c29000305656e7465720001092a0076b975c40167ce0172ce8763bd0174cd680154ce9369760154cd01630167ce7ecd01700167ce7eb9757ccd0167ce5193690167cd6505636c6f736500001c000172ce0167ce946951a269bd0174ce01789369a269d30173cd0164ce519369016bcd6506736574746c650001028a006b016bce0164ce51936987690142ce0154ce94697602db01956993690173ce9669750142ce9369760154cea263750164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd676c009369766b7601637c7ece7c76008763750067517c946901637c7ece687ca569c9c70164cb96697c7576008763756720a55068222783355b755993fe7e1ac0b190d29fa2689a9ebc041ff7252617dd0400cc686c01707c7ececb7c00cc0164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd0164ce0177cd6865";
 const OPERATOR_ACCOUNT_HEX: &str = "a55068222783355b755993fe7e1ac0b190d29fa2689a9ebc041ff7252617dd04";
 const OPERATOR_BLS_HEX: &str = "b6b8aa94cee6ea6012dc787a11a1c6101f83fb5eb974a00b9d1defcf2be0e3afa44c09a1b7c06c9907c6f15cb9216a45";
 
@@ -398,6 +405,15 @@ async fn post_faucet(State(s): State<ArcadeState>, Json(body): Json<FaucetReq>) 
             }
         }
         let _ = cm.apply_changes();
+        // Non-custodial: allocate the player in the lottery contract's shadow
+        // space once, so each `enter` can shadow_up their stake as an exitable
+        // claim. (contract_shadow_alloc_account errors on an existing entry, so
+        // only allocate when there is none — incl. after a win's down_all, which
+        // leaves a zeroed entry.)
+        if cm.get_shadow_alloc_value_in_satoshis(s.contract_id, account_key).is_none() {
+            let _ = cm.contract_shadow_alloc_account(s.contract_id, account_key);
+            let _ = cm.apply_changes();
+        }
     }
     let reg_index = {
         s.registery.lock().await.get_account_info_by_account_key(account_key).map(|(_, _, idx, _)| idx).unwrap_or(0)
@@ -455,6 +471,66 @@ async fn get_round(State(s): State<ArcadeState>, Path(n): Path<u64>) -> Json<Val
     match s.round_details.lock().await.get(&n) {
         Some(v) => Json(v.clone()),
         None => Json(json!({ "error": "unknown or not-yet-settled round" })),
+    }
+}
+
+// Non-custodial proof: render the contract's current shadow claims as a timeout
+// tree of unilaterally-exitable VTXOs and return THIS account's leaf — the value
+// it can sweep to Bitcoin with only its own key (CSV exit path), no operator
+// cooperation. This is what makes the live jackpot non-custodial: your stake is
+// always an exitable claim, not trusted to us.
+async fn get_exit(State(s): State<ArcadeState>, Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+    use cube::constructive::txout_types::timeout_tree::TimeoutTree;
+    let account = match params.get("account").and_then(|a| parse_hex::<32>(a)) {
+        Some(a) => a,
+        None => return Json(json!({ "error": "bad account" })),
+    };
+    let allocations = {
+        s.coin_manager
+            .lock()
+            .await
+            .get_contract_shadow_allocations_in_satoshis(s.contract_id)
+            .unwrap_or_default()
+    };
+    let pot: u64 = allocations.iter().map(|(_, v)| v).sum();
+    let tip = { s.sync_manager.lock().await.bitcoin_sync_height_tip() };
+    let expiry_height = (tip + EXIT_TREE_EXPIRY_WINDOW) as u32;
+
+    let tree = TimeoutTree::build(
+        s.engine_key,
+        &allocations,
+        expiry_height,
+        EXIT_TREE_EXIT_DELAY,
+        None,
+    );
+    let leaf = tree
+        .as_ref()
+        .and_then(|t| t.leaves.iter().find(|l| l.account_key == account));
+
+    match leaf {
+        Some(leaf) => {
+            let (lh, script, cb) = leaf.exit_spend_elements().unwrap_or_default();
+            Json(json!({
+                "account": hex::encode(account),
+                "exitable": true,
+                "value_sats": leaf.value_in_satoshis,
+                "pot_sats": pot,
+                "vtxo_scriptpubkey": hex::encode(leaf.scriptpubkey().unwrap_or_default()),
+                "exit_script": hex::encode(script),
+                "exit_control_block": hex::encode(cb),
+                "exit_leaf_hash": hex::encode(lh),
+                "exit_delay_blocks": EXIT_TREE_EXIT_DELAY,
+                "expiry_height": expiry_height,
+                "note": "Your stake is a Projector value-bound VTXO. After the CSV delay you can sweep it to Bitcoin with only your key — the operator cannot hold it."
+            }))
+        }
+        None => Json(json!({
+            "account": hex::encode(account),
+            "exitable": false,
+            "value_sats": 0,
+            "pot_sats": pot,
+            "note": "No live claim (not entered this round, or won/lost — winnings are paid to your exitable account balance)."
+        })),
     }
 }
 
@@ -795,6 +871,7 @@ pub async fn run_arcade(
         .route("/bundle.js", get(serve_bundle))
         .route("/api/state", get(get_state))
         .route("/api/round/:n", get(get_round))
+        .route("/api/exit", get(get_exit))
         .route("/api/faucet", post(post_faucet))
         .route("/api/call", post(post_call))
         .route("/api/withdraw", post(post_withdraw))
