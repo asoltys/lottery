@@ -805,6 +805,21 @@ async fn post_settle_assertion(State(s): State<ArcadeState>, Json(b): Json<Settl
     }))
 }
 
+// Broadcast relay: a challenger's browser can't reach bitcoind directly, so it
+// POSTs a fully-signed tx here to be relayed. The engine is only a relay — it can't
+// alter a signed tx — so this is safe even though the engine is the adversary in a
+// dispute (in production the browser would use its own node / a public broadcaster).
+#[derive(Deserialize)]
+struct BroadcastReq {
+    tx_hex: String,
+}
+async fn post_broadcast(State(s): State<ArcadeState>, Json(b): Json<BroadcastReq>) -> Json<Value> {
+    match s.broadcast(&b.tx_hex) {
+        Ok(txid) => Json(json!({ "ok": true, "txid": txid })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
+    }
+}
+
 // ENFORCED SETTLE on-chain: assert the round winner AND pre-sign the covenant's
 // unroll with every leaf carrying THIS round's disprove lock (the garbled "invalid"
 // label hash). Optimistic: the unroll isn't broadcast unless disputed — but once
@@ -1272,6 +1287,7 @@ pub async fn run_arcade(
         .route("/api/covenant/unroll", post(post_unroll))
         .route("/api/settle_assertion", post(post_settle_assertion))
         .route("/api/settle", post(post_settle))
+        .route("/api/broadcast", post(post_broadcast))
         .route("/api/faucet", post(post_faucet))
         .route("/api/call", post(post_call))
         .route("/api/withdraw", post(post_withdraw))
