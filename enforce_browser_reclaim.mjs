@@ -12,6 +12,7 @@ import { execSync } from 'node:child_process';
 import { schnorr } from '@noble/curves/secp256k1.js';
 import { attachCosign } from './cosign_client.mjs';
 import { disputeAndReclaim } from './dispute.mjs';
+import { verifyCutChoose } from './garble.mjs';
 import { bytesToHex } from './musig.mjs';
 
 const BASE = 'http://127.0.0.1:8090';
@@ -68,6 +69,9 @@ async function main() {
   const wrongIdx = honest.honest_winner === 1 ? 2 : 1;
   const settle = await post('/api/settle', { seed: SEED, winner: wrongIdx });
   if (!settle.ok) fail('settle', JSON.stringify(settle));
+  // cut-and-choose: re-garble the opened instances and verify honest garbling.
+  const opened = verifyCutChoose(settle);
+  console.log(`cut-and-choose: re-garbled + verified ${opened}/${settle.k} opened instances (settle uses unopened #${settle.settle_instance}).`);
 
   // THE TAB (player 0) runs the exact browser code to detect + reclaim.
   const tab = players[0];

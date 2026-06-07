@@ -9,7 +9,7 @@ import { sha256, sha512 } from '@noble/hashes/sha2.js';
 import { entropyToMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
 import { attachCosign } from './cosign_client.mjs';
-import { challenge } from './garble.mjs';
+import { challenge, verifyCutChoose } from './garble.mjs';
 import { disputeAndReclaim } from './dispute.mjs';
 
 const Fr = bls.fields.Fr;
@@ -231,6 +231,9 @@ async function doDisputeReclaim() {
     const wrong = honest.honest_winner === 1 ? 2 : 1;
     const settle = await api('/api/settle', { seed: DRAW_SEED, winner: wrong });
     if (!settle.ok) { el.textContent = 'settle failed: ' + settle.error; return; }
+    // cut-and-choose: re-garble the opened instances to enforce honest garbling.
+    try { const opened = verifyCutChoose(settle); el.textContent = `cut-and-choose: re-garbled ${opened}/${settle.k} instances ✓ — challenging the settle…`; }
+    catch (e) { el.innerHTML = `🛑 <b>Cut-and-choose failed</b> — the engine garbled dishonestly: ${e.message}`; return; }
     const trueRg = trueRgOf(settle.total);
     const leaf = (settle.leaves || []).find((l) => l.account.toLowerCase() === ME.accountKey.toLowerCase());
     if (!leaf || !leaf.disprove_script) {

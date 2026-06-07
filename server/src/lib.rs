@@ -828,7 +828,7 @@ async fn post_broadcast(State(s): State<ArcadeState>, Json(b): Json<BroadcastReq
 // /cosign (the unroll is an N-of-N covenant spend). Returns the assertion + the
 // pre-signed disprove-locked unroll + per-leaf spend data.
 async fn post_settle(State(s): State<ArcadeState>, Json(b): Json<SettleAssertReq>) -> Json<Value> {
-    use cube::transmutative::garble::WinnerVerifier;
+    use cube::transmutative::garble::{fiat_shamir_open, InstanceCommit, WinnerVerifier};
     let cov = match s.covenant.current().await {
         Some(c) => c,
         None => return Json(json!({"ok":false,"error":"no covenant to settle"})),
@@ -852,11 +852,38 @@ async fn post_settle(State(s): State<ArcadeState>, Json(b): Json<SettleAssertReq
         Some(w) => w,
         None => return Json(json!({"ok":false,"error":"draw landed in the house zone (rollover)","rg":rg,"total":total})),
     };
+    // CUT-AND-CHOOSE: garble K independent instances and commit them; a Fiat-Shamir
+    // challenge (from the commitments) opens half — those are revealed so the
+    // challenger re-garbles + checks them — and the settle uses an UNOPENED instance.
+    // A dishonest garbler (e.g. a disprove lock that can never open) is caught with
+    // overwhelming probability, forcing honest garbling.
     let v = WinnerVerifier::new(&lo, &hi);
-    let wires = v.wires(seed ^ 0x5a5a_5a5a_5a5a_5a5a);
-    let tables = v.garble(&wires);
-    let assertion = v.assert_settle(&wires, &tables, rg, claimed);
+    const K: usize = 8;
+    let mut all_wires = Vec::with_capacity(K);
+    let mut all_tables = Vec::with_capacity(K);
+    let mut commits = Vec::with_capacity(K);
+    for i in 0..K {
+        let wires = v.wires(seed ^ (0x00c0_ffee_0000_0000u64 + i as u64));
+        let tables = v.garble(&wires);
+        commits.push(InstanceCommit { tables_commit: v.tables_commit(&tables), disprove_hash: v.disprove_hash(&wires) });
+        all_wires.push(wires);
+        all_tables.push(tables);
+    }
+    let opened = fiat_shamir_open(&commits, K);
+    let settle_idx = match (0..K).find(|&i| !opened[i]) {
+        Some(i) => i,
+        None => return Json(json!({"ok":false,"error":"cut-and-choose opened every instance; retry"})),
+    };
+    let assertion = v.assert_settle(&all_wires[settle_idx], &all_tables[settle_idx], rg, claimed);
     let disprove_hash = assertion.disprove_hash;
+    let instances: Vec<Value> = (0..K)
+        .map(|i| json!({
+            "tables_commit": hex::encode(commits[i].tables_commit),
+            "disprove_hash": hex::encode(commits[i].disprove_hash),
+            "opened": opened[i],
+            "wires": if opened[i] { serde_json::to_value(&all_wires[i]).ok() } else { None },
+        }))
+        .collect();
 
     // Pre-sign the covenant's unroll with every leaf locked to this round.
     let prev_txid_internal = match bitcoin::Txid::from_str(&cov.txid) {
@@ -886,6 +913,7 @@ async fn post_settle(State(s): State<ArcadeState>, Json(b): Json<SettleAssertReq
         "engine_key": hex::encode(s.engine_key),
         "expiry": cov.expiry, "exit_delay": COVENANT_EXIT_DELAY,
         "disprove_hash": hex::encode(disprove_hash),
+        "k": K, "settle_instance": settle_idx, "instances": instances,
         "unroll_txid": unroll.txid,
         "unroll_tx_hex": unroll.signed_tx_hex,
         "leaves": serde_json::to_value(&unroll.leaves).unwrap_or(Value::Null),

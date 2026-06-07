@@ -14,7 +14,7 @@ import { schnorr } from '@noble/curves/secp256k1.js';
 import { attachCosign } from './cosign_client.mjs';
 import { compactSize } from './covenant.mjs';
 import { scriptPathSighash } from './sighash.mjs';
-import { challenge } from './garble.mjs';
+import { challenge, verifyCutChoose } from './garble.mjs';
 import { taggedHash, hexToBytes, bytesToHex } from './musig.mjs';
 
 const BASE = 'http://127.0.0.1:8090';
@@ -82,6 +82,8 @@ async function main() {
   const wrongIdx = honest.honest_winner === 1 ? 2 : 1;
   const settle = await post('/api/settle', { seed: SEED, winner: wrongIdx });
   if (!settle.ok) fail('settle(wrong)', JSON.stringify(settle));
+  const opened = verifyCutChoose(settle);
+  console.log(`cut-and-choose: re-garbled + verified ${opened}/${settle.k} opened instances (settle uses unopened #${settle.settle_instance}).`);
   const secret = challenge(settle.assertion, trueRg);
   if (!secret) fail('wrong settle did not yield a disprove secret');
   console.log(`WRONG settle: claimed winner ${wrongIdx} (honest ${settle.honest_winner}); challenger derived the disprove secret in JS.`);

@@ -23,6 +23,10 @@ const ENC = enc.encode('enc');
 const ks = (a, b, gate, kind) => sha256(cat(a, b, u32le(gate), kind));
 
 const bitsFor = (n) => { let b = 1; while ((1 << b) < n) b += 1; return b; };
+// gate truth tables (index i*2+j), matching cube.
+const XOR = [0, 1, 1, 0];
+const AND = [0, 0, 0, 1];
+const OR = [0, 1, 1, 1];
 
 // Rebuild the WinnerVerifier gate STRUCTURE for bands lo[]/hi[] — identical wire
 // allocation + gate creation order to cube, so gate ids/tables align.
@@ -32,7 +36,7 @@ export function buildVerifier(lo, hi) {
   let nw = 0;
   const gates = [];
   const wire = () => nw++;
-  const gate = (a, b) => { const o = wire(); const id = gates.length; gates.push({ a, b, o, id }); return o; };
+  const gate = (a, b, truth) => { const o = wire(); const id = gates.length; gates.push({ a, b, o, id, truth }); return o; };
   const one = wire();
   const zero = wire();
   const rg = Array.from({ length: VALUE_BITS }, wire);
@@ -43,8 +47,8 @@ export function buildVerifier(lo, hi) {
     let term = null;
     for (let bit = 0; bit < wBits; bit++) {
       const want1 = (i >> bit) & 1;
-      const lit = want1 ? w[bit] : gate(w[bit], one); // !w_bit = XOR(w_bit, one)
-      term = term === null ? lit : gate(term, lit);    // AND
+      const lit = want1 ? w[bit] : gate(w[bit], one, XOR); // !w_bit = XOR(w_bit, one)
+      term = term === null ? lit : gate(term, lit, AND);
     }
     sel.push(term);
   }
@@ -53,7 +57,7 @@ export function buildVerifier(lo, hi) {
     for (let i = 0; i < n; i++) if ((BigInt(consts[i]) >> BigInt(k)) & 1n) act.push(sel[i]);
     if (act.length === 0) return zero;
     let acc = act[0];
-    for (let j = 1; j < act.length; j++) acc = gate(acc, act[j]); // OR
+    for (let j = 1; j < act.length; j++) acc = gate(acc, act[j], OR);
     return acc;
   });
   const loW = mux(lo);
@@ -61,19 +65,19 @@ export function buildVerifier(lo, hi) {
   const lessThan = (a, b) => {
     let lt = zero;
     for (let i = 0; i < VALUE_BITS; i++) {
-      const na = gate(a[i], one);
-      const alb = gate(na, b[i]);
-      const axb = gate(a[i], b[i]);
-      const eq = gate(axb, one);
-      const eal = gate(eq, lt);
-      lt = gate(alb, eal);
+      const na = gate(a[i], one, XOR);
+      const alb = gate(na, b[i], AND);
+      const axb = gate(a[i], b[i], XOR);
+      const eq = gate(axb, one, XOR);
+      const eal = gate(eq, lt, AND);
+      lt = gate(alb, eal, OR);
     }
     return lt;
   };
   const rgLtLo = lessThan(rg, loW);
   const rgLtHi = lessThan(rg, hiW);
-  const geLo = gate(rgLtLo, one);
-  const valid = gate(geLo, rgLtHi);
+  const geLo = gate(rgLtLo, one, XOR);
+  const valid = gate(geLo, rgLtHi, AND);
   return { gates, rg, w, one, zero, valid };
 }
 
@@ -89,6 +93,48 @@ function evalActive(v, tables, active) {
     active.set(g.o, xor(toBytes(row.ct), ks(la, lb, g.id, ENC)));
   }
   return active.get(v.valid);
+}
+
+// Re-garble all gates from revealed wires (== cube garble), to verify an opened
+// cut-and-choose instance. `wires` is [[label0,label1], …] of Uint8Array.
+function garbleTables(v, wires) {
+  return v.gates.map((g) => {
+    const rows = [];
+    for (let i = 0; i < 2; i++) for (let j = 0; j < 2; j++) {
+      const aL = wires[g.a][i], bL = wires[g.b][j];
+      const outL = wires[g.o][g.truth[i * 2 + j]];
+      rows.push({ tag: ks(aL, bL, g.id, TAG), ct: xor(ks(aL, bL, g.id, ENC), outL) });
+    }
+    const k = g.id % 4; // rotate_left
+    return rows.slice(k).concat(rows.slice(0, k));
+  });
+}
+function tablesCommit(tables) {
+  const parts = [];
+  for (const tab of tables) for (const r of tab) { parts.push(r.tag, r.ct); }
+  return sha256(cat(...parts));
+}
+
+// Verify the cut-and-choose opening: re-garble every OPENED instance from its
+// revealed wires and confirm its committed tables hash + disprove hash. Throws if
+// any opened instance was dishonestly garbled. Returns the number opened.
+export function verifyCutChoose(settle) {
+  const v = buildVerifier(settle.assertion.lo, settle.assertion.hi);
+  let opened = 0;
+  for (let i = 0; i < settle.instances.length; i++) {
+    const inst = settle.instances[i];
+    if (!inst.opened) continue;
+    opened += 1;
+    const wires = inst.wires.map((p) => [toBytes(p[0]), toBytes(p[1])]);
+    const tables = garbleTables(v, wires);
+    if (hex(tablesCommit(tables)) !== inst.tables_commit) throw new Error(`cut-and-choose: instance ${i} tables mismatch (dishonest garbler)`);
+    if (hex(sha256(wires[v.valid][0])) !== inst.disprove_hash) throw new Error(`cut-and-choose: instance ${i} disprove hash mismatch (dishonest garbler)`);
+  }
+  // the settle instance must be unopened and its lock must match the assertion.
+  const si = settle.settle_instance;
+  if (settle.instances[si].opened) throw new Error('cut-and-choose: settle used an opened instance');
+  if (settle.instances[si].disprove_hash !== settle.disprove_hash) throw new Error('cut-and-choose: settle disprove hash mismatch');
+  return opened;
 }
 
 // Challenge a SettleAssertion (parsed JSON from /api/settle[_assertion]) against the
