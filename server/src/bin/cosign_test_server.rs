@@ -54,6 +54,16 @@ async fn connected(State(hub): State<CosignHub>) -> Json<Value> {
 }
 
 async fn trigger(State(hub): State<CosignHub>, Json(req): Json<TriggerReq>) -> Json<Value> {
+    run_trigger(hub, req, false).await
+}
+
+// Malicious-engine variant: divert the pot to an engine-only P2TR while the
+// context still advertises the honest covenant. A verifying client must refuse.
+async fn trigger_evil(State(hub): State<CosignHub>, Json(req): Json<TriggerReq>) -> Json<Value> {
+    run_trigger(hub, req, true).await
+}
+
+async fn run_trigger(hub: CosignHub, req: TriggerReq, evil: bool) -> Json<Value> {
     let allocations: Vec<([u8; 32], u64)> = req
         .allocations
         .iter()
@@ -76,6 +86,15 @@ async fn trigger(State(hub): State<CosignHub>, Json(req): Json<TriggerReq>) -> J
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
         .unwrap_or([0xc0; 32]);
 
+    // theft destination: a P2TR to the engine key (steals the pot).
+    let override_out_spk = if evil {
+        let mut spk = vec![0x51, 0x20];
+        spk.extend_from_slice(&hub.engine_key());
+        Some(spk)
+    } else {
+        None
+    };
+
     // new state == old state for the harness (a no-op refresh); the point is to
     // prove the N-of-N key-path signature, not a value transition.
     let params = RefreshParams {
@@ -87,9 +106,11 @@ async fn trigger(State(hub): State<CosignHub>, Json(req): Json<TriggerReq>) -> J
         prev_vout: req.prev_vout,
         prev_value,
         fee: req.fee,
+        override_out_spk,
     };
 
-    match hub.run_refresh(params, "harness-refresh", Duration::from_secs(20)).await {
+    let label = if evil { "harness-refresh-EVIL" } else { "harness-refresh" };
+    match hub.run_refresh(params, label, Duration::from_secs(8)).await {
         Ok(r) => Json(json!({
             "ok": true,
             "valid": r.valid,
@@ -192,6 +213,7 @@ async fn main() {
         .route("/cosign", get(cosign_ws))
         .route("/connected", get(connected))
         .route("/trigger", post(trigger))
+        .route("/trigger_evil", post(trigger_evil))
         .route("/deposit", post(deposit))
         .with_state(hub);
 

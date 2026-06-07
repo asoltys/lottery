@@ -31,6 +31,7 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex};
 
 use bitcoin::hashes::Hash as _;
@@ -78,6 +79,7 @@ enum ServerMsg {
         your_pubkey: String,  // this client's signing pubkey (so it can self-check)
         your_value: u64,      // value this client's key is projected by (refresh only)
         your_index: u32,      // this client's signer index (refresh only)
+        ctx: Value,           // full tx context so the client rebuilds + verifies what it signs
     },
     #[serde(rename = "aggnonces")]
     AggNonces { session: String, nonces: Vec<NonceMsg> },
@@ -128,6 +130,11 @@ pub struct RefreshParams {
     pub prev_vout: u32,
     pub prev_value: u64,
     pub fee: u64,
+    /// TEST-ONLY: if set, the actual tx output uses this spk instead of the honest
+    /// next-covenant spk, while the context still advertises the honest
+    /// allocations — models a malicious engine trying to divert the pot. A
+    /// verifying client recomputes the covenant + sighash and must refuse.
+    pub override_out_spk: Option<Vec<u8>>,
 }
 
 /// The signed refresh, ready to broadcast.
@@ -219,8 +226,14 @@ impl CosignHub {
             covenant_scriptpubkey(self.engine_key, &p.new_allocations, p.new_expiry)
                 .ok_or("covenant_scriptpubkey(new) failed")?,
         );
+        // The new covenant holds exactly the sum of its leaves; the tx fee is
+        // whatever's left over (prev_value - out_value). Conservation: the client
+        // checks out_value == Σ new_allocations and prev_value >= out_value.
         let new_total: u64 = p.new_allocations.iter().map(|(_, v)| v).sum();
-        let out_value = new_total.saturating_sub(p.fee);
+        let out_value = new_total;
+        if p.prev_value < out_value {
+            return Err("prev_value < new covenant total".into());
+        }
         let outpoint = OutPoint::new(
             Txid::from_byte_array(p.prev_txid),
             p.prev_vout,
@@ -236,7 +249,10 @@ impl CosignHub {
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(out_value),
-                script_pubkey: new_spk,
+                script_pubkey: match &p.override_out_spk {
+                    Some(spk) => ScriptBuf::from_bytes(spk.clone()),
+                    None => new_spk,
+                },
             }],
         };
         let sighash = SighashCache::new(&refresh_tx)
@@ -310,6 +326,29 @@ impl CosignHub {
             return Err("engine nonce rejected by keyagg".into());
         }
 
+        // tx context so each client can rebuild the covenant + sighash and verify
+        // exactly what it signs (no trust in the server's asserted message).
+        let alloc_json = |allocs: &[([u8; 32], u64)]| -> Value {
+            Value::Array(
+                allocs
+                    .iter()
+                    .map(|(k, v)| json!({ "account": hex::encode(k), "value": v }))
+                    .collect(),
+            )
+        };
+        let ctx = json!({
+            "kind": "refresh",
+            "engine": hex::encode(self.engine_key),
+            "old_allocations": alloc_json(&p.old_allocations),
+            "old_expiry": p.old_expiry,
+            "new_allocations": alloc_json(&p.new_allocations),
+            "new_expiry": p.new_expiry,
+            "prev_txid": hex::encode(p.prev_txid),
+            "prev_vout": p.prev_vout,
+            "prev_value": p.prev_value,
+            "out_value": out_value,
+        });
+
         // round 1: ask each participant for a nonce.
         for (account, proj, value, index) in &participant_pubs {
             let _ = sockets[account].send(ServerMsg::Start {
@@ -323,6 +362,7 @@ impl CosignHub {
                 your_pubkey: ser_pt(proj),
                 your_value: *value,
                 your_index: *index,
+                ctx: ctx.clone(),
             });
         }
 
@@ -495,6 +535,16 @@ impl CosignHub {
         };
 
         // round 1: ask the depositor for a nonce.
+        let ctx = json!({
+            "kind": "deposit",
+            "engine": hex::encode(self.engine_key),
+            "account": hex::encode(p.account_key),
+            "prev_txid": hex::encode(p.prev_txid),
+            "prev_vout": p.prev_vout,
+            "prev_value": p.prev_value,
+            "dest_spk": hex::encode(&p.dest_spk),
+            "out_value": p.prev_value.saturating_sub(p.fee),
+        });
         let _ = socket.send(ServerMsg::Start {
             session: session_id.clone(),
             label: label.to_string(),
@@ -506,6 +556,7 @@ impl CosignHub {
             your_pubkey: ser_pt(&account_pt),
             your_value: 0,
             your_index: 0,
+            ctx,
         });
 
         // collect the depositor's nonce.

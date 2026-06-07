@@ -58,6 +58,12 @@ export function evenYSecret(baseSkHex) {
 export function projectedSecret(baseSkHex, value, index) {
   return mod(evenYSecret(baseSkHex) + projectionTweak(value, index));
 }
+// Project a PUBLIC key: pk' = pk + t·G. `pubHex` is a 33-byte compressed point
+// (an account/engine even-Y point). Returns 33-byte compressed hex.
+export function projectPublicKey(pubHex, value, index) {
+  const projected = ptFromBytes(hexToBytes(pubHex)).add(mul(P.BASE, projectionTweak(value, index)));
+  return bytesToHex(ptBytes(projected));
+}
 
 // ---- key aggregation (BIP327, cube-compatible) ----
 // pubkeyHexes: array of 33-byte compressed hex. Returns sorted keys + coefs + aggInner.
