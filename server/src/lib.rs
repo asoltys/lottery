@@ -50,6 +50,8 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 
+pub mod cosign;
+
 const INDEX_HTML: &str = include_str!("../../index.html");
 const BUNDLE_JS: &str = include_str!("../../bundle.js");
 
