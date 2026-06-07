@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use cube::transmutative::secp::into::IntoScalar;
 use cube::transmutative::secp::schnorr::LiftScalar;
-use lottery_arcade::cosign::{cosign_ws, CosignHub, RefreshParams};
+use lottery_arcade::cosign::{cosign_ws, CosignHub, DepositParams, RefreshParams};
 
 #[derive(Deserialize)]
 struct Alloc {
@@ -103,6 +103,72 @@ async fn trigger(State(hub): State<CosignHub>, Json(req): Json<TriggerReq>) -> J
     }
 }
 
+#[derive(Deserialize)]
+struct DepositReq {
+    account: String,
+    #[serde(default)]
+    prev_txid: Option<String>,
+    #[serde(default)]
+    prev_vout: u32,
+    #[serde(default = "default_deposit_value")]
+    prev_value: u64,
+    #[serde(default = "default_fee")]
+    fee: u64,
+    #[serde(default)]
+    dest_spk: Option<String>,
+}
+fn default_deposit_value() -> u64 {
+    100_000
+}
+
+async fn deposit(State(hub): State<CosignHub>, Json(req): Json<DepositReq>) -> Json<Value> {
+    let account_key = match hex::decode(req.account.trim_start_matches("0x"))
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    {
+        Some(k) => k,
+        None => return Json(json!({ "ok": false, "error": "bad account key" })),
+    };
+    let prev_txid = req
+        .prev_txid
+        .as_deref()
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .unwrap_or([0xd0; 32]);
+    // default destination: a P2TR to the engine key (a valid spk; the harness
+    // only needs to prove the 2-of-2 key-path signature, not a real covenant).
+    let dest_spk = req
+        .dest_spk
+        .as_deref()
+        .and_then(|h| hex::decode(h).ok())
+        .unwrap_or_else(|| {
+            let mut spk = vec![0x51, 0x20];
+            spk.extend_from_slice(&hub.engine_key());
+            spk
+        });
+
+    let params = DepositParams {
+        account_key,
+        prev_txid,
+        prev_vout: req.prev_vout,
+        prev_value: req.prev_value,
+        dest_spk,
+        fee: req.fee,
+    };
+    match hub.run_deposit(params, "harness-deposit", Duration::from_secs(20)).await {
+        Ok(r) => Json(json!({
+            "ok": true,
+            "valid": r.valid,
+            "agg_sig": hex::encode(r.agg_sig),
+            "message": hex::encode(r.message),
+            "agg_key": hex::encode(r.agg_key_xonly),
+            "txid": r.txid,
+            "signed_tx": r.signed_tx_hex,
+        })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // fixed engine secret for the harness; engine x-only key is its even-Y pubkey.
@@ -126,6 +192,7 @@ async fn main() {
         .route("/cosign", get(cosign_ws))
         .route("/connected", get(connected))
         .route("/trigger", post(trigger))
+        .route("/deposit", post(deposit))
         .with_state(hub);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8099").await.unwrap();

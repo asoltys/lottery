@@ -4,7 +4,7 @@
 // base secp secret never leaves the device — only a nonce and a partial signature
 // go on the wire.
 
-import { partialSign, projectedSecret, publicNonces, bytesToHex } from './musig.mjs';
+import { partialSign, projectedSecret, evenYSecret, publicNonces, bytesToHex } from './musig.mjs';
 
 const rand32 = () => {
   const b = new Uint8Array(32);
@@ -29,8 +29,11 @@ export function attachCosign(ws, secpHex, accountKeyHex, onEvent = () => {}) {
     try { msg = JSON.parse(ev.data); } catch { return; }
     switch (msg.type) {
       case 'start': {
-        // derive my projected secret + a fresh nonce pair, commit the nonce.
-        const secret = projectedSecret(secpHex, msg.your_value, msg.your_index);
+        // derive my signing secret: projected (refresh) or plain even-Y (deposit
+        // lift-in, a plain 2-of-2), then a fresh nonce pair, and commit the nonce.
+        const secret = msg.project === false
+          ? evenYSecret(secpHex)
+          : projectedSecret(secpHex, msg.your_value, msg.your_index);
         const hidingSecHex = rand32();
         const bindingSecHex = rand32();
         const { hidingHex, bindingHex } = publicNonces(hidingSecHex, bindingSecHex);

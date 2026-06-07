@@ -41,6 +41,8 @@ use bitcoin::{
     Witness,
 };
 
+use cube::constructive::txout_types::lift::lift_versions::liftv2::cosign::EngineCosigner;
+use cube::constructive::txout_types::lift::lift_versions::liftv2::liftv2::return_liftv2_taproot;
 use cube::constructive::txout_types::timeout_tree::funding_taproot;
 use cube::constructive::txout_types::timeout_tree::refresh::{
     covenant_scriptpubkey, engine_projected_pubkey, engine_projected_secret,
@@ -68,12 +70,14 @@ enum ServerMsg {
     Start {
         session: String,
         label: String,
+        kind: String,         // "refresh" (Projector-projected) | "deposit" (plain 2-of-2)
+        project: bool,        // true: sign with projected secret; false: even-Y account secret
         message: String,      // 32-byte sighash hex (what the client signs)
-        pubkeys: Vec<String>, // all signers' projected pubkeys (33-byte hex)
-        tweak: String,        // funding taproot tweak (32-byte hex)
-        your_pubkey: String,  // this client's projected pubkey (so it can self-check)
-        your_value: u64,      // the value this client's key is projected by
-        your_index: u32,      // this client's signer index
+        pubkeys: Vec<String>, // all signers' pubkeys (33-byte hex)
+        tweak: String,        // taproot tweak (32-byte hex)
+        your_pubkey: String,  // this client's signing pubkey (so it can self-check)
+        your_value: u64,      // value this client's key is projected by (refresh only)
+        your_index: u32,      // this client's signer index (refresh only)
     },
     #[serde(rename = "aggnonces")]
     AggNonces { session: String, nonces: Vec<NonceMsg> },
@@ -136,6 +140,17 @@ pub struct RefreshResult {
     pub txid: String,
 }
 
+/// Parameters for one LiftV2 deposit lift-in (spend a 2-of-2 account+engine
+/// deposit output into the pot covenant via a cooperative key-path cosign).
+pub struct DepositParams {
+    pub account_key: [u8; 32],
+    pub prev_txid: [u8; 32],
+    pub prev_vout: u32,
+    pub prev_value: u64,
+    pub dest_spk: Vec<u8>, // where the lifted funds go (e.g. the pot covenant spk)
+    pub fee: u64,
+}
+
 fn pt(hexstr: &str) -> Option<Point> {
     Point::from_hex(hexstr).ok()
 }
@@ -157,6 +172,11 @@ impl CosignHub {
     /// How many participant sockets are currently connected.
     pub async fn connected(&self) -> Vec<[u8; 32]> {
         self.participants.lock().await.keys().cloned().collect()
+    }
+
+    /// The engine's x-only key (for callers that need the keyagg counterpart).
+    pub fn engine_key(&self) -> [u8; 32] {
+        self.engine_key
     }
 
     // Deterministic, message-bound engine nonce secrets (never reused across
@@ -295,6 +315,8 @@ impl CosignHub {
             let _ = sockets[account].send(ServerMsg::Start {
                 session: session_id.clone(),
                 label: label.to_string(),
+                kind: "refresh".to_string(),
+                project: true,
                 message: hex::encode(sighash),
                 pubkeys: pubkeys.clone(),
                 tweak: tweak_hex.clone(),
@@ -410,6 +432,193 @@ impl CosignHub {
             signed_tx_hex,
             txid,
         })
+    }
+
+    /// Drive a LiftV2 deposit lift-in: a cooperative 2-of-2 (account+engine)
+    /// taproot key-path cosign spending the deposit output into `dest_spk`. The
+    /// depositor cosigns from their browser (plain even-Y account secret, no
+    /// projection); the engine aggregates into the key-path witness.
+    pub async fn run_deposit(
+        &self,
+        p: DepositParams,
+        label: &str,
+        round_timeout: Duration,
+    ) -> Result<RefreshResult, String> {
+        // --- build the lift-in tx + key-path sighash over the deposit output ---
+        let deposit_taproot = return_liftv2_taproot(p.account_key, self.engine_key)
+            .ok_or("return_liftv2_taproot failed")?;
+        let deposit_spk = ScriptBuf::from_bytes(deposit_taproot.spk().ok_or("deposit spk")?);
+        let prev_txout = TxOut {
+            value: Amount::from_sat(p.prev_value),
+            script_pubkey: deposit_spk,
+        };
+        let outpoint = OutPoint::new(Txid::from_byte_array(p.prev_txid), p.prev_vout);
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(p.prev_value.saturating_sub(p.fee)),
+                script_pubkey: ScriptBuf::from_bytes(p.dest_spk.clone()),
+            }],
+        };
+        let sighash = SighashCache::new(&tx)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prev_txout]), TapSighashType::Default)
+            .map_err(|e| format!("sighash: {e}"))?
+            .to_byte_array();
+
+        // pubkeys (even-Y 33-byte) the browser keyaggs: [account, engine].
+        let account_pt = p.account_key.into_point().map_err(|_| "account point")?;
+        let engine_pt = self.engine_key.into_point().map_err(|_| "engine point")?;
+        let pubkeys = vec![ser_pt(&account_pt), ser_pt(&engine_pt)];
+        let tweak_hex = hex::encode(deposit_taproot.tap_tweak());
+
+        // session bookkeeping + the depositor's socket.
+        let session_id = {
+            let mut c = self.counter.lock().await;
+            *c += 1;
+            format!("deposit-{}", *c)
+        };
+        let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<SessionInput>();
+        self.sessions.lock().await.insert(session_id.clone(), inbox_tx);
+        let socket = match self.participants.lock().await.get(&p.account_key) {
+            Some(tx) => tx.clone(),
+            None => {
+                self.sessions.lock().await.remove(&session_id);
+                return Err(format!("depositor {} not connected", hex::encode(p.account_key)));
+            }
+        };
+
+        // round 1: ask the depositor for a nonce.
+        let _ = socket.send(ServerMsg::Start {
+            session: session_id.clone(),
+            label: label.to_string(),
+            kind: "deposit".to_string(),
+            project: false,
+            message: hex::encode(sighash),
+            pubkeys: pubkeys.clone(),
+            tweak: tweak_hex.clone(),
+            your_pubkey: ser_pt(&account_pt),
+            your_value: 0,
+            your_index: 0,
+        });
+
+        // collect the depositor's nonce.
+        let mut client_nonce: Option<NonceMsg> = None;
+        let r1 = self
+            .collect(&mut inbox_rx, round_timeout, |input, st: &mut Option<NonceMsg>| match input {
+                SessionInput::Nonce(n) => {
+                    if pt(&n.hiding).is_some() && pt(&n.binding).is_some() {
+                        *st = Some(n);
+                        return true;
+                    }
+                    false
+                }
+                _ => false,
+            }, &mut client_nonce, 1)
+            .await;
+        if r1.is_err() || client_nonce.is_none() {
+            self.abort_one(&session_id, &socket, "timed out collecting nonce").await;
+            return Err("timed out collecting deposit nonce".into());
+        }
+        let client_nonce = client_nonce.unwrap();
+        let client_h = pt(&client_nonce.hiding).ok_or("bad client hiding nonce")?;
+        let client_b = pt(&client_nonce.binding).ok_or("bad client binding nonce")?;
+
+        // engine begins: its nonces + the now-known sighash, partial-signs.
+        let (eng_hn, eng_bn) = self.engine_nonces(&sighash);
+        let engine = EngineCosigner::begin(
+            p.account_key,
+            self.engine_key,
+            (*self.engine_secret).into_scalar().map_err(|_| "engine scalar")?.lift(),
+            eng_hn,
+            eng_bn,
+            client_h,
+            client_b,
+            sighash,
+        )
+        .ok_or("engine begin failed")?;
+        let (engine_h, engine_b) = engine.engine_public_nonces();
+
+        // round 2: send both nonces, request the depositor's partial.
+        let nonce_vec = vec![
+            client_nonce.clone(),
+            NonceMsg {
+                pubkey: ser_pt(&engine_pt),
+                hiding: ser_pt(&engine_h),
+                binding: ser_pt(&engine_b),
+            },
+        ];
+        let _ = socket.send(ServerMsg::AggNonces {
+            session: session_id.clone(),
+            nonces: nonce_vec,
+        });
+
+        // collect the depositor's partial.
+        let mut client_partial: Option<Scalar> = None;
+        let r2 = self
+            .collect(&mut inbox_rx, round_timeout, |input, st: &mut Option<Scalar>| match input {
+                SessionInput::Partial { partial, .. } => match Scalar::from_hex(&partial) {
+                    Ok(sc) => {
+                        *st = Some(sc);
+                        true
+                    }
+                    Err(_) => false,
+                },
+                _ => false,
+            }, &mut client_partial, 1)
+            .await;
+        if r2.is_err() || client_partial.is_none() {
+            self.abort_one(&session_id, &socket, "timed out collecting partial").await;
+            return Err("timed out collecting deposit partial".into());
+        }
+
+        // aggregate into the key-path signature.
+        let agg_sig = engine
+            .complete(client_partial.unwrap())
+            .ok_or("aggregate failed (bad client partial)")?;
+        let agg_key_xonly = deposit_taproot.tweaked_key().ok_or("tweaked_key")?.serialize_xonly();
+        let valid = verify_xonly(agg_key_xonly, sighash, agg_sig, SchnorrSigningMode::BIP340);
+
+        let mut witness = Witness::new();
+        witness.push(agg_sig.to_vec());
+        tx.input[0].witness = witness;
+        let signed_tx_hex = hex::encode(bitcoin::consensus::encode::serialize(&tx));
+        let txid = tx.compute_txid().to_string();
+
+        let _ = socket.send(ServerMsg::Complete {
+            session: session_id.clone(),
+            agg_sig: hex::encode(agg_sig),
+            txid: Some(txid.clone()),
+        });
+        self.sessions.lock().await.remove(&session_id);
+
+        Ok(RefreshResult {
+            agg_sig,
+            message: sighash,
+            agg_key_xonly,
+            valid,
+            signed_tx_hex,
+            txid,
+        })
+    }
+
+    async fn abort_one(
+        &self,
+        session_id: &str,
+        socket: &mpsc::UnboundedSender<ServerMsg>,
+        reason: &str,
+    ) {
+        let _ = socket.send(ServerMsg::Abort {
+            session: session_id.to_string(),
+            reason: reason.to_string(),
+        });
+        self.sessions.lock().await.remove(session_id);
     }
 
     // Drain the session inbox until `done(input, state)` returns true or timeout.

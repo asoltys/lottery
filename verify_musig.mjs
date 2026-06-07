@@ -2,7 +2,7 @@
 // (tests/musig_vectors.rs). Run: node verify_musig.mjs
 import {
   keyAgg, aggKeyWithTweak, partialSign, projectedSecret, publicNonces,
-  bytesToHex,
+  evenYSecret, bytesToHex,
 } from './musig.mjs';
 
 // --- vector (from `cargo test --test musig_vectors -- --nocapture`) ---
@@ -79,6 +79,35 @@ const oddPartial = partialSign({
   me: { secret: oddProjSk, hidingSecHex: V.ALICE_HIDING_SK, bindingSecHex: V.ALICE_BINDING_SK },
 });
 check('odd-Y base normalization (partial)', oddPartial, ODD.EXPECTED);
+
+// (f) LiftV2 lift-in: the depositor's half of a plain 2-of-2 (account+engine)
+// taproot key-path cosign — NO Projector projection, signed with the even-Y
+// account secret directly. From cube/tests/liftv2_browser_vector.rs.
+const LIFT = {
+  MESSAGE: '5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a',
+  ACCOUNT_PK: '02cb70281face51a77d51400612196032bb12422d4c07fa42997a0ab39c2431455',
+  ENGINE_PK: '0251deb9fcf4d16b0f82c75cf71e1ffb7879beb0c6bf733b0778a81b777406574f',
+  TWEAK: '80a2028c313e418252b6c59c49410634261dfb5217854c59fc6d54a0704f0ae1',
+  ACCOUNT_SK: '1cc5906ab936b1e29db24fffe9f87b33a4c64f2d3b59aed6c3c4faeb8fcba6da',
+  A_HID_PUB: '020f8eb9edf13c5cbca406d616d9441311906d72ea405bcb7e22b99f7e892f0d20',
+  A_BIND_PUB: '031451a7f53decf60829622152e16f92b9fb7b72b4521e03510eba2469a742643f',
+  E_HID_PUB: '024cb6badc87cfcad700eb028e1203f2cc0fd63a919d7c199a63b7891afd300e7c',
+  E_BIND_PUB: '02f963d471e593d7574451d73a748ed06edae936f62cda9b4b62aa9cdd280c1d99',
+  A_HID_SK: 'e2d64e2bd20d5843d03a47199f059aebdf2a9904616a01fe961ee875a7748199',
+  A_BIND_SK: '4b978d3aac4135213f536194522f68fbb2ca4321a49d95560ae9726cd9d6a55d',
+  EXPECTED: 'c0abf96e0a48fb7328aeb0810da619ddbfa372bfaf17d88091386c0106614680',
+};
+const liftPartial = partialSign({
+  pubkeys: [LIFT.ACCOUNT_PK, LIFT.ENGINE_PK],
+  tweakHex: LIFT.TWEAK,
+  nonces: [
+    { keyHex: LIFT.ACCOUNT_PK, hidingHex: LIFT.A_HID_PUB, bindingHex: LIFT.A_BIND_PUB },
+    { keyHex: LIFT.ENGINE_PK, hidingHex: LIFT.E_HID_PUB, bindingHex: LIFT.E_BIND_PUB },
+  ],
+  messageHex: LIFT.MESSAGE,
+  me: { secret: evenYSecret(LIFT.ACCOUNT_SK), hidingSecHex: LIFT.A_HID_SK, bindingSecHex: LIFT.A_BIND_SK },
+});
+check('LiftV2 lift-in client partial', liftPartial, LIFT.EXPECTED);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
