@@ -94,10 +94,8 @@ async function main() {
   const genTxid = cli(`sendrawtransaction ${gres.signed_tx}`);
   mine(1);
   const genTx = cliJSON(`getrawtransaction ${genTxid} true`);
-  const allocs = deposits.map((d) => ({ account: d.account, value: d.value }));
-  const maxA = allocs.reduce((m, a) => (a.value > m.value ? a : m), allocs[0]);
-  maxA.value -= GEN_FEE;
-  const covValue = allocs.reduce((s, a) => s + a.value, 0);
+  const allocs = gres.covenant_allocations;
+  const covValue = gres.covenant_value;
   const covVout = genTx.vout.findIndex((o) => o.value && sat(o.value) === covValue);
   console.log(`genesis covenant: ${genTxid.slice(0, 16)}… vout ${covVout} = ${covValue} sat`);
 

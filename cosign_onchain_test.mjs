@@ -84,11 +84,9 @@ async function main() {
   const genTx = cliJSON(`getrawtransaction ${genTxid} true`);
   console.log(`\nGENESIS confirmed: ${genTxid.slice(0, 16)}…  (${genTx.vin.length} deposit inputs -> 1 covenant, ${genTx.confirmations} conf)`);
 
-  // covenant allocations the server used: each deposit value, largest minus GEN_FEE.
-  const allocs = deposits.map((d) => ({ account: d.account, value: d.value }));
-  const maxA = allocs.reduce((m, a) => (a.value > m.value ? a : m), allocs[0]);
-  maxA.value -= GEN_FEE;
-  const covValue = allocs.reduce((s, a) => s + a.value, 0);
+  // use the SERVER's canonical covenant allocations (avoids fee-ambiguity).
+  const allocs = gres.covenant_allocations;
+  const covValue = gres.covenant_value;
   const covVout = genTx.vout.findIndex((o) => o.value && sat(o.value) === covValue);
   if (covVout < 0) fail('covenant vout not found', covValue);
 

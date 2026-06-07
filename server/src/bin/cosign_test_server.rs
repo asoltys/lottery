@@ -238,9 +238,20 @@ async fn genesis(State(hub): State<CosignHub>, Json(req): Json<GenesisReq>) -> J
     if let Some(max) = allocations.iter_mut().max_by_key(|(_, v)| *v) {
         max.1 = max.1.saturating_sub(req.fee);
     }
+    // return the canonical covenant allocations (sorted by account, as run_genesis
+    // builds them) so callers use the SERVER's truth for later refresh/unroll —
+    // avoids any ambiguity (e.g. equal deposit amounts) about which got the fee.
+    let mut canonical = allocations.clone();
+    canonical.sort_by(|a, b| a.0.cmp(&b.0));
+    let covenant_allocations: Vec<Value> = canonical
+        .iter()
+        .map(|(k, v)| json!({ "account": hex::encode(k), "value": v }))
+        .collect();
+    let covenant_value: u64 = canonical.iter().map(|(_, v)| v).sum();
     match hub.run_genesis(deposits, allocations, req.expiry, req.fee, Duration::from_secs(20)).await {
         Ok(r) => Json(json!({
             "ok": true, "valid": r.valid, "txid": r.txid, "signed_tx": r.signed_tx_hex,
+            "covenant_allocations": covenant_allocations, "covenant_value": covenant_value,
         })),
         Err(e) => Json(json!({ "ok": false, "error": e })),
     }
