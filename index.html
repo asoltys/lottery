@@ -131,6 +131,42 @@
     </div>
 
     <div class="card">
+      <div class="feedtitle">how it works · non-custodial</div>
+      <div style="font-size:13px;color:#aab4c4;line-height:1.6">
+        Your stake isn't an IOU we hold for you. The moment you enter, your contribution is recorded
+        on the contract as a <b style="color:#9fe3bd">Shadowing claim</b> tied to <i>your</i> key — so the
+        jackpot is always exactly the sum of every player's claims, never an opaque balance the operator controls.
+        <div style="margin-top:10px">
+          The engine renders that pot as a <b style="color:#9fe3bd">timeout tree</b> of per-player VTXOs: each claim
+          is a Bitcoin output you can sweep with <b>only your key</b> after a short timelock — no operator signature
+          needed. Hit <b>your exit proof</b> (it appears above once you've staked) to see the exact VTXO and the
+          <code>CSV</code> exit script that pays it to you.
+        </div>
+        <div style="margin-top:10px">
+          The draw is <b style="color:#9fe3bd">provably fair</b>: the winner is picked from a Bitcoin block hash no
+          one can predict or grind. Click any round number under "recent draws" to recompute and verify it yourself.
+        </div>
+        <details style="margin-top:10px">
+          <summary style="cursor:pointer;color:#6b8cff">the cryptography, briefly</summary>
+          <div style="margin-top:8px;color:#8a94a6;font-size:12px;line-height:1.6">
+            Claims use Cube's <code>OP_SHADOW_*</code> opcodes (invariant: contract balance ≥ Σ claims, enforced by
+            the VM). Each VTXO's key path is a <b>Projector</b> value-bound MuSig2 aggregate of your key + the engine
+            key, so a claim can't be re-bound to a different amount; the script path is your unilateral
+            <code>&lt;delay&gt; CSV DROP &lt;your key&gt; CHECKSIG</code> exit. Across rounds the pot's covenant is
+            refreshed by an N-of-N signature of all participants; anyone who goes offline is covered by a
+            <b>pre-signed unroll</b> that puts their VTXO on-chain so they can still exit alone. Today the engine
+            <i>derives and serves</i> each player's exit proof from live claims; emitting those covenants on-chain
+            every round (so the timelocked exit is enforced without trusting the engine to stay honest) is the
+            final piece being rolled out.
+          </div>
+        </details>
+        <div style="margin-top:10px;font-size:11px;color:#6b7689">
+          Running on Mutinynet (a Bitcoin signet with 30-second blocks).
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
       <div class="feedtitle">recent draws</div>
       <div id="draws"><div class="draw empty">no draws yet</div></div>
     </div>
