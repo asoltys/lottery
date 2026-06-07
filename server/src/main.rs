@@ -25,18 +25,6 @@ const DEFAULT_CONTRACT: &str = "82b2b9530ee1e22739dff2653bb95c6495f151bb3ea9b093
 const DEFAULT_MINE_ADDR: &str = "bcrt1q6eveccs27r8ckn76chzwz0ajhe2qje5yp8ks8t";
 
 fn main() {
-    // Attach the arcade when the engine's managers come up.
-    set_engine_hook(Box::new(|h: EngineHandles| {
-        let port: u16 = env::var("CUBE_ARCADE_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8090);
-        let contract_hex = env::var("CUBE_LOTTERY_CONTRACT").unwrap_or_else(|_| DEFAULT_CONTRACT.to_string());
-        let mine_address = env::var("CUBE_MINE_ADDRESS").unwrap_or_else(|_| DEFAULT_MINE_ADDR.to_string());
-        if let Ok(bytes) = hex::decode(&contract_hex) {
-            if let Ok(contract_id) = <[u8; 32]>::try_from(bytes) {
-                tokio::spawn(lottery_arcade::run_arcade(h, port, contract_id, mine_address));
-            }
-        }
-    }));
-
     let args: Vec<String> = env::args().collect();
     if args.len() != 8 {
         eprintln!(
@@ -93,6 +81,22 @@ fn main() {
         Some(k) => k,
         None => return eprintln!("invalid nsec"),
     };
+
+    // Attach the arcade when the engine's managers come up. We capture the engine
+    // SECRET (not just the pubkey in EngineHandles) so the arcade can co-sign
+    // covenant refreshes / lift-ins as the engine. Registered after the nsec is
+    // known, before runner::run (which invokes the hook once managers are up).
+    let engine_secret = secret;
+    set_engine_hook(Box::new(move |h: EngineHandles| {
+        let port: u16 = env::var("CUBE_ARCADE_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(8090);
+        let contract_hex = env::var("CUBE_LOTTERY_CONTRACT").unwrap_or_else(|_| DEFAULT_CONTRACT.to_string());
+        let mine_address = env::var("CUBE_MINE_ADDRESS").unwrap_or_else(|_| DEFAULT_MINE_ADDR.to_string());
+        if let Ok(bytes) = hex::decode(&contract_hex) {
+            if let Ok(contract_id) = <[u8; 32]>::try_from(bytes) {
+                tokio::spawn(lottery_arcade::run_arcade(h, engine_secret, port, contract_id, mine_address));
+            }
+        }
+    }));
 
     runner::run(resource_mode, chain, operating_kind, rpc_holder, sync_mode, key_holder);
 }

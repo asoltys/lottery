@@ -34,7 +34,7 @@ use cube::transmutative::bls::verify::bls_verify;
 use cube::transmutative::hash::{sha256, Hash, HashTag};
 use cube::transmutative::key::KeyHolder;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRef, Path, Query, State};
 use axum::http::header;
 use axum::response::{Html, IntoResponse};
 use axum::routing::{get, post};
@@ -51,6 +51,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 pub mod cosign;
+pub mod covenant_manager;
 
 const INDEX_HTML: &str = include_str!("../../index.html");
 const BUNDLE_JS: &str = include_str!("../../bundle.js");
@@ -118,11 +119,20 @@ struct ArcadeState {
     round_details: Arc<tokio::sync::Mutex<HashMap<u64, Value>>>,
     exec_lock: Arc<tokio::sync::Mutex<()>>,
     tx: broadcast::Sender<()>, // "state changed" signal -> WebSocket push
+    cosign_hub: cosign::CosignHub, // live N-of-N covenant refresh / lift-in cosign
+    covenant: covenant_manager::CovenantManager, // persisted on-chain pot covenant
 }
 
 impl ArcadeState {
     fn notify(&self) {
         let _ = self.tx.send(());
+    }
+}
+
+// Let axum extract the cosign hub from the arcade state for the /cosign route.
+impl FromRef<ArcadeState> for cosign::CosignHub {
+    fn from_ref(s: &ArcadeState) -> Self {
+        s.cosign_hub.clone()
     }
 }
 
@@ -554,6 +564,19 @@ async fn get_exit(State(s): State<ArcadeState>, Query(params): Query<HashMap<Str
     }
 }
 
+// The current on-chain pot covenant pointer (Phase 0: read-only view; populated
+// by deposits/refresh in Phase 1). Lets the UI + watchtower see the live covenant
+// and its pre-signed unroll.
+async fn get_covenant(State(s): State<ArcadeState>) -> Json<Value> {
+    let st = s.covenant.snapshot().await;
+    Json(json!({
+        "covenant": st.covenant,
+        "unroll_present": st.unroll.is_some(),
+        "pending_refresh_txid": st.pending_refresh_txid,
+        "cosign_connected": s.cosign_hub.connected().await.len(),
+    }))
+}
+
 // Withdraw an account's in-game balance to an arbitrary regtest address. This is
 // a custodial bridge: we verify the owner's BLS signature, debit the L2 balance,
 // and pay the equivalent on-chain from the engine's bitcoind wallet.
@@ -734,6 +757,7 @@ async fn lifecycle(s: ArcadeState) {
 /// Spawns the arcade web server + round-lifecycle task.
 pub async fn run_arcade(
     handles: cube::operative::runner::hook::EngineHandles,
+    engine_secret: [u8; 32],
     port: u16,
     contract_id: [u8; 32],
     mine_address: String,
@@ -854,6 +878,29 @@ pub async fn run_arcade(
         .map(|(_, _, idx, _)| idx)
         .unwrap_or(0);
 
+    // Verify the plumbed engine secret derives the engine pubkey the managers
+    // report — the covenant cosign is built on this identity, so a mismatch would
+    // silently break every refresh/lift-in. Loud warning, not a hard abort (the
+    // arcade still serves the L2 game; only on-chain cosign would be affected).
+    {
+        use cube::transmutative::secp::into::IntoScalar;
+        use cube::transmutative::secp::schnorr::LiftScalar;
+        match engine_secret.into_scalar() {
+            Ok(s) if s.lift().base_point_mul().serialize_xonly() == engine_key => {
+                println!("arcade: engine secret verified against engine key {}", hex::encode(engine_key));
+            }
+            _ => eprintln!(
+                "arcade: WARNING engine secret does NOT derive engine key {} — covenant cosign will fail",
+                hex::encode(engine_key)
+            ),
+        }
+    }
+    let cosign_hub = cosign::CosignHub::new(engine_secret, engine_key);
+    let covenant_path = std::env::var("CUBE_COVENANT_STATE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("arcade-covenant.json"));
+    let covenant = covenant_manager::CovenantManager::load(covenant_path);
+
     let (tx, _rx) = broadcast::channel::<()>(64);
     let state = ArcadeState {
         chain: _chain,
@@ -881,6 +928,8 @@ pub async fn run_arcade(
         round_details: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         exec_lock: Arc::new(tokio::sync::Mutex::new(())),
         tx: tx.clone(),
+        cosign_hub,
+        covenant,
     };
 
     tokio::spawn(lifecycle(state.clone()));
@@ -894,11 +943,13 @@ pub async fn run_arcade(
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/cosign", get(cosign::cosign_ws))
         .route("/", get(serve_index))
         .route("/bundle.js", get(serve_bundle))
         .route("/api/state", get(get_state))
         .route("/api/round/:n", get(get_round))
         .route("/api/exit", get(get_exit))
+        .route("/api/covenant", get(get_covenant))
         .route("/api/faucet", post(post_faucet))
         .route("/api/call", post(post_call))
         .route("/api/withdraw", post(post_withdraw))
