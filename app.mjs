@@ -8,6 +8,7 @@ import { schnorr } from '@noble/curves/secp256k1.js';
 import { sha256, sha512 } from '@noble/hashes/sha2.js';
 import { entropyToMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
+import { attachCosign } from './cosign_client.mjs';
 
 const Fr = bls.fields.Fr;
 const enc = new TextEncoder();
@@ -188,6 +189,37 @@ function render(st) {
   $('draws').innerHTML = feed || '<div class="draw empty">no draws yet</div>';
   renderStatus();
   refreshExitProof();
+  refreshCovenant();
+}
+
+// Show the player's LiftV2 deposit address (fund it to put real BTC into the pot).
+async function showDepositAddress() {
+  const el = $('depositaddr');
+  if (!el) return;
+  try {
+    const d = await api(`/api/deposit_address?account=${ME.accountKey}`);
+    if (d.address) {
+      el.innerHTML = `send BTC here to join the pot (2-of-2 with the engine, CSV-refundable):<br><code>${d.address}</code>`;
+      el.style.display = '';
+    } else { el.textContent = d.error || 'unavailable'; el.style.display = ''; }
+  } catch (e) { el.textContent = 'error: ' + e.message; el.style.display = ''; }
+}
+
+// Reflect the on-chain pot covenant + the tab's exitable claim in it.
+async function refreshCovenant() {
+  const el = $('covenantstatus');
+  if (!el) return;
+  try {
+    const c = await api('/api/covenant');
+    if (c.covenant) {
+      const mine = (c.covenant.allocations || []).find((a) => (a[0] || '').toLowerCase() === ME.accountKey.toLowerCase());
+      el.innerHTML = `pot covenant <b>${Number(c.covenant.value).toLocaleString()}</b> sat across <b>${(c.covenant.allocations || []).length}</b> players` +
+        (mine ? ` · your claim <b>${Number(mine[1]).toLocaleString()}</b> sat (exitable${c.unroll_present ? ', unroll pre-signed' : ''})` : ' · you have no claim yet') +
+        ` · ${c.cosign_connected} online to co-sign`;
+    } else {
+      el.textContent = 'no on-chain covenant yet — deposit and the engine forms one';
+    }
+  } catch (e) {}
 }
 
 // Non-custodial proof: show the player that their live stake is a unilaterally
@@ -225,12 +257,38 @@ function connectWS() {
   ws.onerror = () => { try { ws.close(); } catch (e) {} };
 }
 
+// ---- cosign WebSocket (non-custodial covenant participation) ----
+// The tab holds a second socket on /cosign and auto-co-signs covenant refreshes,
+// lift-ins, and unrolls with ITS OWN key — verifying every tx before signing
+// (musig.mjs/covenant.mjs/sighash.mjs). The server never sees the key.
+let cosignWs = null;
+let cosignDetach = null;
+function connectCosign() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  cosignWs = new WebSocket(`${proto}://${location.host}/cosign`);
+  cosignWs.addEventListener('open', () => {
+    cosignDetach = attachCosign(cosignWs, ME.secp, ME.accountKey, (kind, detail) => {
+      if (kind === 'nonce') flash('🔑 co-signing the pot covenant…');
+      else if (kind === 'complete') flash('✅ covenant co-signed', 'ok');
+      else if (kind === 'reject') flash('🛑 refused to sign (verification failed): ' + (detail.errors || []).join('; '), 'err');
+    });
+  });
+  cosignWs.addEventListener('close', () => { if (cosignDetach) { cosignDetach(); cosignDetach = null; } setTimeout(connectCosign, 1500); });
+  cosignWs.addEventListener('error', () => { try { cosignWs.close(); } catch (e) {} });
+}
+function switchCosign() {
+  if (cosignWs) { try { cosignWs.onclose = null; cosignWs.close(); } catch (e) {} }
+  if (cosignDetach) { cosignDetach(); cosignDetach = null; }
+  connectCosign();
+}
+
 // Switch the live connection to the current ME right away. Used after
 // restore/new-player so the balance updates instantly instead of waiting for
 // the 1.5s auto-reconnect (and we don't double-connect via the old onclose).
 function switchAccount() {
   if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
   connectWS();
+  switchCosign();
   // Belt-and-suspenders: also pull state over HTTP in case the socket is slow.
   api(`/api/state?account=${ME.accountKey}`).then(render).catch(() => {});
 }
@@ -397,10 +455,12 @@ function main() {
   $('exportbtn').onclick = toggleExport;
   $('restorebtn').onclick = doRestore;
   $('withdrawbtn').onclick = doWithdraw;
+  const dbtn = $('depositbtn'); if (dbtn) dbtn.onclick = showDepositAddress;
   $('copyphrase').onclick = () => copyText($('phraseout').textContent);
   flash('Welcome, ' + short(ME.accountKey) + '. Keys generated in your browser — back them up to restore later.', 'ok');
   window.addEventListener('hashchange', route);
   route(); // connects the WS on the home view, or shows a round-details page
+  connectCosign(); // participate in non-custodial covenant cosign for this tab
   setInterval(() => { if (displayTimeLeft > 0 && lastState && lastState.participants >= lastState.min_participants) displayTimeLeft--; renderStatus(); }, 1000);
 }
 main();
