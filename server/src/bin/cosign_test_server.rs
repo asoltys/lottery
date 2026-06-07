@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use cube::transmutative::secp::into::IntoScalar;
 use cube::transmutative::secp::schnorr::LiftScalar;
-use lottery_arcade::cosign::{cosign_ws, CosignHub, DepositParams, RefreshParams};
+use lottery_arcade::cosign::{cosign_ws, CosignHub, DepositParams, GenesisDeposit, RefreshParams};
 
 #[derive(Deserialize)]
 struct Alloc {
@@ -190,6 +190,54 @@ async fn deposit(State(hub): State<CosignHub>, Json(req): Json<DepositReq>) -> J
     }
 }
 
+#[derive(Deserialize)]
+struct GenesisDepositReq {
+    account: String,
+    prev_txid: String,
+    #[serde(default)]
+    prev_vout: u32,
+    prev_value: u64,
+}
+#[derive(Deserialize)]
+struct GenesisReq {
+    deposits: Vec<GenesisDepositReq>,
+    #[serde(default = "default_expiry")]
+    expiry: u32,
+    #[serde(default = "default_fee")]
+    fee: u64,
+}
+
+async fn genesis(State(hub): State<CosignHub>, Json(req): Json<GenesisReq>) -> Json<Value> {
+    let mut deposits = Vec::new();
+    let mut allocations = Vec::new();
+    for d in &req.deposits {
+        let account = match hex::decode(d.account.trim_start_matches("0x"))
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        {
+            Some(k) => k,
+            None => return Json(json!({ "ok": false, "error": "bad account key" })),
+        };
+        let prev_txid = match hex::decode(&d.prev_txid).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+            Some(t) => t,
+            None => return Json(json!({ "ok": false, "error": "bad prev_txid" })),
+        };
+        deposits.push(GenesisDeposit { account_key: account, prev_txid, prev_vout: d.prev_vout, prev_value: d.prev_value });
+        allocations.push((account, d.prev_value)); // genesis: each depositor's claim = their deposit
+    }
+    // the covenant value is total deposits minus the genesis fee; reduce the
+    // largest allocation by the fee so Σ allocations == covenant value.
+    if let Some(max) = allocations.iter_mut().max_by_key(|(_, v)| *v) {
+        max.1 = max.1.saturating_sub(req.fee);
+    }
+    match hub.run_genesis(deposits, allocations, req.expiry, req.fee, Duration::from_secs(20)).await {
+        Ok(r) => Json(json!({
+            "ok": true, "valid": r.valid, "txid": r.txid, "signed_tx": r.signed_tx_hex,
+        })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // fixed engine secret for the harness; engine x-only key is its even-Y pubkey.
@@ -215,6 +263,7 @@ async fn main() {
         .route("/trigger", post(trigger))
         .route("/trigger_evil", post(trigger_evil))
         .route("/deposit", post(deposit))
+        .route("/genesis", post(genesis))
         .with_state(hub);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8099").await.unwrap();

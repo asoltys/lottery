@@ -45,25 +45,47 @@ function verifyRefresh(ctx, message, myAccountHex) {
   }
 }
 
-// Rebuild the LiftV2 lift-in: confirm we are spending OUR OWN deposit output and
-// that the sighash matches. The destination (pot covenant) is supplied by ctx;
-// the app should compare ctx.dest_spk to its expected pot covenant.
+// Rebuild a LiftV2 lift-in (possibly multi-input: a genesis tx combining several
+// deposits into the pot covenant) and confirm: we are spending OUR OWN deposit at
+// our input index, the sighash matches, and — if a covenant is declared — the
+// output is that covenant and we keep an exitable claim in it.
 function verifyDeposit(ctx, message, myAccountHex) {
   const errors = [];
   let mySighash = null;
   try {
-    if ((ctx.account || '').toLowerCase() !== myAccountHex.toLowerCase())
-      errors.push('deposit account is not mine');
-    const depositSpk = liftV2Spk(myAccountHex, ctx.engine).spk;
-    mySighash = keyPathSighash({
-      version: 2, lockTime: 0, inputIndex: 0,
-      inputs: [{ txid: ctx.prev_txid, vout: ctx.prev_vout, value: ctx.prev_value, spk: depositSpk, sequence: 0xffffffff }],
-      outputs: [{ value: ctx.out_value, spk: ctx.dest_spk }],
-    });
+    const me = myAccountHex.toLowerCase();
+    if ((ctx.account || '').toLowerCase() !== me) errors.push('deposit account is not mine');
+    const idx = Number(ctx.input_index);
+    const myInput = (ctx.inputs || [])[idx];
+    if (!myInput || (myInput.account || '').toLowerCase() !== me)
+      errors.push('my input index does not spend my deposit');
+
+    // every input is a LiftV2 deposit spk of (input.account, engine).
+    const inputs = (ctx.inputs || []).map((i) => ({
+      txid: i.txid, vout: i.vout, value: i.value,
+      spk: liftV2Spk(i.account, ctx.engine).spk, sequence: 0xffffffff,
+    }));
+    const outputs = (ctx.outputs || []).map((o) => ({ value: o.value, spk: o.spk }));
+    mySighash = keyPathSighash({ version: 2, lockTime: 0, inputIndex: idx, inputs, outputs });
     if (mySighash.toLowerCase() !== (message || '').toLowerCase())
       errors.push('sighash mismatch — not the deposit spend described');
-    if (Number(ctx.prev_value) < Number(ctx.out_value))
-      errors.push('negative fee (prev_value < out_value)');
+
+    // value sanity: total in >= total out (non-negative fee).
+    const totalIn = inputs.reduce((s, i) => s + Number(i.value), 0);
+    const totalOut = outputs.reduce((s, o) => s + Number(o.value), 0);
+    if (totalIn < totalOut) errors.push('negative fee (Σ inputs < Σ outputs)');
+
+    // if the output is a declared covenant, confirm it and our exitable claim.
+    if (ctx.covenant) {
+      const allocs = ctx.covenant.allocations || [];
+      const expected = covenantSpk(ctx.engine, allocs, Number(ctx.covenant.expiry)).spk;
+      if ((outputs[0]?.spk || '').toLowerCase() !== expected.toLowerCase())
+        errors.push('output is not the declared pot covenant');
+      if (Number(outputs[0]?.value) !== allocs.reduce((s, a) => s + Number(a.value), 0))
+        errors.push('covenant value != Σ allocations (leaves would not sum)');
+      if (!allocs.find((a) => a.account.toLowerCase() === me))
+        errors.push('no exitable claim for me in the pot covenant');
+    }
     return { ok: errors.length === 0, errors, mySighash };
   } catch (e) {
     return { ok: false, errors: ['verify exception: ' + e.message], mySighash };

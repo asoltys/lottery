@@ -158,6 +158,14 @@ pub struct DepositParams {
     pub fee: u64,
 }
 
+/// One deposit feeding the genesis tx (a LiftV2 UTXO to be lifted into the pot).
+pub struct GenesisDeposit {
+    pub account_key: [u8; 32],
+    pub prev_txid: [u8; 32],
+    pub prev_vout: u32,
+    pub prev_value: u64,
+}
+
 fn pt(hexstr: &str) -> Option<Point> {
     Point::from_hex(hexstr).ok()
 }
@@ -474,51 +482,25 @@ impl CosignHub {
         })
     }
 
-    /// Drive a LiftV2 deposit lift-in: a cooperative 2-of-2 (account+engine)
-    /// taproot key-path cosign spending the deposit output into `dest_spk`. The
-    /// depositor cosigns from their browser (plain even-Y account secret, no
-    /// projection); the engine aggregates into the key-path witness.
-    pub async fn run_deposit(
+    /// Cosign ONE LiftV2 deposit input of a (pre-built) tx: the depositor's 2-of-2
+    /// (account+engine) key-path partial over the given input sighash, aggregated
+    /// with the engine's into the 64-byte witness. `ctx` describes the whole tx so
+    /// the depositor's browser verifies what it signs. Returns the input's sig.
+    async fn cosign_deposit_input(
         &self,
-        p: DepositParams,
+        account_key: [u8; 32],
+        sighash: [u8; 32],
+        ctx: Value,
         label: &str,
         round_timeout: Duration,
-    ) -> Result<RefreshResult, String> {
-        // --- build the lift-in tx + key-path sighash over the deposit output ---
-        let deposit_taproot = return_liftv2_taproot(p.account_key, self.engine_key)
+    ) -> Result<[u8; 64], String> {
+        let deposit_taproot = return_liftv2_taproot(account_key, self.engine_key)
             .ok_or("return_liftv2_taproot failed")?;
-        let deposit_spk = ScriptBuf::from_bytes(deposit_taproot.spk().ok_or("deposit spk")?);
-        let prev_txout = TxOut {
-            value: Amount::from_sat(p.prev_value),
-            script_pubkey: deposit_spk,
-        };
-        let outpoint = OutPoint::new(Txid::from_byte_array(p.prev_txid), p.prev_vout);
-        let mut tx = Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: outpoint,
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(p.prev_value.saturating_sub(p.fee)),
-                script_pubkey: ScriptBuf::from_bytes(p.dest_spk.clone()),
-            }],
-        };
-        let sighash = SighashCache::new(&tx)
-            .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prev_txout]), TapSighashType::Default)
-            .map_err(|e| format!("sighash: {e}"))?
-            .to_byte_array();
-
-        // pubkeys (even-Y 33-byte) the browser keyaggs: [account, engine].
-        let account_pt = p.account_key.into_point().map_err(|_| "account point")?;
+        let account_pt = account_key.into_point().map_err(|_| "account point")?;
         let engine_pt = self.engine_key.into_point().map_err(|_| "engine point")?;
         let pubkeys = vec![ser_pt(&account_pt), ser_pt(&engine_pt)];
         let tweak_hex = hex::encode(deposit_taproot.tap_tweak());
 
-        // session bookkeeping + the depositor's socket.
         let session_id = {
             let mut c = self.counter.lock().await;
             *c += 1;
@@ -526,25 +508,14 @@ impl CosignHub {
         };
         let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<SessionInput>();
         self.sessions.lock().await.insert(session_id.clone(), inbox_tx);
-        let socket = match self.participants.lock().await.get(&p.account_key) {
+        let socket = match self.participants.lock().await.get(&account_key) {
             Some(tx) => tx.clone(),
             None => {
                 self.sessions.lock().await.remove(&session_id);
-                return Err(format!("depositor {} not connected", hex::encode(p.account_key)));
+                return Err(format!("depositor {} not connected", hex::encode(account_key)));
             }
         };
 
-        // round 1: ask the depositor for a nonce.
-        let ctx = json!({
-            "kind": "deposit",
-            "engine": hex::encode(self.engine_key),
-            "account": hex::encode(p.account_key),
-            "prev_txid": hex::encode(p.prev_txid),
-            "prev_vout": p.prev_vout,
-            "prev_value": p.prev_value,
-            "dest_spk": hex::encode(&p.dest_spk),
-            "out_value": p.prev_value.saturating_sub(p.fee),
-        });
         let _ = socket.send(ServerMsg::Start {
             session: session_id.clone(),
             label: label.to_string(),
@@ -559,7 +530,6 @@ impl CosignHub {
             ctx,
         });
 
-        // collect the depositor's nonce.
         let mut client_nonce: Option<NonceMsg> = None;
         let r1 = self
             .collect(&mut inbox_rx, round_timeout, |input, st: &mut Option<NonceMsg>| match input {
@@ -581,10 +551,9 @@ impl CosignHub {
         let client_h = pt(&client_nonce.hiding).ok_or("bad client hiding nonce")?;
         let client_b = pt(&client_nonce.binding).ok_or("bad client binding nonce")?;
 
-        // engine begins: its nonces + the now-known sighash, partial-signs.
         let (eng_hn, eng_bn) = self.engine_nonces(&sighash);
         let engine = EngineCosigner::begin(
-            p.account_key,
+            account_key,
             self.engine_key,
             (*self.engine_secret).into_scalar().map_err(|_| "engine scalar")?.lift(),
             eng_hn,
@@ -596,7 +565,6 @@ impl CosignHub {
         .ok_or("engine begin failed")?;
         let (engine_h, engine_b) = engine.engine_public_nonces();
 
-        // round 2: send both nonces, request the depositor's partial.
         let nonce_vec = vec![
             client_nonce.clone(),
             NonceMsg {
@@ -605,20 +573,13 @@ impl CosignHub {
                 binding: ser_pt(&engine_b),
             },
         ];
-        let _ = socket.send(ServerMsg::AggNonces {
-            session: session_id.clone(),
-            nonces: nonce_vec,
-        });
+        let _ = socket.send(ServerMsg::AggNonces { session: session_id.clone(), nonces: nonce_vec });
 
-        // collect the depositor's partial.
         let mut client_partial: Option<Scalar> = None;
         let r2 = self
             .collect(&mut inbox_rx, round_timeout, |input, st: &mut Option<Scalar>| match input {
                 SessionInput::Partial { partial, .. } => match Scalar::from_hex(&partial) {
-                    Ok(sc) => {
-                        *st = Some(sc);
-                        true
-                    }
+                    Ok(sc) => { *st = Some(sc); true }
                     Err(_) => false,
                 },
                 _ => false,
@@ -629,33 +590,209 @@ impl CosignHub {
             return Err("timed out collecting deposit partial".into());
         }
 
-        // aggregate into the key-path signature.
         let agg_sig = engine
             .complete(client_partial.unwrap())
             .ok_or("aggregate failed (bad client partial)")?;
         let agg_key_xonly = deposit_taproot.tweaked_key().ok_or("tweaked_key")?.serialize_xonly();
-        let valid = verify_xonly(agg_key_xonly, sighash, agg_sig, SchnorrSigningMode::BIP340);
-
-        let mut witness = Witness::new();
-        witness.push(agg_sig.to_vec());
-        tx.input[0].witness = witness;
-        let signed_tx_hex = hex::encode(bitcoin::consensus::encode::serialize(&tx));
-        let txid = tx.compute_txid().to_string();
-
+        if !verify_xonly(agg_key_xonly, sighash, agg_sig, SchnorrSigningMode::BIP340) {
+            self.abort_one(&session_id, &socket, "deposit signature invalid").await;
+            return Err("deposit input signature did not verify".into());
+        }
         let _ = socket.send(ServerMsg::Complete {
             session: session_id.clone(),
             agg_sig: hex::encode(agg_sig),
-            txid: Some(txid.clone()),
+            txid: None,
         });
         self.sessions.lock().await.remove(&session_id);
+        Ok(agg_sig)
+    }
 
+    // Full-tx context for a deposit input, so the browser rebuilds + verifies the
+    // exact (multi-input) tx it signs. `inputs` lists every deposit input as
+    // (account, txid, vout, value); `covenant` (optional) lets the depositor
+    // confirm the output really is a covenant in which it keeps an exitable claim.
+    fn deposit_ctx(
+        &self,
+        my_account: [u8; 32],
+        input_index: usize,
+        inputs: &[([u8; 32], [u8; 32], u32, u64)],
+        out_value: u64,
+        out_spk: &[u8],
+        covenant: Option<Value>,
+    ) -> Value {
+        let inputs_json: Vec<Value> = inputs
+            .iter()
+            .map(|(acct, txid, vout, value)| json!({
+                "account": hex::encode(acct),
+                "txid": hex::encode(txid),
+                "vout": vout,
+                "value": value,
+            }))
+            .collect();
+        json!({
+            "kind": "deposit",
+            "engine": hex::encode(self.engine_key),
+            "account": hex::encode(my_account),
+            "input_index": input_index,
+            "inputs": inputs_json,
+            "outputs": [{ "value": out_value, "spk": hex::encode(out_spk) }],
+            "covenant": covenant,
+        })
+    }
+
+    /// Drive a single LiftV2 deposit lift-in into `dest_spk` (a 1-input tx).
+    pub async fn run_deposit(
+        &self,
+        p: DepositParams,
+        label: &str,
+        round_timeout: Duration,
+    ) -> Result<RefreshResult, String> {
+        let deposit_taproot = return_liftv2_taproot(p.account_key, self.engine_key)
+            .ok_or("return_liftv2_taproot failed")?;
+        let deposit_spk = ScriptBuf::from_bytes(deposit_taproot.spk().ok_or("deposit spk")?);
+        let prev_txout = TxOut { value: Amount::from_sat(p.prev_value), script_pubkey: deposit_spk };
+        let outpoint = OutPoint::new(Txid::from_byte_array(p.prev_txid), p.prev_vout);
+        let out_value = p.prev_value.saturating_sub(p.fee);
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(out_value),
+                script_pubkey: ScriptBuf::from_bytes(p.dest_spk.clone()),
+            }],
+        };
+        let sighash = SighashCache::new(&tx)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prev_txout]), TapSighashType::Default)
+            .map_err(|e| format!("sighash: {e}"))?
+            .to_byte_array();
+
+        let ctx = self.deposit_ctx(
+            p.account_key, 0,
+            &[(p.account_key, p.prev_txid, p.prev_vout, p.prev_value)],
+            out_value, &p.dest_spk, None,
+        );
+        let agg_sig = self.cosign_deposit_input(p.account_key, sighash, ctx, label, round_timeout).await?;
+
+        let agg_key_xonly = deposit_taproot.tweaked_key().ok_or("tweaked_key")?.serialize_xonly();
+        let valid = verify_xonly(agg_key_xonly, sighash, agg_sig, SchnorrSigningMode::BIP340);
+        let mut witness = Witness::new();
+        witness.push(agg_sig.to_vec());
+        tx.input[0].witness = witness;
         Ok(RefreshResult {
             agg_sig,
             message: sighash,
             agg_key_xonly,
             valid,
-            signed_tx_hex,
-            txid,
+            signed_tx_hex: hex::encode(bitcoin::consensus::encode::serialize(&tx)),
+            txid: tx.compute_txid().to_string(),
+        })
+    }
+
+    /// GENESIS: combine many LiftV2 deposits into the pot covenant in one tx —
+    /// inputs are the deposit UTXOs (each 2-of-2 cosigned by its depositor), the
+    /// single output is the covenant over `allocations`. Each depositor cosigns
+    /// only its own input, verifying the whole tx (incl. its covenant claim).
+    pub async fn run_genesis(
+        &self,
+        deposits: Vec<GenesisDeposit>,
+        mut allocations: Vec<([u8; 32], u64)>,
+        expiry: u32,
+        fee: u64,
+        round_timeout: Duration,
+    ) -> Result<RefreshResult, String> {
+        if deposits.is_empty() {
+            return Err("genesis needs at least one deposit".into());
+        }
+        allocations.sort_by(|a, b| a.0.cmp(&b.0));
+        let covenant_spk = covenant_scriptpubkey(self.engine_key, &allocations, expiry)
+            .ok_or("covenant_scriptpubkey failed")?;
+        let total_in: u64 = deposits.iter().map(|d| d.prev_value).sum();
+        let out_value = total_in.saturating_sub(fee);
+
+        // prevouts (each deposit's LiftV2 output) + inputs.
+        let mut prevouts: Vec<TxOut> = Vec::with_capacity(deposits.len());
+        let mut txins: Vec<TxIn> = Vec::with_capacity(deposits.len());
+        for d in &deposits {
+            let dt = return_liftv2_taproot(d.account_key, self.engine_key).ok_or("liftv2 taproot")?;
+            prevouts.push(TxOut {
+                value: Amount::from_sat(d.prev_value),
+                script_pubkey: ScriptBuf::from_bytes(dt.spk().ok_or("deposit spk")?),
+            });
+            txins.push(TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array(d.prev_txid), d.prev_vout),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            });
+        }
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: txins,
+            output: vec![TxOut {
+                value: Amount::from_sat(out_value),
+                script_pubkey: ScriptBuf::from_bytes(covenant_spk.clone()),
+            }],
+        };
+
+        let alloc_json = Value::Array(
+            allocations
+                .iter()
+                .map(|(k, v)| json!({ "account": hex::encode(k), "value": v }))
+                .collect(),
+        );
+        let covenant_ctx = json!({ "allocations": alloc_json, "expiry": expiry });
+        let input_tuples: Vec<([u8; 32], [u8; 32], u32, u64)> = deposits
+            .iter()
+            .map(|d| (d.account_key, d.prev_txid, d.prev_vout, d.prev_value))
+            .collect();
+
+        // compute every input's key-path sighash up front (cache borrows tx), then
+        // drop the cache so we can fill witnesses afterward.
+        let sighashes: Vec<[u8; 32]> = {
+            let mut cache = SighashCache::new(&tx);
+            let mut v = Vec::with_capacity(deposits.len());
+            for j in 0..deposits.len() {
+                v.push(
+                    cache
+                        .taproot_key_spend_signature_hash(j, &Prevouts::All(&prevouts), TapSighashType::Default)
+                        .map_err(|e| format!("sighash[{j}]: {e}"))?
+                        .to_byte_array(),
+                );
+            }
+            v
+        };
+
+        // cosign each deposit input (sequentially) over the full multi-input tx.
+        let mut sigs: Vec<[u8; 64]> = Vec::with_capacity(deposits.len());
+        for (j, d) in deposits.iter().enumerate() {
+            let ctx = self.deposit_ctx(
+                d.account_key, j, &input_tuples, out_value, &covenant_spk, Some(covenant_ctx.clone()),
+            );
+            let sig = self
+                .cosign_deposit_input(d.account_key, sighashes[j], ctx, "genesis", round_timeout)
+                .await?;
+            sigs.push(sig);
+        }
+        for (j, sig) in sigs.into_iter().enumerate() {
+            let mut w = Witness::new();
+            w.push(sig.to_vec());
+            tx.input[j].witness = w;
+        }
+
+        Ok(RefreshResult {
+            agg_sig: [0u8; 64], // per-input sigs are in the witnesses; no single agg here
+            message: [0u8; 32],
+            agg_key_xonly: [0u8; 32],
+            valid: true,
+            signed_tx_hex: hex::encode(bitcoin::consensus::encode::serialize(&tx)),
+            txid: tx.compute_txid().to_string(),
         })
     }
 
