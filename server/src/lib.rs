@@ -805,6 +805,79 @@ async fn post_settle_assertion(State(s): State<ArcadeState>, Json(b): Json<Settl
     }))
 }
 
+// ENFORCED SETTLE on-chain: assert the round winner AND pre-sign the covenant's
+// unroll with every leaf carrying THIS round's disprove lock (the garbled "invalid"
+// label hash). Optimistic: the unroll isn't broadcast unless disputed — but once
+// it is, each holder's real on-chain VTXO leaf is reclaimable via its disprove path
+// iff the engine asserted a wrong winner. Needs the participants connected to
+// /cosign (the unroll is an N-of-N covenant spend). Returns the assertion + the
+// pre-signed disprove-locked unroll + per-leaf spend data.
+async fn post_settle(State(s): State<ArcadeState>, Json(b): Json<SettleAssertReq>) -> Json<Value> {
+    use cube::transmutative::garble::WinnerVerifier;
+    let cov = match s.covenant.current().await {
+        Some(c) => c,
+        None => return Json(json!({"ok":false,"error":"no covenant to settle"})),
+    };
+    let allocs: Vec<([u8; 32], u64)> = cov.allocations.iter().filter_map(|(h, v)| parse_hex::<32>(h).map(|a| (a, *v))).collect();
+    if allocs.is_empty() {
+        return Json(json!({"ok":false,"error":"covenant has no stakes"}));
+    }
+    let (mut lo, mut hi, mut acc) = (Vec::new(), Vec::new(), 0u64);
+    for (_, v) in &allocs {
+        lo.push(acc);
+        acc += v;
+        hi.push(acc);
+    }
+    let total = acc;
+    let space = total.saturating_mul(ODDS_DENOM + 1).max(1);
+    let seed = b.seed.unwrap_or_else(|| u64::from_le_bytes(s.best_block_hash()[0..8].try_into().unwrap()));
+    let rg = seed % space;
+    let honest_winner = (0..allocs.len()).find(|&i| lo[i] <= rg && rg < hi[i]).map(|i| i as u32);
+    let claimed = match b.winner.or(honest_winner) {
+        Some(w) => w,
+        None => return Json(json!({"ok":false,"error":"draw landed in the house zone (rollover)","rg":rg,"total":total})),
+    };
+    let v = WinnerVerifier::new(&lo, &hi);
+    let wires = v.wires(seed ^ 0x5a5a_5a5a_5a5a_5a5a);
+    let tables = v.garble(&wires);
+    let assertion = v.assert_settle(&wires, &tables, rg, claimed);
+    let disprove_hash = assertion.disprove_hash;
+
+    // Pre-sign the covenant's unroll with every leaf locked to this round.
+    let prev_txid_internal = match bitcoin::Txid::from_str(&cov.txid) {
+        Ok(t) => t.to_byte_array(),
+        Err(_) => return Json(json!({"ok":false,"error":"bad covenant txid"})),
+    };
+    let unroll = match s
+        .cosign_hub
+        .run_unroll(allocs.clone(), cov.expiry, prev_txid_internal, cov.vout, cov.value, COVENANT_EXIT_DELAY, COVENANT_FEE, Some(disprove_hash), std::time::Duration::from_secs(30))
+        .await
+    {
+        Ok(u) => u,
+        Err(e) => return Json(json!({"ok":false,"error":format!("unroll pre-sign: {e}")})),
+    };
+    let _ = s.covenant.update(|st| {
+        st.unroll = Some(covenant_manager::PreSignedUnroll {
+            covenant_txid: cov.txid.clone(),
+            unroll_txid: unroll.txid.clone(),
+            unroll_tx_hex: unroll.signed_tx_hex.clone(),
+        });
+    }).await;
+    s.notify();
+    Json(json!({
+        "ok": true,
+        "rg": rg, "total": total, "honest_winner": honest_winner, "claimed_winner": claimed,
+        "is_honest": Some(claimed) == honest_winner,
+        "engine_key": hex::encode(s.engine_key),
+        "expiry": cov.expiry, "exit_delay": COVENANT_EXIT_DELAY,
+        "disprove_hash": hex::encode(disprove_hash),
+        "unroll_txid": unroll.txid,
+        "unroll_tx_hex": unroll.signed_tx_hex,
+        "leaves": serde_json::to_value(&unroll.leaves).unwrap_or(Value::Null),
+        "assertion": assertion,
+    }))
+}
+
 // The current on-chain pot covenant pointer (Phase 0: read-only view; populated
 // by deposits/refresh in Phase 1). Lets the UI + watchtower see the live covenant
 // and its pre-signed unroll.
@@ -1198,6 +1271,7 @@ pub async fn run_arcade(
         .route("/api/covenant/refresh", post(post_refresh))
         .route("/api/covenant/unroll", post(post_unroll))
         .route("/api/settle_assertion", post(post_settle_assertion))
+        .route("/api/settle", post(post_settle))
         .route("/api/faucet", post(post_faucet))
         .route("/api/call", post(post_call))
         .route("/api/withdraw", post(post_withdraw))
