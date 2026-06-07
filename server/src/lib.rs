@@ -89,6 +89,7 @@ const OPERATOR_BLS_HEX: &str = "b6b8aa94cee6ea6012dc787a11a1c6101f83fb5eb974a00b
 
 #[derive(Clone)]
 struct ArcadeState {
+    chain: Chain,
     engine_key: [u8; 32],
     contract_id: [u8; 32],
     registery: REGISTERY,
@@ -319,6 +320,10 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
         "recent_draws": s.recent_draws.lock().await.clone(),
         "entry_cost_hint": FAUCET_GRANT,
         "explorer_url": std::env::var("CUBE_EXPLORER_URL").ok(),
+        // Free L2 faucet + custodial on-chain cash-out are regtest-only; on
+        // signet/mainnet there is no free money and no operator-funded payout.
+        "faucet_enabled": s.chain == Chain::Regtest,
+        "network": s.chain.to_string(),
     });
 
     if let Some(acct_hex) = account {
@@ -389,6 +394,12 @@ struct FaucetReq {
     bls_key: String,
 }
 async fn post_faucet(State(s): State<ArcadeState>, Json(body): Json<FaucetReq>) -> Json<Value> {
+    // The faucet mints free L2 play-money. Only allow it on regtest (worthless
+    // coins). On signet/mainnet it's disabled so free funds can never be cashed
+    // out on-chain — real funds must come from a trustless deposit.
+    if s.chain != Chain::Regtest {
+        return Json(json!({ "error": "faucet disabled on this network — deposit to play" }));
+    }
     let (account_key, bls_key) = match (parse_hex::<32>(&body.account_key), parse_hex::<48>(&body.bls_key)) {
         (Some(a), Some(b)) => (a, b),
         _ => return Json(json!({ "error": "bad keys" })),
@@ -554,6 +565,12 @@ struct WithdrawReq {
 }
 async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawReq>) -> Json<Value> {
     let err = |m: &str| Json(json!({ "ok": false, "error": m }));
+    // Custodial on-chain payout is only allowed on regtest. On signet/mainnet it's
+    // disabled — otherwise faucet-derived (free) L2 balance could be cashed out as
+    // real BTC. Non-custodial exit is via the unilateral VTXO exit (see /api/exit).
+    if s.chain != Chain::Regtest {
+        return err("on-chain withdraw disabled on this network — exit via your VTXO (see how-it-works)");
+    }
     let account_key = match parse_hex::<32>(&body.account_key) { Some(a) => a, None => return err("bad account key") };
     let bls_key = match parse_hex::<48>(&body.bls_key) { Some(b) => b, None => return err("bad bls key") };
     let signature = match parse_hex::<96>(&body.bls_signature) { Some(x) => x, None => return err("bad signature") };
@@ -837,6 +854,7 @@ pub async fn run_arcade(
 
     let (tx, _rx) = broadcast::channel::<()>(64);
     let state = ArcadeState {
+        chain: _chain,
         engine_key,
         contract_id,
         registery: Arc::clone(registery),

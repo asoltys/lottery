@@ -156,7 +156,16 @@ function render(st) {
   $('jackpot').textContent = st.jackpot.toLocaleString();
   const a = st.account || {};
   $('balance').textContent = (a.balance || 0).toLocaleString();
-  $('registered').textContent = a.registered ? '' : ' (hit the faucet to join)';
+  // The free faucet + custodial on-chain cash-out are regtest-only. On signet/
+  // mainnet there's no free money and no operator-funded payout, so hide both.
+  const faucetEnabled = st.faucet_enabled !== false;
+  const fbtn = $('faucetbtn');
+  if (fbtn) fbtn.style.display = faucetEnabled ? '' : 'none';
+  const cashout = $('cashoutcard');
+  if (cashout) cashout.style.display = faucetEnabled ? '' : 'none';
+  $('registered').textContent = a.registered
+    ? ''
+    : (faucetEnabled ? ' (hit the faucet to join)' : ' (deposit to play)');
   if (a.registered) { ME.registeryIndex = a.registery_index; saveMe(); }
   $('participants').textContent = `${st.participants}`;
   $('roundpot').textContent = st.round_pot.toLocaleString();
