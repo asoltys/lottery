@@ -53,6 +53,10 @@ async fn connected(State(hub): State<CosignHub>) -> Json<Value> {
     Json(json!({ "connected": c }))
 }
 
+async fn engine(State(hub): State<CosignHub>) -> Json<Value> {
+    Json(json!({ "engine_key": hex::encode(hub.engine_key()) }))
+}
+
 async fn trigger(State(hub): State<CosignHub>, Json(req): Json<TriggerReq>) -> Json<Value> {
     run_trigger(hub, req, false).await
 }
@@ -95,12 +99,16 @@ async fn run_trigger(hub: CosignHub, req: TriggerReq, evil: bool) -> Json<Value>
         None
     };
 
-    // new state == old state for the harness (a no-op refresh); the point is to
-    // prove the N-of-N key-path signature, not a value transition.
+    // new state mirrors old, minus a tx fee taken from the largest allocation so
+    // the broadcast refresh actually pays a fee (out_value = Σ new < prev_value).
+    let mut new_allocations = allocations.clone();
+    if let Some(max) = new_allocations.iter_mut().max_by_key(|(_, v)| *v) {
+        max.1 = max.1.saturating_sub(req.fee);
+    }
     let params = RefreshParams {
         old_allocations: allocations.clone(),
         old_expiry: req.expiry,
-        new_allocations: allocations,
+        new_allocations,
         new_expiry: req.expiry + 1_000,
         prev_txid,
         prev_vout: req.prev_vout,
@@ -260,6 +268,7 @@ async fn main() {
     let app = Router::new()
         .route("/cosign", get(cosign_ws))
         .route("/connected", get(connected))
+        .route("/engine", get(engine))
         .route("/trigger", post(trigger))
         .route("/trigger_evil", post(trigger_evil))
         .route("/deposit", post(deposit))
