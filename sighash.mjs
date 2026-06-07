@@ -55,3 +55,40 @@ export function keyPathSighash(tx) {
   );
   return Array.from(taggedHash('TapSighash', ss), (b) => b.toString(16).padStart(2, '0')).join('');
 }
+
+// BIP341 SCRIPT-path sighash (ext_flag=1, no annex) — for unilaterally sweeping a
+// VTXO leaf via its tapscript (CSV exit). Same common fields as the key-path,
+// plus the tapleaf hash / key version / codesep position. `tapleafHash` is hex.
+export function scriptPathSighash(tx, tapleafHash) {
+  const hashType = 0x00;
+  const inSeq = (i) => (i.sequence === undefined ? 0xffffffff : i.sequence);
+  const shaPrevouts = sha256(cat(...tx.inputs.map((i) => cat(hexToBytes(i.txid), u32le(i.vout)))));
+  const shaAmounts = sha256(cat(...tx.inputs.map((i) => u64le(i.value))));
+  const shaScriptpubkeys = sha256(cat(...tx.inputs.map((i) => {
+    const spk = hexToBytes(i.spk);
+    return cat(compactSize(spk.length), spk);
+  })));
+  const shaSequences = sha256(cat(...tx.inputs.map((i) => u32le(inSeq(i)))));
+  const shaOutputs = sha256(cat(...tx.outputs.map((o) => {
+    const spk = hexToBytes(o.spk);
+    return cat(u64le(o.value), compactSize(spk.length), spk);
+  })));
+  const spendType = 0x02; // ext_flag=1 (script path), no annex
+  const ss = cat(
+    Uint8Array.from([0x00]),
+    Uint8Array.from([hashType]),
+    u32le(tx.version),
+    u32le(tx.lockTime),
+    shaPrevouts,
+    shaAmounts,
+    shaScriptpubkeys,
+    shaSequences,
+    shaOutputs,
+    Uint8Array.from([spendType]),
+    u32le(tx.inputIndex),
+    hexToBytes(tapleafHash),       // tapleaf hash
+    Uint8Array.from([0x00]),       // key version
+    u32le(0xffffffff),             // codesep position (none)
+  );
+  return Array.from(taggedHash('TapSighash', ss), (b) => b.toString(16).padStart(2, '0')).join('');
+}

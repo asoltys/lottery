@@ -44,7 +44,7 @@ use bitcoin::{
 
 use cube::constructive::txout_types::lift::lift_versions::liftv2::cosign::EngineCosigner;
 use cube::constructive::txout_types::lift::lift_versions::liftv2::liftv2::return_liftv2_taproot;
-use cube::constructive::txout_types::timeout_tree::funding_taproot;
+use cube::constructive::txout_types::timeout_tree::{funding_taproot, TimeoutTree};
 use cube::constructive::txout_types::timeout_tree::refresh::{
     covenant_scriptpubkey, engine_projected_pubkey, engine_projected_secret,
     participant_projected_pubkey, refresh_keyagg,
@@ -164,6 +164,29 @@ pub struct GenesisDeposit {
     pub prev_txid: [u8; 32],
     pub prev_vout: u32,
     pub prev_value: u64,
+}
+
+/// A materialized VTXO leaf after the unroll: what a holder needs to unilaterally
+/// sweep it (CSV exit path) with only its own key.
+#[derive(Serialize)]
+pub struct LeafInfo {
+    pub account: String,
+    pub value: u64,
+    pub vout: u32,
+    pub scriptpubkey: String,
+    pub exit_script: String,
+    pub control_block: String,
+    pub exit_delay: u16,
+}
+
+/// Result of pre-signing + assembling the unroll (covenant -> per-participant
+/// VTXO leaves), broadcastable by anyone with nobody online.
+#[derive(Serialize)]
+pub struct UnrollResult {
+    pub txid: String,
+    pub signed_tx_hex: String,
+    pub valid: bool,
+    pub leaves: Vec<LeafInfo>,
 }
 
 fn pt(hexstr: &str) -> Option<Point> {
@@ -480,6 +503,242 @@ impl CosignHub {
             signed_tx_hex,
             txid,
         })
+    }
+
+    /// UNROLL (unilateral-exit enabler): pre-sign the spend of the pot covenant
+    /// into per-participant VTXO leaves via N-of-N cosign. Anyone can broadcast the
+    /// result later with nobody online; each holder then CSV-sweeps its leaf.
+    pub async fn run_unroll(
+        &self,
+        mut allocations: Vec<([u8; 32], u64)>,
+        expiry: u32,
+        prev_txid: [u8; 32],
+        prev_vout: u32,
+        prev_value: u64,
+        exit_delay: u16,
+        fee: u64,
+        round_timeout: Duration,
+    ) -> Result<UnrollResult, String> {
+        allocations.sort_by(|a, b| a.0.cmp(&b.0));
+        let tree = TimeoutTree::build(self.engine_key, &allocations, expiry, exit_delay, None)
+            .ok_or("timeout tree build failed")?;
+        let mut outs = tree.unroll_outputs().ok_or("unroll outputs")?;
+        if outs.is_empty() {
+            return Err("no leaves to unroll".into());
+        }
+        // take the unroll tx fee from the last leaf so the tx is broadcastable.
+        let li = outs.len() - 1;
+        outs[li].value = Amount::from_sat(outs[li].value.to_sat().saturating_sub(fee));
+
+        let covenant_taproot = funding_taproot(self.engine_key, &allocations, expiry)
+            .ok_or("funding_taproot failed")?;
+        let covenant_spk = ScriptBuf::from_bytes(covenant_taproot.spk().ok_or("covenant spk")?);
+        let prev_txout = TxOut { value: Amount::from_sat(prev_value), script_pubkey: covenant_spk };
+        let outpoint = OutPoint::new(Txid::from_byte_array(prev_txid), prev_vout);
+        let mut unroll_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: outs.clone(),
+        };
+        let sighash = SighashCache::new(&unroll_tx)
+            .taproot_key_spend_signature_hash(0, &Prevouts::All(&[prev_txout]), TapSighashType::Default)
+            .map_err(|e| format!("sighash: {e}"))?
+            .to_byte_array();
+
+        // map each output to its leaf (same order) for the client ctx + sweep data.
+        let mut leaf_info: Vec<LeafInfo> = Vec::with_capacity(outs.len());
+        let mut out_json: Vec<Value> = Vec::with_capacity(outs.len());
+        for (k, leaf) in tree.leaves.iter().enumerate() {
+            let spk = leaf.scriptpubkey().ok_or("leaf spk")?;
+            let (_lh, script, cb) = leaf.exit_spend_elements().ok_or("leaf exit elements")?;
+            out_json.push(json!({
+                "value": outs[k].value.to_sat(),
+                "spk": hex::encode(outs[k].script_pubkey.as_bytes()),
+                "account": hex::encode(leaf.account_key),
+            }));
+            leaf_info.push(LeafInfo {
+                account: hex::encode(leaf.account_key),
+                value: outs[k].value.to_sat(),
+                vout: k as u32,
+                scriptpubkey: hex::encode(spk),
+                exit_script: hex::encode(script),
+                control_block: hex::encode(cb),
+                exit_delay,
+            });
+        }
+        let alloc_json = Value::Array(
+            allocations.iter().map(|(k, v)| json!({ "account": hex::encode(k), "value": v })).collect(),
+        );
+        let ctx = json!({
+            "kind": "unroll",
+            "engine": hex::encode(self.engine_key),
+            "allocations": alloc_json,
+            "expiry": expiry,
+            "prev_txid": hex::encode(prev_txid),
+            "prev_vout": prev_vout,
+            "prev_value": prev_value,
+            "outputs": out_json,
+        });
+
+        let agg_sig = self
+            .cosign_covenant_keypath(&allocations, expiry, sighash, "unroll", ctx, "unroll", round_timeout)
+            .await?;
+        let agg_key_xonly = covenant_taproot.tweaked_key().ok_or("tweaked_key")?.serialize_xonly();
+        let valid = verify_xonly(agg_key_xonly, sighash, agg_sig, SchnorrSigningMode::BIP340);
+        let mut witness = Witness::new();
+        witness.push(agg_sig.to_vec());
+        unroll_tx.input[0].witness = witness;
+
+        Ok(UnrollResult {
+            txid: unroll_tx.compute_txid().to_string(),
+            signed_tx_hex: hex::encode(bitcoin::consensus::encode::serialize(&unroll_tx)),
+            valid,
+            leaves: leaf_info,
+        })
+    }
+
+    /// Shared N-of-N covenant key-path cosign (engine + all participants) over a
+    /// given sighash. Used by the unroll; the refresh has its own inline copy. The
+    /// `ctx` (kind "refresh"|"unroll") lets each client rebuild + verify the tx.
+    async fn cosign_covenant_keypath(
+        &self,
+        allocations: &[([u8; 32], u64)],
+        expiry: u32,
+        sighash: [u8; 32],
+        kind: &str,
+        ctx: Value,
+        label: &str,
+        round_timeout: Duration,
+    ) -> Result<[u8; 64], String> {
+        let old_taproot = funding_taproot(self.engine_key, allocations, expiry).ok_or("funding_taproot")?;
+        let keyagg = refresh_keyagg(self.engine_key, allocations, expiry).ok_or("refresh_keyagg")?;
+        let tweak_hex = hex::encode(old_taproot.tap_tweak());
+        let engine_pub = engine_projected_pubkey(self.engine_key.into_point().map_err(|_| "engine point")?, allocations)
+            .ok_or("engine_projected_pubkey")?;
+        let engine_sec = engine_projected_secret(
+            (*self.engine_secret).into_scalar().map_err(|_| "engine scalar")?.lift(),
+            allocations,
+        )
+        .ok_or("engine_projected_secret")?;
+        let mut participant_pubs: Vec<([u8; 32], Point, u64, u32)> = Vec::new();
+        for (i, (account, value)) in allocations.iter().enumerate() {
+            let base = account.into_point().map_err(|_| "account point")?;
+            let proj = participant_projected_pubkey(base, *value, i as u32).ok_or("participant projected")?;
+            participant_pubs.push((*account, proj, *value, i as u32));
+        }
+        let mut pubkeys: Vec<String> = participant_pubs.iter().map(|(_, p, _, _)| ser_pt(p)).collect();
+        pubkeys.push(ser_pt(&engine_pub));
+
+        let session_id = {
+            let mut c = self.counter.lock().await;
+            *c += 1;
+            format!("{}-{}", kind, *c)
+        };
+        let (inbox_tx, mut inbox_rx) = mpsc::unbounded_channel::<SessionInput>();
+        self.sessions.lock().await.insert(session_id.clone(), inbox_tx);
+        let sockets = {
+            let parts = self.participants.lock().await;
+            let mut map: HashMap<[u8; 32], mpsc::UnboundedSender<ServerMsg>> = HashMap::new();
+            for (account, _, _, _) in &participant_pubs {
+                match parts.get(account) {
+                    Some(tx) => { map.insert(*account, tx.clone()); }
+                    None => {
+                        self.sessions.lock().await.remove(&session_id);
+                        return Err(format!("participant {} not connected", hex::encode(account)));
+                    }
+                }
+            }
+            map
+        };
+
+        let mut session = MusigSessionCtx::new(&keyagg, sighash).ok_or("session new")?;
+        let (eng_hn, eng_bn) = self.engine_nonces(&sighash);
+        if !session.insert_nonce(engine_pub, eng_hn.base_point_mul(), eng_bn.base_point_mul()) {
+            self.sessions.lock().await.remove(&session_id);
+            return Err("engine nonce rejected".into());
+        }
+        for (account, proj, value, index) in &participant_pubs {
+            let _ = sockets[account].send(ServerMsg::Start {
+                session: session_id.clone(),
+                label: label.to_string(),
+                kind: kind.to_string(),
+                project: true,
+                message: hex::encode(sighash),
+                pubkeys: pubkeys.clone(),
+                tweak: tweak_hex.clone(),
+                your_pubkey: ser_pt(proj),
+                your_value: *value,
+                your_index: *index,
+                ctx: ctx.clone(),
+            });
+        }
+
+        let mut nonces: HashMap<String, NonceMsg> = HashMap::new();
+        let want = participant_pubs.len();
+        if self
+            .collect(&mut inbox_rx, round_timeout, |input, st| match input {
+                SessionInput::Nonce(n) => {
+                    if let (Some(k), Some(h), Some(b)) = (pt(&n.pubkey), pt(&n.hiding), pt(&n.binding)) {
+                        if session.insert_nonce(k, h, b) { st.insert(n.pubkey.clone(), n); }
+                    }
+                    st.len() == want
+                }
+                _ => false,
+            }, &mut nonces, want)
+            .await
+            .is_err()
+        {
+            self.abort(&session_id, &sockets, "timed out collecting nonces").await;
+            return Err("timed out collecting nonces".into());
+        }
+
+        nonces.insert(ser_pt(&engine_pub), NonceMsg {
+            pubkey: ser_pt(&engine_pub),
+            hiding: ser_pt(&eng_hn.base_point_mul()),
+            binding: ser_pt(&eng_bn.base_point_mul()),
+        });
+        let nonce_vec: Vec<NonceMsg> = pubkeys.iter().filter_map(|k| nonces.get(k).cloned()).collect();
+        for (account, _, _, _) in &participant_pubs {
+            let _ = sockets[account].send(ServerMsg::AggNonces { session: session_id.clone(), nonces: nonce_vec.clone() });
+        }
+
+        let engine_partial = session.partial_sign(engine_sec, eng_hn, eng_bn).ok_or("engine partial_sign")?;
+        session.insert_partial_sig(engine_pub, engine_partial);
+
+        let mut partials: HashMap<String, ()> = HashMap::new();
+        if self
+            .collect(&mut inbox_rx, round_timeout, |input, st| match input {
+                SessionInput::Partial { pubkey, partial } => {
+                    if let (Some(k), Ok(sc)) = (pt(&pubkey), Scalar::from_hex(&partial)) {
+                        if session.insert_partial_sig(k, sc) { st.insert(pubkey.clone(), ()); }
+                    }
+                    st.len() == want
+                }
+                _ => false,
+            }, &mut partials, want)
+            .await
+            .is_err()
+        {
+            self.abort(&session_id, &sockets, "timed out collecting partials").await;
+            return Err("timed out collecting partials".into());
+        }
+
+        let agg_sig = session.full_agg_sig().ok_or("full_agg_sig failed")?;
+        for (account, _, _, _) in &participant_pubs {
+            let _ = sockets[account].send(ServerMsg::Complete {
+                session: session_id.clone(),
+                agg_sig: hex::encode(agg_sig),
+                txid: None,
+            });
+        }
+        self.sessions.lock().await.remove(&session_id);
+        Ok(agg_sig)
     }
 
     /// Cosign ONE LiftV2 deposit input of a (pre-built) tx: the depositor's 2-of-2

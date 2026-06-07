@@ -45,6 +45,29 @@ function verifyRefresh(ctx, message, myAccountHex) {
   }
 }
 
+// Verify an UNROLL (covenant -> per-participant VTXO leaves) before pre-signing
+// it: rebuild the covenant input spk, recompute the key-path sighash over the
+// declared leaf outputs, confirm it matches, and confirm we get a leaf. (Leaf
+// spk reconstruction in JS is a follow-up; we verify the sighash + our presence.)
+function verifyUnroll(ctx, message, myAccountHex) {
+  const errors = [];
+  let mySighash = null;
+  try {
+    const me = myAccountHex.toLowerCase();
+    const prevSpk = covenantSpk(ctx.engine, ctx.allocations, Number(ctx.expiry)).spk;
+    const inputs = [{ txid: ctx.prev_txid, vout: ctx.prev_vout, value: ctx.prev_value, spk: prevSpk, sequence: 0xffffffff }];
+    const outputs = (ctx.outputs || []).map((o) => ({ value: o.value, spk: o.spk }));
+    mySighash = keyPathSighash({ version: 2, lockTime: 0, inputIndex: 0, inputs, outputs });
+    if (mySighash.toLowerCase() !== (message || '').toLowerCase())
+      errors.push('sighash mismatch — not the unroll described');
+    if (!(ctx.outputs || []).some((o) => (o.account || '').toLowerCase() === me))
+      errors.push('no leaf for me in the unroll');
+    return { ok: errors.length === 0, errors, mySighash };
+  } catch (e) {
+    return { ok: false, errors: ['verify exception: ' + e.message], mySighash };
+  }
+}
+
 // Rebuild a LiftV2 lift-in (possibly multi-input: a genesis tx combining several
 // deposits into the pot covenant) and confirm: we are spending OUR OWN deposit at
 // our input index, the sighash matches, and — if a covenant is declared — the
@@ -118,6 +141,10 @@ export function attachCosign(ws, secpHex, accountKeyHex, onEvent = () => {}) {
           mySighash = v.mySighash;
         } else if (msg.ctx && msg.ctx.kind === 'deposit') {
           const v = verifyDeposit(msg.ctx, msg.message, accountKeyHex);
+          if (!v.ok) { onEvent('reject', { session: msg.session, errors: v.errors }); break; }
+          mySighash = v.mySighash;
+        } else if (msg.ctx && msg.ctx.kind === 'unroll') {
+          const v = verifyUnroll(msg.ctx, msg.message, accountKeyHex);
           if (!v.ok) { onEvent('reject', { session: msg.session, errors: v.errors }); break; }
           mySighash = v.mySighash;
         }

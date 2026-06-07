@@ -246,6 +246,52 @@ async fn genesis(State(hub): State<CosignHub>, Json(req): Json<GenesisReq>) -> J
     }
 }
 
+#[derive(Deserialize)]
+struct UnrollReq {
+    allocations: Vec<Alloc>,
+    prev_txid: String,
+    #[serde(default)]
+    prev_vout: u32,
+    prev_value: u64,
+    #[serde(default = "default_expiry")]
+    expiry: u32,
+    #[serde(default = "default_exit_delay")]
+    exit_delay: u16,
+    #[serde(default = "default_fee")]
+    fee: u64,
+}
+fn default_exit_delay() -> u16 {
+    6
+}
+
+async fn unroll(State(hub): State<CosignHub>, Json(req): Json<UnrollReq>) -> Json<Value> {
+    let allocations: Vec<([u8; 32], u64)> = req
+        .allocations
+        .iter()
+        .filter_map(|a| {
+            hex::decode(a.account.trim_start_matches("0x")).ok()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                .map(|k| (k, a.value))
+        })
+        .collect();
+    if allocations.len() != req.allocations.len() {
+        return Json(json!({ "ok": false, "error": "bad account key" }));
+    }
+    let prev_txid = match hex::decode(&req.prev_txid).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+        Some(t) => t,
+        None => return Json(json!({ "ok": false, "error": "bad prev_txid" })),
+    };
+    match hub
+        .run_unroll(allocations, req.expiry, prev_txid, req.prev_vout, req.prev_value, req.exit_delay, req.fee, Duration::from_secs(20))
+        .await
+    {
+        Ok(r) => Json(json!({
+            "ok": true, "valid": r.valid, "txid": r.txid, "signed_tx": r.signed_tx_hex, "leaves": r.leaves,
+        })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // fixed engine secret for the harness; engine x-only key is its even-Y pubkey.
@@ -273,6 +319,7 @@ async fn main() {
         .route("/trigger_evil", post(trigger_evil))
         .route("/deposit", post(deposit))
         .route("/genesis", post(genesis))
+        .route("/unroll", post(unroll))
         .with_state(hub);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8099").await.unwrap();
