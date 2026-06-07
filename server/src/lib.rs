@@ -741,6 +741,66 @@ async fn post_unroll(State(s): State<ArcadeState>) -> Json<Value> {
     Json(json!({ "ok": true, "unroll_txid": txid }))
 }
 
+// ENFORCED SETTLE: the engine asserts the round winner over the pot covenant and
+// publishes a garbled fraud-proof (BitVM3/ZKTLC). Bands = the covenant stakes; the
+// draw rg = seed mod space (house multiplier ODDS_DENOM). Returns a SettleAssertion
+// a challenger can verify off-chain: an HONEST winner yields no disprove secret; a
+// WRONG winner (set `winner` to force the demo's cheat) hands the challenger the
+// secret that opens the contested leaf's disprove lock. `disprove_hash` is what the
+// contested covenant leaf must commit to enforce this settle.
+#[derive(Deserialize)]
+struct SettleAssertReq {
+    #[serde(default)]
+    winner: Option<u32>, // force a (possibly wrong) winner for the demo; else honest
+    #[serde(default)]
+    seed: Option<u64>, // override the draw seed; else derived from the best block hash
+}
+async fn post_settle_assertion(State(s): State<ArcadeState>, Json(b): Json<SettleAssertReq>) -> Json<Value> {
+    use cube::transmutative::garble::WinnerVerifier;
+    let cov = match s.covenant.current().await {
+        Some(c) => c,
+        None => return Json(json!({"ok":false,"error":"no covenant to settle"})),
+    };
+    let stakes: Vec<u64> = cov.allocations.iter().map(|(_, v)| *v).collect();
+    if stakes.is_empty() {
+        return Json(json!({"ok":false,"error":"covenant has no stakes"}));
+    }
+    let (mut lo, mut hi, mut acc) = (Vec::new(), Vec::new(), 0u64);
+    for v in &stakes {
+        lo.push(acc);
+        acc += v;
+        hi.push(acc);
+    }
+    let total = acc;
+    let space = total.saturating_mul(ODDS_DENOM + 1).max(1);
+    let seed = b.seed.unwrap_or_else(|| {
+        let h = s.best_block_hash();
+        u64::from_le_bytes(h[0..8].try_into().unwrap())
+    });
+    let rg = seed % space;
+    let honest_winner = (0..stakes.len()).find(|&i| lo[i] <= rg && rg < hi[i]).map(|i| i as u32);
+    let claimed = match b.winner.or(honest_winner) {
+        Some(w) => w,
+        None => return Json(json!({"ok":false,"error":"draw landed in the house zone (rollover) — try another seed","rg":rg,"total":total})),
+    };
+    let v = WinnerVerifier::new(&lo, &hi);
+    let wires = v.wires(seed ^ 0x5a5a_5a5a_5a5a_5a5a);
+    let tables = v.garble(&wires);
+    let assertion = v.assert_settle(&wires, &tables, rg, claimed);
+    let accounts: Vec<String> = cov.allocations.iter().map(|(a, _)| a.clone()).collect();
+    Json(json!({
+        "ok": true,
+        "rg": rg, "total": total, "space": space,
+        "honest_winner": honest_winner,
+        "claimed_winner": claimed,
+        "is_honest": Some(claimed) == honest_winner,
+        "accounts": accounts,
+        "disprove_hash": hex::encode(assertion.disprove_hash),
+        "gate_count": v.gate_count(),
+        "assertion": assertion,
+    }))
+}
+
 // The current on-chain pot covenant pointer (Phase 0: read-only view; populated
 // by deposits/refresh in Phase 1). Lets the UI + watchtower see the live covenant
 // and its pre-signed unroll.
@@ -1133,6 +1193,7 @@ pub async fn run_arcade(
         .route("/api/covenant/genesis", post(post_genesis))
         .route("/api/covenant/refresh", post(post_refresh))
         .route("/api/covenant/unroll", post(post_unroll))
+        .route("/api/settle_assertion", post(post_settle_assertion))
         .route("/api/faucet", post(post_faucet))
         .route("/api/call", post(post_call))
         .route("/api/withdraw", post(post_withdraw))
