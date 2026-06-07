@@ -4,3 +4,6 @@ data/
 .env
 regtest/fixtures/
 /tmp/
+server/storage/
+server/nns_ip_address.txt
+nns_ip_address.txt
