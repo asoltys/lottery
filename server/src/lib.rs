@@ -121,7 +121,22 @@ struct ArcadeState {
     tx: broadcast::Sender<()>, // "state changed" signal -> WebSocket push
     cosign_hub: cosign::CosignHub, // live N-of-N covenant refresh / lift-in cosign
     covenant: covenant_manager::CovenantManager, // persisted on-chain pot covenant
+    pending_deposits: Arc<tokio::sync::Mutex<Vec<PendingDeposit>>>, // confirmed deposits awaiting genesis/join
 }
+
+// A confirmed LiftV2 deposit UTXO awaiting inclusion in the pot covenant.
+#[derive(Clone)]
+struct PendingDeposit {
+    account: [u8; 32],
+    txid_internal: [u8; 32], // bitcoin internal byte order (for the outpoint)
+    vout: u32,
+    value: u64,
+}
+
+// Covenant lifecycle tuning (regtest-friendly small values).
+const COVENANT_FEE: u64 = 1_000; // per genesis/refresh/unroll tx
+const COVENANT_EXIT_DELAY: u16 = 6; // CSV blocks for the demo (vs 144 in prod)
+const COVENANT_EXPIRY_WINDOW: u64 = 12_960; // CLTV engine-reclaim window above tip
 
 impl ArcadeState {
     fn notify(&self) {
@@ -154,6 +169,11 @@ impl ArcadeState {
     }
     fn rpc(&self) -> Option<Client> {
         Client::new(&self.rpc_url, Auth::UserPass(self.rpc_user.clone(), self.rpc_pass.clone())).ok()
+    }
+    // Broadcast a fully-signed tx (hex) via bitcoind; returns the display txid.
+    fn broadcast(&self, tx_hex: &str) -> Result<String, String> {
+        let rpc = self.rpc().ok_or("bitcoin rpc unavailable")?;
+        rpc.send_raw_transaction(tx_hex).map(|t| t.to_string()).map_err(|e| format!("{e}"))
     }
     fn best_block_hash(&self) -> [u8; 32] {
         self.rpc()
@@ -564,6 +584,163 @@ async fn get_exit(State(s): State<ArcadeState>, Query(params): Query<HashMap<Str
     }
 }
 
+// The LiftV2 deposit address for a player: a taproot {key-path MuSig2(account,
+// engine); script-path CSV-3mo account sweep}. Funding it and lifting it in is how
+// a player trustlessly puts real BTC into the pot covenant.
+async fn get_deposit_address(State(s): State<ArcadeState>, Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+    use cube::constructive::txout_types::lift::lift_versions::liftv2::liftv2::return_liftv2_taproot;
+    let account = match params.get("account").and_then(|a| parse_hex::<32>(a)) {
+        Some(a) => a,
+        None => return Json(json!({ "error": "bad account" })),
+    };
+    let spk = match return_liftv2_taproot(account, s.engine_key).and_then(|t| t.spk()) {
+        Some(s) => s,
+        None => return Json(json!({ "error": "could not derive deposit taproot" })),
+    };
+    let network = match s.chain {
+        Chain::Mainnet => bitcoin::Network::Bitcoin,
+        Chain::Signet => bitcoin::Network::Signet,
+        _ => bitcoin::Network::Regtest,
+    };
+    let script = bitcoin::ScriptBuf::from_bytes(spk.clone());
+    let address = match bitcoin::Address::from_script(script.as_script(), network) {
+        Ok(a) => a.to_string(),
+        Err(_) => return Json(json!({ "error": "address encode failed" })),
+    };
+    Json(json!({
+        "account": hex::encode(account),
+        "engine": hex::encode(s.engine_key),
+        "address": address,
+        "scriptpubkey": hex::encode(spk),
+    }))
+}
+
+// Register a confirmed LiftV2 deposit UTXO (verify it exists on bitcoind and its
+// spk matches LiftV2(account, engine)); queue it to join the pot covenant.
+#[derive(Deserialize)]
+struct DepositRegReq {
+    account_key: String,
+    txid: String,
+    vout: u32,
+}
+async fn post_deposit(State(s): State<ArcadeState>, Json(b): Json<DepositRegReq>) -> Json<Value> {
+    use cube::constructive::txout_types::lift::lift_versions::liftv2::liftv2::return_liftv2_taproot;
+    let account = match parse_hex::<32>(&b.account_key) { Some(a) => a, None => return Json(json!({"ok":false,"error":"bad account"})) };
+    let txid = match bitcoin::Txid::from_str(&b.txid) { Ok(t) => t, Err(_) => return Json(json!({"ok":false,"error":"bad txid"})) };
+    let rpc = match s.rpc() { Some(r) => r, None => return Json(json!({"ok":false,"error":"rpc unavailable"})) };
+    let txout = match rpc.get_tx_out(&txid, b.vout, Some(true)) {
+        Ok(Some(o)) => o,
+        Ok(None) => return Json(json!({"ok":false,"error":"utxo not found or already spent"})),
+        Err(e) => return Json(json!({"ok":false,"error":format!("{e}")})),
+    };
+    let expected = match return_liftv2_taproot(account, s.engine_key).and_then(|t| t.spk()) {
+        Some(spk) => spk,
+        None => return Json(json!({"ok":false,"error":"taproot derive failed"})),
+    };
+    if txout.script_pub_key.hex != expected {
+        return Json(json!({"ok":false,"error":"utxo spk does not match LiftV2(account, engine)"}));
+    }
+    let value = txout.value.to_sat();
+    {
+        let mut pd = s.pending_deposits.lock().await;
+        if !pd.iter().any(|d| d.txid_internal == txid.to_byte_array() && d.vout == b.vout) {
+            pd.push(PendingDeposit { account, txid_internal: txid.to_byte_array(), vout: b.vout, value });
+        }
+    }
+    Json(json!({ "ok": true, "value": value, "pending": s.pending_deposits.lock().await.len() }))
+}
+
+// GENESIS: combine all queued deposits into the pot covenant via N-of-N cosign
+// (depositors must be connected to /cosign), broadcast it, and record the covenant.
+async fn post_genesis(State(s): State<ArcadeState>) -> Json<Value> {
+    let deposits = { s.pending_deposits.lock().await.clone() };
+    if deposits.is_empty() { return Json(json!({"ok":false,"error":"no pending deposits"})); }
+    if s.covenant.current().await.is_some() { return Json(json!({"ok":false,"error":"covenant exists; use refresh to add"})); }
+    let gdeposits: Vec<cosign::GenesisDeposit> = deposits.iter().map(|d| cosign::GenesisDeposit {
+        account_key: d.account, prev_txid: d.txid_internal, prev_vout: d.vout, prev_value: d.value,
+    }).collect();
+    let mut allocs: Vec<([u8; 32], u64)> = deposits.iter().map(|d| (d.account, d.value)).collect();
+    if let Some(max) = allocs.iter_mut().max_by_key(|(_, v)| *v) { max.1 = max.1.saturating_sub(COVENANT_FEE); }
+    let tip = { s.sync_manager.lock().await.bitcoin_sync_height_tip() };
+    let expiry = (tip + COVENANT_EXPIRY_WINDOW) as u32;
+    let res = match s.cosign_hub.run_genesis(gdeposits, allocs.clone(), expiry, COVENANT_FEE, std::time::Duration::from_secs(30)).await {
+        Ok(r) => r, Err(e) => return Json(json!({"ok":false,"error":e})),
+    };
+    let txid = match s.broadcast(&res.signed_tx_hex) { Ok(t) => t, Err(e) => return Json(json!({"ok":false,"error":format!("broadcast: {e}")})) };
+    s.mine(1);
+    let mut canonical = allocs.clone();
+    canonical.sort_by(|a, b| a.0.cmp(&b.0));
+    let cov_value: u64 = canonical.iter().map(|(_, v)| v).sum();
+    let alloc_pairs: Vec<(String, u64)> = canonical.iter().map(|(k, v)| (hex::encode(k), *v)).collect();
+    let _ = s.covenant.update(|st| {
+        st.covenant = Some(covenant_manager::CovenantState { txid: txid.clone(), vout: 0, value: cov_value, allocations: alloc_pairs, expiry });
+        st.unroll = None;
+    }).await;
+    { s.pending_deposits.lock().await.clear(); }
+    s.notify();
+    Json(json!({ "ok": true, "txid": txid, "covenant_value": cov_value, "participants": canonical.len() }))
+}
+
+// REFRESH: move the pot covenant to a new allocation state (default: mirror the
+// current one) via N-of-N cosign, broadcast, then pre-sign the new unroll.
+#[derive(Deserialize)]
+struct AllocIn { account: String, value: u64 }
+#[derive(Deserialize)]
+struct RefreshReq {
+    #[serde(default)]
+    new_allocations: Option<Vec<AllocIn>>,
+}
+async fn post_refresh(State(s): State<ArcadeState>, Json(b): Json<RefreshReq>) -> Json<Value> {
+    let cov = match s.covenant.current().await { Some(c) => c, None => return Json(json!({"ok":false,"error":"no covenant"})) };
+    let old_allocs: Vec<([u8; 32], u64)> = cov.allocations.iter().filter_map(|(h, v)| parse_hex::<32>(h).map(|a| (a, *v))).collect();
+    let old_txid_internal = match bitcoin::Txid::from_str(&cov.txid) { Ok(t) => t.to_byte_array(), Err(_) => return Json(json!({"ok":false,"error":"bad covenant txid"})) };
+    let mut new_allocs: Vec<([u8; 32], u64)> = match &b.new_allocations {
+        Some(v) => v.iter().filter_map(|a| parse_hex::<32>(&a.account).map(|k| (k, a.value))).collect(),
+        None => old_allocs.clone(),
+    };
+    if new_allocs.is_empty() { return Json(json!({"ok":false,"error":"empty new allocations"})); }
+    if let Some(max) = new_allocs.iter_mut().max_by_key(|(_, v)| *v) { max.1 = max.1.saturating_sub(COVENANT_FEE); }
+    let new_expiry = cov.expiry;
+    let params = cosign::RefreshParams {
+        old_allocations: old_allocs, old_expiry: cov.expiry, new_allocations: new_allocs.clone(),
+        new_expiry, prev_txid: old_txid_internal, prev_vout: cov.vout, prev_value: cov.value,
+        fee: COVENANT_FEE, override_out_spk: None,
+    };
+    let res = match s.cosign_hub.run_refresh(params, "arcade-refresh", std::time::Duration::from_secs(30)).await {
+        Ok(r) => r, Err(e) => return Json(json!({"ok":false,"error":e})),
+    };
+    let refresh_txid = match s.broadcast(&res.signed_tx_hex) { Ok(t) => t, Err(e) => return Json(json!({"ok":false,"error":format!("broadcast: {e}")})) };
+    s.mine(1);
+    let mut canonical = new_allocs.clone();
+    canonical.sort_by(|a, b| a.0.cmp(&b.0));
+    let new_value: u64 = canonical.iter().map(|(_, v)| v).sum();
+    let alloc_pairs: Vec<(String, u64)> = canonical.iter().map(|(k, v)| (hex::encode(k), *v)).collect();
+    let new_txid_internal = match bitcoin::Txid::from_str(&refresh_txid) { Ok(t) => t.to_byte_array(), Err(_) => return Json(json!({"ok":false,"error":"bad refresh txid"})) };
+    let unroll = match s.cosign_hub.run_unroll(canonical.clone(), new_expiry, new_txid_internal, 0, new_value, COVENANT_EXIT_DELAY, COVENANT_FEE, std::time::Duration::from_secs(30)).await {
+        Ok(u) => u, Err(e) => return Json(json!({"ok":false,"error":format!("unroll presign: {e}")})),
+    };
+    let _ = s.covenant.update(|st| {
+        st.covenant = Some(covenant_manager::CovenantState { txid: refresh_txid.clone(), vout: 0, value: new_value, allocations: alloc_pairs, expiry: new_expiry });
+        st.unroll = Some(covenant_manager::PreSignedUnroll { covenant_txid: refresh_txid.clone(), unroll_txid: unroll.txid.clone(), unroll_tx_hex: unroll.signed_tx_hex.clone() });
+    }).await;
+    s.notify();
+    Json(json!({
+        "ok": true, "refresh_txid": refresh_txid, "covenant_value": new_value,
+        "unroll_txid": unroll.txid,
+        "leaves": serde_json::to_value(&unroll.leaves).unwrap_or(Value::Null),
+    }))
+}
+
+// Broadcast the pre-signed unroll (covenant -> VTXO leaves) — the cooperative or
+// forced exit path. After this, each holder unilaterally sweeps its leaf.
+async fn post_unroll(State(s): State<ArcadeState>) -> Json<Value> {
+    let snap = s.covenant.snapshot().await;
+    let unroll = match snap.unroll { Some(u) => u, None => return Json(json!({"ok":false,"error":"no pre-signed unroll"})) };
+    let txid = match s.broadcast(&unroll.unroll_tx_hex) { Ok(t) => t, Err(e) => return Json(json!({"ok":false,"error":format!("broadcast: {e}")})) };
+    s.mine(1);
+    Json(json!({ "ok": true, "unroll_txid": txid }))
+}
+
 // The current on-chain pot covenant pointer (Phase 0: read-only view; populated
 // by deposits/refresh in Phase 1). Lets the UI + watchtower see the live covenant
 // and its pre-signed unroll.
@@ -930,6 +1107,7 @@ pub async fn run_arcade(
         tx: tx.clone(),
         cosign_hub,
         covenant,
+        pending_deposits: Arc::new(tokio::sync::Mutex::new(Vec::new())),
     };
 
     tokio::spawn(lifecycle(state.clone()));
@@ -950,6 +1128,11 @@ pub async fn run_arcade(
         .route("/api/round/:n", get(get_round))
         .route("/api/exit", get(get_exit))
         .route("/api/covenant", get(get_covenant))
+        .route("/api/deposit_address", get(get_deposit_address))
+        .route("/api/deposit", post(post_deposit))
+        .route("/api/covenant/genesis", post(post_genesis))
+        .route("/api/covenant/refresh", post(post_refresh))
+        .route("/api/covenant/unroll", post(post_unroll))
         .route("/api/faucet", post(post_faucet))
         .route("/api/call", post(post_call))
         .route("/api/withdraw", post(post_withdraw))
