@@ -716,7 +716,7 @@ async fn post_refresh(State(s): State<ArcadeState>, Json(b): Json<RefreshReq>) -
     let new_value: u64 = canonical.iter().map(|(_, v)| v).sum();
     let alloc_pairs: Vec<(String, u64)> = canonical.iter().map(|(k, v)| (hex::encode(k), *v)).collect();
     let new_txid_internal = match bitcoin::Txid::from_str(&refresh_txid) { Ok(t) => t.to_byte_array(), Err(_) => return Json(json!({"ok":false,"error":"bad refresh txid"})) };
-    let unroll = match s.cosign_hub.run_unroll(canonical.clone(), new_expiry, new_txid_internal, 0, new_value, COVENANT_EXIT_DELAY, COVENANT_FEE, std::time::Duration::from_secs(30)).await {
+    let unroll = match s.cosign_hub.run_unroll(canonical.clone(), new_expiry, new_txid_internal, 0, new_value, COVENANT_EXIT_DELAY, COVENANT_FEE, None, std::time::Duration::from_secs(30)).await {
         Ok(u) => u, Err(e) => return Json(json!({"ok":false,"error":format!("unroll presign: {e}")})),
     };
     let _ = s.covenant.update(|st| {
@@ -794,7 +794,11 @@ async fn post_settle_assertion(State(s): State<ArcadeState>, Json(b): Json<Settl
         "honest_winner": honest_winner,
         "claimed_winner": claimed,
         "is_honest": Some(claimed) == honest_winner,
+        "engine_key": hex::encode(s.engine_key),
+        "expiry": cov.expiry,
+        "exit_delay": COVENANT_EXIT_DELAY,
         "accounts": accounts,
+        "stakes": stakes,
         "disprove_hash": hex::encode(assertion.disprove_hash),
         "gate_count": v.gate_count(),
         "assertion": assertion,

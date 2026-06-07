@@ -293,7 +293,7 @@ async fn unroll(State(hub): State<CosignHub>, Json(req): Json<UnrollReq>) -> Jso
         None => return Json(json!({ "ok": false, "error": "bad prev_txid" })),
     };
     match hub
-        .run_unroll(allocations, req.expiry, prev_txid, req.prev_vout, req.prev_value, req.exit_delay, req.fee, Duration::from_secs(20))
+        .run_unroll(allocations, req.expiry, prev_txid, req.prev_vout, req.prev_value, req.exit_delay, req.fee, None, Duration::from_secs(20))
         .await
     {
         Ok(r) => Json(json!({

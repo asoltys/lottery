@@ -18,10 +18,7 @@ use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::taproot::{LeafVersion, TapLeafHash};
 use bitcoin::transaction::Version;
 use bitcoin::{absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
-use bitcoin::opcodes::all::{OP_CHECKSIG, OP_EQUALVERIFY, OP_HASH160};
-use bitcoin::script::Builder;
 
-use cube::constructive::taproot::{TapLeaf, TapRoot};
 use cube::transmutative::garble::{SettleAssertion, WinnerVerifier};
 use cube::transmutative::secp::schnorr::{sign, SchnorrSigningMode};
 use secp::Scalar;
@@ -40,6 +37,9 @@ struct AssertResp {
     honest_winner: Option<u32>,
     claimed_winner: u32,
     disprove_hash: String,
+    engine_key: String,
+    expiry: u32,
+    exit_delay: u16,
     assertion: SettleAssertion,
 }
 
@@ -72,31 +72,30 @@ fn challenger_xonly() -> [u8; 32] {
     Scalar::from_slice(&CHALLENGER_SK).unwrap().base_point_mul().serialize_xonly()
 }
 
-// The contested output: a taproot whose script path is the disprove leaf gated by
-// the round's disprove hash + the challenger's key (mirrors the ZKTLC leaf).
-fn contested_taproot(disprove_hash: [u8; 32]) -> TapRoot {
-    let x = bitcoin::XOnlyPublicKey::from_slice(&challenger_xonly()).unwrap();
-    let script = Builder::new()
-        .push_opcode(OP_HASH160)
-        .push_slice(bitcoin::hashes::ripemd160::Hash::hash(&disprove_hash).to_byte_array())
-        .push_opcode(OP_EQUALVERIFY)
-        .push_x_only_key(&x)
-        .push_opcode(OP_CHECKSIG)
-        .into_script();
-    // unspendable-ish internal key (any point); only the disprove leaf matters here.
-    let inner = Scalar::from_slice(&[0x02; 32]).unwrap().base_point_mul();
-    TapRoot::key_and_script_path_single(inner, TapLeaf::new(script.to_bytes()))
+// The contested output is the challenger's ACTUAL covenant VTXO leaf — built via
+// cube's TimeoutTree with this round's disprove lock — so reclaiming it is exactly
+// the on-chain ZKTLC disprove path, not a stand-in. Returns (spk, disprove_script,
+// disprove_control_block).
+fn contested_leaf(engine_key: [u8; 32], disprove_hash: [u8; 32], expiry: u32, exit_delay: u16) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    use cube::constructive::txout_types::timeout_tree::TimeoutTree;
+    let acct = challenger_xonly();
+    let stake = 200_000u64; // the contested leaf's value
+    let tree = TimeoutTree::build(engine_key, &[(acct, stake)], expiry, exit_delay, Some(&[disprove_hash]))
+        .expect("timeout tree");
+    let leaf = &tree.leaves[0];
+    let spk = leaf.scriptpubkey().expect("leaf spk");
+    let (_lh, script, cb) = leaf.disprove_spend_elements().expect("disprove elements");
+    (spk, script, cb)
 }
 
-fn reclaim(disprove_hash: [u8; 32], secret: [u8; 32]) -> String {
-    let taproot = contested_taproot(disprove_hash);
-    let spk = taproot.spk().unwrap();
+fn reclaim(engine_key: [u8; 32], disprove_hash: [u8; 32], secret: [u8; 32], expiry: u32, exit_delay: u16) -> String {
+    let (spk, script, control_block) = contested_leaf(engine_key, disprove_hash, expiry, exit_delay);
     let addr = {
         let j = cli(&["decodescript", &hex::encode(&spk)]);
         let v: serde_json::Value = serde_json::from_str(&j).unwrap();
         v["address"].as_str().unwrap().to_string()
     };
-    // fund the contested output, confirm, locate its vout.
+    // fund the contested leaf, confirm, locate its vout.
     let fund_txid = cli(&["sendtoaddress", &addr, "0.002"]);
     cli(&["-generate", "1"]);
     let raw: serde_json::Value = serde_json::from_str(&cli(&["getrawtransaction", &fund_txid, "true"])).unwrap();
@@ -107,7 +106,7 @@ fn reclaim(disprove_hash: [u8; 32], secret: [u8; 32]) -> String {
             value = (o["value"].as_f64().unwrap() * 1e8).round() as u64;
         }
     }
-    // build the disprove spend: input = contested output, output = challenger payout.
+    // build the disprove spend: input = contested leaf, output = challenger payout.
     let dest = cli(&["getnewaddress"]);
     let dest_spk = {
         let j = cli(&["getaddressinfo", &dest]);
@@ -122,10 +121,6 @@ fn reclaim(disprove_hash: [u8; 32], secret: [u8; 32]) -> String {
             script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new(),
         }],
         output: vec![TxOut { value: Amount::from_sat(value - 500), script_pubkey: ScriptBuf::from_bytes(dest_spk) }],
-    };
-    let (_lh, script, control_block) = {
-        let leaf = taproot.tree().unwrap().leaves()[0].clone();
-        (leaf.tapleaf_hash(), leaf.tap_script(), taproot.control_block(0).unwrap().to_vec())
     };
     let script_buf = ScriptBuf::from_bytes(script.clone());
     let lh = TapLeafHash::from_script(&script_buf, LeafVersion::TapScript);
@@ -178,8 +173,9 @@ fn main() {
     println!("WRONG settle (claimed winner {}, honest {:?}): challenger derived the disprove secret.",
         wrong.claimed_winner, wrong.honest_winner);
 
-    // 3) reclaim the contested output on regtest with the secret.
-    let txid = reclaim(disprove_hash, secret);
+    // 3) reclaim the contested covenant leaf on regtest with the secret.
+    let engine_key: [u8; 32] = hex::decode(&wrong.engine_key).unwrap().try_into().unwrap();
+    let txid = reclaim(engine_key, disprove_hash, secret, wrong.expiry, wrong.exit_delay);
     cli(&["-generate", "1"]);
     let conf: serde_json::Value = serde_json::from_str(&cli(&["getrawtransaction", &txid, "true"])).unwrap();
     let confs = conf["confirmations"].as_u64().unwrap_or(0);

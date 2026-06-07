@@ -177,6 +177,10 @@ pub struct LeafInfo {
     pub exit_script: String,
     pub control_block: String,
     pub exit_delay: u16,
+    /// The disprove (fraud-proof) spend path, present when the leaf is locked to a
+    /// round's garbled "invalid" label — empty otherwise.
+    pub disprove_script: String,
+    pub disprove_control_block: String,
 }
 
 /// Result of pre-signing + assembling the unroll (covenant -> per-participant
@@ -517,10 +521,15 @@ impl CosignHub {
         prev_value: u64,
         exit_delay: u16,
         fee: u64,
+        disprove_hash: Option<[u8; 32]>,
         round_timeout: Duration,
     ) -> Result<UnrollResult, String> {
         allocations.sort_by(|a, b| a.0.cmp(&b.0));
-        let tree = TimeoutTree::build(self.engine_key, &allocations, expiry, exit_delay, None)
+        // When a round's settle is being enforced, every leaf carries that round's
+        // garbled "invalid" label as its disprove lock — so any participant who can
+        // disprove the settle reclaims their own VTXO leaf.
+        let disprove_hashes: Option<Vec<[u8; 32]>> = disprove_hash.map(|h| vec![h; allocations.len()]);
+        let tree = TimeoutTree::build(self.engine_key, &allocations, expiry, exit_delay, disprove_hashes.as_deref())
             .ok_or("timeout tree build failed")?;
         let mut outs = tree.unroll_outputs().ok_or("unroll outputs")?;
         if outs.is_empty() {
@@ -557,6 +566,11 @@ impl CosignHub {
         for (k, leaf) in tree.leaves.iter().enumerate() {
             let spk = leaf.scriptpubkey().ok_or("leaf spk")?;
             let (_lh, script, cb) = leaf.exit_spend_elements().ok_or("leaf exit elements")?;
+            // the disprove (fraud-proof) spend path, present iff a round lock is set.
+            let (disprove_script, disprove_cb) = match leaf.disprove_spend_elements() {
+                Some((_dlh, ds, dcb)) => (hex::encode(ds), hex::encode(dcb)),
+                None => (String::new(), String::new()),
+            };
             out_json.push(json!({
                 "value": outs[k].value.to_sat(),
                 "spk": hex::encode(outs[k].script_pubkey.as_bytes()),
@@ -570,6 +584,8 @@ impl CosignHub {
                 exit_script: hex::encode(script),
                 control_block: hex::encode(cb),
                 exit_delay,
+                disprove_script,
+                disprove_control_block: disprove_cb,
             });
         }
         let alloc_json = Value::Array(
