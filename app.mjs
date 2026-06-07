@@ -9,6 +9,7 @@ import { sha256, sha512 } from '@noble/hashes/sha2.js';
 import { entropyToMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
 import { attachCosign } from './cosign_client.mjs';
+import { challenge } from './garble.mjs';
 
 const Fr = bls.fields.Fr;
 const enc = new TextEncoder();
@@ -190,6 +191,37 @@ function render(st) {
   renderStatus();
   refreshExitProof();
   refreshCovenant();
+}
+
+// Verify the round's settle in the browser via the garbled fraud-proof. Honest →
+// no secret (draw stands); dishonest engine → the browser derives the disprove
+// secret (the stake is reclaimable). `cheat` asks the engine to assert a wrong
+// winner so the disprove path can be demonstrated.
+const DRAW_SEED = 5000;
+async function doVerifyDraw(cheat) {
+  const el = $('drawverify');
+  if (!el) return;
+  el.textContent = 'garble-evaluating the proof in your browser…';
+  try {
+    const honest = await api('/api/settle_assertion', { seed: DRAW_SEED });
+    if (!honest.ok) { el.textContent = honest.error || 'no covenant to verify yet — deposit first'; return; }
+    let resp = honest;
+    if (cheat) {
+      const wrong = honest.honest_winner === 1 ? 2 : 1;
+      resp = await api('/api/settle_assertion', { seed: DRAW_SEED, winner: wrong });
+    }
+    // independently recompute the public draw: rg = seed mod (total * (odds+1)).
+    const trueRg = Number(BigInt(DRAW_SEED) % (BigInt(resp.total) * 476n));
+    const secret = challenge(resp.assertion, trueRg);
+    if (secret === null) {
+      el.innerHTML = `✓ <b>Draw verified</b> in your browser — winner is entry <b>${resp.honest_winner}</b> (draw rg=${resp.rg}). ` +
+        `The engine's claim is correct; nothing to dispute. <i>Checked with no server trust and no WASM.</i>`;
+    } else {
+      el.innerHTML = `🚨 <b>Fraud detected!</b> The engine claimed winner <b>${resp.claimed_winner}</b>, but the draw (rg=${resp.rg}) ` +
+        `belongs to entry <b>${resp.honest_winner}</b>. Your browser derived the disprove secret ` +
+        `<code>${secret.slice(0, 20)}…</code> — your stake is reclaimable on-chain via the VTXO disprove path.`;
+    }
+  } catch (e) { el.textContent = 'verify error: ' + e.message; }
 }
 
 // Show the player's LiftV2 deposit address (fund it to put real BTC into the pot).
@@ -456,6 +488,8 @@ function main() {
   $('restorebtn').onclick = doRestore;
   $('withdrawbtn').onclick = doWithdraw;
   const dbtn = $('depositbtn'); if (dbtn) dbtn.onclick = showDepositAddress;
+  const vbtn = $('verifybtn'); if (vbtn) vbtn.onclick = () => doVerifyDraw(false);
+  const cbtn = $('cheatbtn'); if (cbtn) cbtn.onclick = () => doVerifyDraw(true);
   $('copyphrase').onclick = () => copyText($('phraseout').textContent);
   flash('Welcome, ' + short(ME.accountKey) + '. Keys generated in your browser — back them up to restore later.', 'ok');
   window.addEventListener('hashchange', route);

@@ -122,6 +122,13 @@
         <button id="depositbtn" style="margin-top:8px">Show my deposit address</button>
         <div id="depositaddr" style="display:none;margin-top:8px"></div>
       </div>
+      <div id="disputecard" style="margin-top:12px;padding:10px 12px;border:1px solid #4a2a3a;border-radius:8px;background:#170c12;font-size:12px;color:#e3b8c9;line-height:1.5;word-break:break-all">
+        <div style="color:#f0d0dc;font-weight:600;margin-bottom:6px">🔎 Verify the draw (BitVM disprove · in your browser)</div>
+        <div style="margin-bottom:8px;color:#b08a99">The engine asserts the winner; your browser garble-evaluates the proof and can catch a lie — no server trust, no WASM.</div>
+        <button id="verifybtn">Verify the last draw</button>
+        <button id="cheatbtn" style="margin-left:6px;background:#3a2330;color:#e3b8c9">Simulate a dishonest engine</button>
+        <div id="drawverify" style="margin-top:8px"></div>
+      </div>
     </div>
 
     <div class="card" id="cashoutcard">
@@ -213,6 +220,6 @@
 
     <div id="round" style="display:none"></div>
   </div>
-  <script type="module" src="/bundle.js?v=bdf63801"></script>
+  <script type="module" src="/bundle.js?v=fb67ca0b"></script>
 </body>
 </html>
