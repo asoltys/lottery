@@ -122,6 +122,9 @@ struct ArcadeState {
     cosign_hub: cosign::CosignHub, // live N-of-N covenant refresh / lift-in cosign
     covenant: covenant_manager::CovenantManager, // persisted on-chain pot covenant
     pending_deposits: Arc<tokio::sync::Mutex<Vec<PendingDeposit>>>, // confirmed deposits awaiting genesis/join
+    // Per-account LiftV2 deposit address watch: detected (mempool + confirmed)
+    // deposits, refreshed by the background watcher and pushed over /ws.
+    deposit_watch: Arc<tokio::sync::Mutex<HashMap<[u8; 32], DepositWatch>>>,
 }
 
 // A confirmed LiftV2 deposit UTXO awaiting inclusion in the pot covenant.
@@ -132,6 +135,22 @@ struct PendingDeposit {
     vout: u32,
     value: u64,
 }
+
+// Live view of an account's deposit address (filled by the watcher loop).
+#[derive(Clone, Default)]
+struct DepositWatch {
+    address: String,
+    scriptpubkey: String,
+    pending_sats: u64,   // sum of 0-conf (mempool) deposits
+    confirmed_sats: u64, // sum of >=1-conf deposits
+    confirmations: i64,  // confirmations of the most-confirmed deposit
+    txid: Option<String>,
+    vout: Option<u32>,
+}
+
+// bitcoind watch-only descriptor wallet that tracks players' deposit addresses
+// so we can detect deposits (incl. unconfirmed) without each client polling.
+const DEPOSIT_WATCH_WALLET: &str = "lotto-deposit-watch";
 
 // Covenant lifecycle tuning (regtest-friendly small values).
 const COVENANT_FEE: u64 = 1_000; // per genesis/refresh/unroll tx
@@ -169,6 +188,38 @@ impl ArcadeState {
     }
     fn rpc(&self) -> Option<Client> {
         Client::new(&self.rpc_url, Auth::UserPass(self.rpc_user.clone(), self.rpc_pass.clone())).ok()
+    }
+    // A bitcoind RPC client scoped to the deposit-watch wallet.
+    fn watch_rpc(&self) -> Option<Client> {
+        let url = format!("{}/wallet/{}", self.rpc_url.trim_end_matches('/'), DEPOSIT_WATCH_WALLET);
+        Client::new(&url, Auth::UserPass(self.rpc_user.clone(), self.rpc_pass.clone())).ok()
+    }
+    // Create (or load) the watch-only descriptor wallet. Idempotent.
+    fn ensure_watch_wallet(&self) {
+        let Some(rpc) = self.rpc() else { return };
+        // createwallet(name, disable_private_keys=true, blank=true, passphrase="", avoid_reuse=false, descriptors=true)
+        let created: Result<Value, _> = rpc.call("createwallet", &[
+            json!(DEPOSIT_WATCH_WALLET), json!(true), json!(true), json!(""), json!(false), json!(true),
+        ]);
+        if created.is_err() {
+            // already exists -> just load it (ignore "already loaded")
+            let _: Result<Value, _> = rpc.call("loadwallet", &[json!(DEPOSIT_WATCH_WALLET)]);
+        }
+    }
+    // Import a deposit address into the watch wallet so listunspent sees it. A
+    // small rescan window (~1 day) catches deposits sent just before the import.
+    fn import_watch_address(&self, address: &str, label: &str) {
+        let Some(wrpc) = self.watch_rpc() else { return };
+        let desc = format!("addr({})", address);
+        let checksummed = match wrpc.call::<Value>("getdescriptorinfo", &[json!(desc)]) {
+            Ok(v) => v.get("descriptor").and_then(|d| d.as_str()).map(|s| s.to_string()),
+            Err(_) => None,
+        };
+        let Some(desc) = checksummed else { return };
+        let ts = (Utc::now().timestamp() - 86_400).max(0);
+        let _: Result<Value, _> = wrpc.call("importdescriptors", &[json!([
+            { "desc": desc, "timestamp": ts, "label": label, "internal": false }
+        ])]);
     }
     // Broadcast a fully-signed tx (hex) via bitcoind; returns the display txid.
     fn broadcast(&self, tx_hex: &str) -> Result<String, String> {
@@ -377,10 +428,28 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
                     your += cur - prev;
                 }
             }
+            // Live deposit-address status (mempool + confirmed), and whether the
+            // deposit has already joined the on-chain pot covenant.
+            let dep = { s.deposit_watch.lock().await.get(&account_key).cloned() };
+            let acct_hex_lc = hex::encode(account_key);
+            let joined_sats = match s.covenant.current().await {
+                Some(cov) => cov.allocations.iter().find(|(h, _)| h.eq_ignore_ascii_case(&acct_hex_lc)).map(|(_, v)| *v).unwrap_or(0),
+                None => 0,
+            };
+            let deposit_json = dep.map(|d| json!({
+                "address": d.address,
+                "pending_sats": d.pending_sats,
+                "confirmed_sats": d.confirmed_sats,
+                "confirmations": d.confirmations,
+                "txid": d.txid,
+                "joined_sats": joined_sats,
+            }));
+
             out["account"] = json!({
                 "registered": registered, "registery_index": reg_index, "balance": balance,
                 "your_contribution": your,
                 "odds_pct": if round_total > 0 { (your as f64) * 100.0 / (round_total as f64) } else { 0.0 },
+                "deposit": deposit_json,
             });
         }
     }
@@ -584,6 +653,80 @@ async fn get_exit(State(s): State<ArcadeState>, Query(params): Query<HashMap<Str
     }
 }
 
+// Background loop: watch every registered LiftV2 deposit address via a watch-only
+// wallet's listunspent(0) (so mempool + confirmed are both visible), refresh each
+// account's DepositWatch, auto-queue confirmed deposits for the covenant, and nudge
+// /ws clients on any change. Lets the browser show a deposit (pending -> confirmed
+// -> joined) live instead of the player polling or refreshing.
+async fn deposit_watcher(s: ArcadeState) {
+    { let s2 = s.clone(); tokio::task::spawn_blocking(move || s2.ensure_watch_wallet()).await.ok(); }
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let watched: Vec<([u8; 32], String)> = {
+            let w = s.deposit_watch.lock().await;
+            w.iter().filter(|(_, v)| !v.address.is_empty()).map(|(k, v)| (*k, v.address.clone())).collect()
+        };
+        if watched.is_empty() { continue; }
+        let s2 = s.clone();
+        let unspent = tokio::task::spawn_blocking(move || {
+            let wrpc = s2.watch_rpc()?;
+            wrpc.call::<Value>("listunspent", &[json!(0), json!(9_999_999)]).ok()
+        }).await.ok().flatten();
+        let utxos = match unspent { Some(Value::Array(a)) => a, _ => continue };
+
+        // address -> (pending_sats, confirmed_sats, max_confs, deepest confirmed txid/vout)
+        let mut agg: HashMap<String, (u64, u64, i64, Option<String>, Option<u32>)> = HashMap::new();
+        // confirmed UTXOs to queue for the covenant: (address, txid_display, vout, value)
+        let mut confirmed_utxos: Vec<(String, String, u32, u64)> = Vec::new();
+        for u in &utxos {
+            let addr = u.get("address").and_then(|x| x.as_str()).unwrap_or("");
+            if addr.is_empty() { continue; }
+            let sats = (u.get("amount").and_then(|x| x.as_f64()).unwrap_or(0.0) * 1e8).round() as u64;
+            let confs = u.get("confirmations").and_then(|x| x.as_i64()).unwrap_or(0);
+            let e = agg.entry(addr.to_string()).or_insert((0, 0, 0, None, None));
+            if confs >= 1 {
+                e.1 += sats;
+                let txid = u.get("txid").and_then(|x| x.as_str()).map(|t| t.to_string());
+                let vout = u.get("vout").and_then(|x| x.as_u64()).map(|v| v as u32);
+                if e.3.is_none() || confs > e.2 { e.3 = txid.clone(); e.4 = vout; }
+                if confs > e.2 { e.2 = confs; }
+                if let (Some(t), Some(v)) = (txid, vout) { confirmed_utxos.push((addr.to_string(), t, v, sats)); }
+            } else {
+                e.0 += sats;
+                if e.3.is_none() && e.0 > 0 { e.3 = u.get("txid").and_then(|x| x.as_str()).map(|t| t.to_string()); }
+            }
+        }
+
+        let mut changed = false;
+        {
+            let mut w = s.deposit_watch.lock().await;
+            for (acct, addr) in &watched {
+                let (p, c, confs, txid, vout) = agg.get(addr).cloned().unwrap_or((0, 0, 0, None, None));
+                if let Some(e) = w.get_mut(acct) {
+                    if e.pending_sats != p || e.confirmed_sats != c || e.confirmations != confs { changed = true; }
+                    e.pending_sats = p; e.confirmed_sats = c; e.confirmations = confs; e.txid = txid; e.vout = vout;
+                }
+            }
+        }
+
+        // Auto-queue confirmed deposits into the covenant join queue (dedup by
+        // outpoint). The depositor still needs to be online to co-sign genesis.
+        if !confirmed_utxos.is_empty() {
+            let addr_to_acct: HashMap<String, [u8; 32]> = watched.iter().map(|(a, addr)| (addr.clone(), *a)).collect();
+            let mut pd = s.pending_deposits.lock().await;
+            for (addr, txid_disp, vout, value) in confirmed_utxos {
+                let Some(acct) = addr_to_acct.get(&addr) else { continue };
+                let txid_internal = match bitcoin::Txid::from_str(&txid_disp) { Ok(t) => t.to_byte_array(), Err(_) => continue };
+                if pd.iter().any(|d| d.txid_internal == txid_internal && d.vout == vout) { continue; }
+                pd.push(PendingDeposit { account: *acct, txid_internal, vout, value });
+                changed = true;
+            }
+        }
+
+        if changed { let _ = s.tx.send(()); }
+    }
+}
+
 // The LiftV2 deposit address for a player: a taproot {key-path MuSig2(account,
 // engine); script-path CSV-3mo account sweep}. Funding it and lifting it in is how
 // a player trustlessly puts real BTC into the pot covenant.
@@ -607,6 +750,22 @@ async fn get_deposit_address(State(s): State<ArcadeState>, Query(params): Query<
         Ok(a) => a.to_string(),
         Err(_) => return Json(json!({ "error": "address encode failed" })),
     };
+    // Register the address for watching + import it into the watch-only wallet so
+    // the background watcher detects deposits (incl. unconfirmed) and pushes them.
+    {
+        let mut w = s.deposit_watch.lock().await;
+        let entry = w.entry(account).or_default();
+        let first_time = entry.address.is_empty();
+        entry.address = address.clone();
+        entry.scriptpubkey = hex::encode(&spk);
+        if first_time {
+            let s2 = s.clone();
+            let addr = address.clone();
+            let label = hex::encode(account);
+            // import off the request path (getdescriptorinfo + a small rescan).
+            tokio::spawn(async move { tokio::task::spawn_blocking(move || s2.import_watch_address(&addr, &label)).await.ok(); });
+        }
+    }
     Json(json!({
         "account": hex::encode(account),
         "engine": hex::encode(s.engine_key),
@@ -1288,9 +1447,11 @@ pub async fn run_arcade(
         cosign_hub,
         covenant,
         pending_deposits: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        deposit_watch: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
     };
 
     tokio::spawn(lifecycle(state.clone()));
+    tokio::spawn(deposit_watcher(state.clone()));
     // Heartbeat: nudge WS clients periodically (reaps dead sockets, resync safety).
     tokio::spawn(async move {
         loop {

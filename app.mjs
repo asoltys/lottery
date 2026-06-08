@@ -190,8 +190,33 @@ function render(st) {
   }).join('');
   $('draws').innerHTML = feed || '<div class="draw empty">no draws yet</div>';
   renderStatus();
+  renderDeposit(a.deposit);
   refreshExitProof();
   refreshCovenant();
+}
+
+// Live deposit-address status, pushed over the same /ws as the rest of state:
+// unconfirmed (mempool) -> confirmed -> joined the pot covenant.
+function renderDeposit(d) {
+  const el = $('depositstatus');
+  if (!el) return;
+  const sat = (n) => Number(n || 0).toLocaleString();
+  const parts = [];
+  if (d) {
+    if (d.joined_sats > 0) parts.push(`🔐 <b>${sat(d.joined_sats)}</b> sat in the pot covenant (exitable with your key)`);
+    if (d.confirmed_sats > 0) parts.push(`✅ <b>${sat(d.confirmed_sats)}</b> sat confirmed (${d.confirmations} conf) — joins the pot at the next round`);
+    if (d.pending_sats > 0) parts.push(`⏳ <b>${sat(d.pending_sats)}</b> sat detected, unconfirmed — waiting for a block…`);
+  }
+  if (!parts.length) { el.style.display = 'none'; return; }
+  el.innerHTML = parts.join('<br>');
+  el.style.display = '';
+}
+
+// Register our deposit address with the server (so it starts watching the chain
+// for deposits to it) without necessarily revealing the address in the UI.
+async function ensureDepositWatch() {
+  if (!ME.accountKey) return;
+  try { await api(`/api/deposit_address?account=${ME.accountKey}`); } catch (e) {}
 }
 
 // Verify the round's settle in the browser via the garbled fraud-proof. Honest →
@@ -356,6 +381,7 @@ function switchAccount() {
   if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
   connectWS();
   switchCosign();
+  ensureDepositWatch();
   // Belt-and-suspenders: also pull state over HTTP in case the socket is slow.
   api(`/api/state?account=${ME.accountKey}`).then(render).catch(() => {});
 }
@@ -530,6 +556,7 @@ function main() {
   window.addEventListener('hashchange', route);
   route(); // connects the WS on the home view, or shows a round-details page
   connectCosign(); // participate in non-custodial covenant cosign for this tab
+  ensureDepositWatch(); // start server-side watching of our deposit address
   setInterval(() => { if (displayTimeLeft > 0 && lastState && lastState.participants >= lastState.min_participants) displayTimeLeft--; renderStatus(); }, 1000);
 }
 main();
