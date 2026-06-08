@@ -550,15 +550,26 @@ impl CosignHub {
         if outs.is_empty() {
             return Err("no leaves to unroll".into());
         }
-        // SELF-FUNDED unroll: bake the miner fee into the last leaf so this
-        // pre-signed tx is broadcastable STANDALONE by anyone — the watchtower, or a
-        // stranded player force-exiting with no operator and no CPFP funder (which is
-        // what a browser-only user is). That trustless property is why we don't use
-        // a feeless TRUC+P2A unroll here (CPFP needs an external funder = the
-        // operator). The baked fee is generous; on a busy chain a holder can still
-        // CPFP it from their own UTXO if they have one.
-        let li = outs.len() - 1;
-        outs[li].value = Amount::from_sat(outs[li].value.to_sat().saturating_sub(fee));
+        // SELF-FUNDED unroll: bake the miner fee into the leaves so this pre-signed
+        // tx is broadcastable STANDALONE by anyone — the watchtower, or a stranded
+        // player force-exiting with no operator and no CPFP funder (which is what a
+        // browser-only user is). That trustless property is why we don't use a feeless
+        // TRUC+P2A unroll here (CPFP needs an external funder = the operator).
+        //
+        // Spread the fee EVENLY across every leaf (fee/N each) — the unroll is a shared
+        // action anyone can trigger that forces EVERYONE on-chain, so no single holder
+        // should bear its whole cost. The few-sat remainder lands on the largest leaf,
+        // which can always absorb it without dusting.
+        let n = outs.len() as u64;
+        let per = fee / n;
+        let rem = fee % n;
+        for o in outs.iter_mut() {
+            o.value = Amount::from_sat(o.value.to_sat().saturating_sub(per));
+        }
+        if rem > 0 {
+            let big = outs.iter().enumerate().max_by_key(|(_, o)| o.value.to_sat()).map(|(i, _)| i).unwrap_or(0);
+            outs[big].value = Amount::from_sat(outs[big].value.to_sat().saturating_sub(rem));
+        }
 
         let covenant_taproot = funding_taproot(self.engine_key, &allocations, expiry)
             .ok_or("funding_taproot failed")?;
