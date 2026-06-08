@@ -35,8 +35,9 @@
   #enterbtn { background: #ffd75e; color: #1a1300; flex: 0 0 auto; }
   .chips { display: flex; gap: 8px; margin-top: 8px; }
   .chips { flex-wrap: wrap; }
-  .chip { background: #1b2230; color: #aab4c4; border: 1px solid #2b3545; border-radius: 999px; padding: 7px 14px; font-size: 13px; cursor: pointer; }
-  .chip.sel { background: #ffd75e; color: #1a1300; border-color: #ffd75e; font-weight: 700; }
+  .chip { flex: 1 1 0; text-align: center; background: #1b2230; color: #aab4c4; border: 1px solid #2b3545; border-radius: 999px; padding: 11px 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .chip:hover { filter: brightness(1.15); }
+  #betchips.busy .chip { opacity: .5; pointer-events: none; }
   #depositbtn, #withdrawbtn2 { background: #222b39; color: #cdd6e5; font-size: 13px; }
   #withdrawbtn2 { margin-left: 8px; }
   .me { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #8a94a6; }
@@ -116,7 +117,6 @@
         <span class="chip" data-bet="25000">25k</span>
         <span class="chip" data-bet="all">🎰 ALL IN</span>
       </div>
-      <button id="enterbtn" disabled style="width:100%;margin-top:10px">Enter</button>
       <div style="margin-top:12px;font-size:12px;color:#6b7689">you've put in <b id="yourin" style="color:#d7dce5">0</b> this round · last winner: <span id="winner">—</span></div>
       <div id="fundscard" style="margin-top:12px;padding:10px 12px;border:1px solid #2a3550;border-radius:8px;background:#0c1320;font-size:12px;color:#9fb0d0;line-height:1.5;overflow-wrap:anywhere">
         <button id="depositbtn">Add funds</button>
@@ -201,7 +201,12 @@
           <details style="margin-top:4px">
             <summary style="cursor:pointer;color:#6b8cff">For the technically curious</summary>
             <div style="margin-top:8px;color:#8a94a6;font-size:12px;line-height:1.7">
-              Each stake is recorded on the contract as a Shadowing claim bound to your key, so the pot is always exactly the sum of players' claims. The engine renders the pot as a timeout tree of per-player VTXOs: each is a Bitcoin output whose key path is a Projector value-bound MuSig2 of your key + the engine key (a claim can't be re-bound to a different amount), and whose script path is your unilateral <code>&lt;delay&gt; CSV &lt;your key&gt; CHECKSIG</code> exit. Across rounds the pot is refreshed by an N-of-N signature of all participants; anyone offline is covered by a pre-signed unroll that puts their VTXO on-chain so they can still exit alone. The unroll is a feeless TRUC (v3) transaction with a pay-to-anchor output, fee-bumped at broadcast via package-relay CPFP. The winner predicate is enforced with a garbled-circuit fraud proof (BitVM-style): the engine asserts the winner, and a wrong assertion is on-chain disprovable, letting an honest player reclaim their stake.
+              <p style="margin:0 0 10px"><b style="color:#cdd6e5">The shadow chain.</b> The contract keeps its own internal ledger — a “shadow chain” — that mirrors who owns what in the pot. Every stake adds a <i>shadow claim</i> bound to your key, and the pot is always exactly the sum of all shadow claims. Nothing here is custodial bookkeeping in a database: this shadow ledger is the source of truth the engine turns directly into real, individually-spendable Bitcoin outputs.</p>
+              <p style="margin:0 0 10px"><b style="color:#cdd6e5">Per-player VTXOs.</b> The engine renders the pot as a <i>timeout tree</i> of VTXOs (“virtual UTXOs”) — one Bitcoin output per player. Each output has two ways to be spent: a cooperative <b>key path</b>, and your own unilateral <b>script path</b>, <code>&lt;delay&gt; CSV &lt;your key&gt; CHECKSIG</code> — i.e. after a short on-chain delay you can sweep your own output with only your key.</p>
+              <p style="margin:0 0 10px"><b style="color:#cdd6e5">Value-bound MuSig2.</b> The key path is a <i>Projector value-bound MuSig2</i> key. In plain terms: MuSig2 lets several keys jointly control one output with a single combined signature. Cube's twist tweaks that combined key by your claim's <i>amount</i> (<code>pk' = pk + t·G</code>, where <code>t</code> is derived from the value), so the key is mathematically tied to a specific number of sats — a claim can't be silently re-pointed at a different amount. The key combines <i>your</i> key with the engine's, and moving the pot needs an N-of-N signature of <i>every</i> participant, so no single party — not even the operator — can move your funds.</p>
+              <p style="margin:0 0 10px"><b style="color:#cdd6e5">Exit even if everyone's gone.</b> Between rounds the pot is refreshed by an N-of-N signature of all current players. Anyone offline is covered by a pre-signed <i>unroll</i> that puts every player's VTXO on-chain so they can still exit alone. The unroll is <b>self-funded</b> — its miner fee is baked in — so <i>anyone</i> can broadcast it: a watchtower, or you from a copy your browser cached, even if this site and the operator vanish entirely. Then your CSV script path sweeps your output with just your key.</p>
+              <p style="margin:0 0 10px"><b style="color:#cdd6e5">Provably-fair winner.</b> The winner is enforced with a garbled-circuit fraud proof (BitVM-style): the engine asserts the winner, and a wrong assertion is disprovable on-chain, letting an honest player reclaim their stake.</p>
+              <p style="margin:0"><b style="color:#cdd6e5">Deposits.</b> Add funds on-chain (straight to a VTXO only you can spend), or over Lightning — a Lightning payment is swapped on-chain into that same self-custodied output, so it's non-custodial the moment it lands.</p>
             </div>
           </details>
           <p style="margin:12px 0 0;font-size:11px;color:#6b7689">
@@ -214,6 +219,6 @@
 
     <div id="round" style="display:none"></div>
   </div>
-  <script type="module" src="/bundle.js?v=ca46f73f"></script>
+  <script type="module" src="/bundle.js?v=57be4af1"></script>
 </body>
 </html>

@@ -131,7 +131,7 @@ function flash(msg, kind) {
 }
 function friendly(raw) {
   raw = raw || '';
-  if (/BalanceWouldGoNegative|PayableAccountBalanceDown/.test(raw)) return 'not enough balance — hit the faucet';
+  if (/BalanceWouldGoNegative|PayableAccountBalanceDown/.test(raw)) return 'not enough balance — add funds';
   if (/signature/i.test(raw)) return 'signature rejected';
   return raw.length > 100 ? raw.slice(0, 100) + '…' : raw;
 }
@@ -174,7 +174,7 @@ function render(st) {
   $('yourodds').textContent = (a.odds_pct ? a.odds_pct.toFixed(1) : '0.0') + '%';
   $('yourin').textContent = (a.your_contribution || 0).toLocaleString();
   $('winner').textContent = st.last_winner ? short(st.last_winner) : '—';
-  $('enterbtn').disabled = !a.registered;
+  if ($('betchips')) $('betchips').classList.toggle('disabled', !a.registered);
   // optional block-explorer link (set server-side via CUBE_EXPLORER_URL)
   const exp = $('explorerlink');
   if (st.explorer_url) { exp.href = st.explorer_url; exp.style.display = ''; }
@@ -200,23 +200,24 @@ function render(st) {
     }
     ['withdrawbtn', 'forceexitbtn', 'downloadkitbtn'].forEach((id) => { const b = $(id); if (b) b.disabled = claim <= 0; });
   }
-  updateEnterLabel();
 }
 
-// ---- betting: pick a chip (5k/10k/25k/ALL IN), Enter places that bet ----
-let selectedBet = 5000; // sats, or 'all'
-function updateEnterLabel() {
-  const btn = $('enterbtn'); if (!btn) return;
+// ---- betting: clicking a chip (5k/10k/25k/ALL IN) places that bet immediately ----
+let betting = false;
+async function doEnterBet(betSpec) {
+  if (betting) return;
   const bal = (lastState && lastState.account && lastState.account.balance) || 0;
-  const amt = selectedBet === 'all' ? bal : selectedBet;
-  btn.textContent = selectedBet === 'all' ? `🎰 Bet all (${bal.toLocaleString()})` : `Enter ${amt.toLocaleString()}`;
-}
-function selectBet(v) {
-  selectedBet = v;
-  document.querySelectorAll('#betchips .chip').forEach((c) => {
-    c.classList.toggle('sel', c.dataset.bet === String(v));
-  });
-  updateEnterLabel();
+  const amount = betSpec === 'all' ? bal : Math.min(betSpec, bal);
+  if (amount < 1) return flash('not enough balance — add funds first', 'err');
+  betting = true;
+  const chips = $('betchips'); if (chips) chips.classList.add('busy');
+  try {
+    const r = await enter(amount);
+    if (r.ok) flash(`Entered ${amount.toLocaleString()} into the jackpot!`, 'ok');
+    else flash('Enter failed: ' + friendly(r.error), 'err');
+  } catch (e) { flash('Enter error: ' + e.message, 'err'); }
+  betting = false;
+  if (chips) chips.classList.remove('busy');
 }
 
 // When a confirmed deposit hasn't been credited to the in-game balance yet,
@@ -258,12 +259,12 @@ function renderDeposit(d) {
   const sat = (n) => Number(n || 0).toLocaleString();
   const parts = [];
   if (d) {
-    if (d.confirmed_sats > 0) {
-      parts.push(d.claimable_sats > 0
-        ? `✅ <b>${sat(d.confirmed_sats)}</b> sat received — adding to your balance…`
-        : `✅ <b>${sat(d.confirmed_sats)}</b> sat received & added to your balance`);
-    }
-    if (d.pending_sats > 0) parts.push(`⏳ <b>${sat(d.pending_sats)}</b> sat incoming — waiting for confirmation…`);
+    // Only TRANSIENT states show: incoming (unconfirmed) and the brief crediting
+    // window (claimable). A fully-credited deposit shows nothing — the balance
+    // already reflects it (and a toast confirmed it), so it doesn't linger or
+    // reappear on refresh.
+    if (d.pending_sats > 0) parts.push(`⏳ <b>${sat(d.pending_sats)}</b> sats incoming — waiting for confirmation…`);
+    if (d.claimable_sats > 0) parts.push(`✅ <b>${sat(d.claimable_sats)}</b> sats received — adding to your balance…`);
   }
   if (!parts.length) { el.style.display = 'none'; return; }
   el.innerHTML = parts.join('<br>');
@@ -301,7 +302,7 @@ async function lnDeposit() {
     const bolt11 = r.bolt11;
     const res = $('lnresult');
     res.innerHTML = `${qrSvg(bolt11)}
-      <div style="margin-top:8px;font-size:11px;color:#6b7689">pay this ${amt.toLocaleString()}-sat invoice from any Mutinynet Lightning wallet — your balance updates automatically when it arrives.</div>
+      <div style="margin-top:8px;font-size:11px;color:#6b7689">pay this ${amt.toLocaleString()}-sats invoice from any Mutinynet Lightning wallet — your balance updates automatically when it arrives.</div>
       <div class="kv" style="margin-top:8px"><div class="kvv" style="text-align:left">${bolt11}</div><button class="mini" id="lncopy">copy</button></div>
       <a href="lightning:${bolt11}" class="rlink" style="font-size:12px;color:#6b8cff">open in wallet →</a>`;
     res.style.display = '';
@@ -379,19 +380,6 @@ async function doFaucet() {
     flash(`Faucet sent 10,000. Balance: ${r.balance.toLocaleString()}.`, 'ok');
   } catch (e) { flash('Faucet error: ' + e.message, 'err'); }
   $('faucetbtn').disabled = false; // state update arrives via WS push
-}
-
-async function doEnter() {
-  const bal = (lastState && lastState.account && lastState.account.balance) || 0;
-  const amount = selectedBet === 'all' ? bal : Math.min(selectedBet, bal);
-  if (amount < 1) return flash('not enough balance — add funds first', 'err');
-  $('enterbtn').disabled = true;
-  try {
-    const r = await enter(amount);
-    if (r.ok) flash(`Entered ${amount.toLocaleString()} into the jackpot!`, 'ok');
-    else flash('Enter failed: ' + friendly(r.error), 'err');
-  } catch (e) { flash('Enter error: ' + e.message, 'err'); }
-  $('enterbtn').disabled = false; // re-enable (next state push re-derives it)
 }
 
 // Decode a bech32/bech32m address to its scriptPubKey hex (so we can verify the
@@ -561,23 +549,14 @@ function renderRound(d) {
     recomputed = r.toString();
     ok = Number(r) === d.r;
   } catch (e) {}
-  const segs = (d.segments || []).map((s) => {
-    const isMe = (s.key || '').toLowerCase() === mine;
-    const who = isMe ? 'YOU' : short(s.key);
-    const note = s.winner ? '🏆 winner' : '';
-    return bandRow(`${who} · ${Number(s.contribution).toLocaleString()}`, s.lower, s.upper, d.space, (s.winner ? 'win' : '') + (isMe ? ' me' : ''), note);
-  }).join('');
-  const houseRow = d.house > 0
-    ? bandRow('house / rollover zone', d.round_total, d.space, d.space, 'house', d.rollover ? '🎲 landed here → rollover' : 'no winner if r lands here')
-    : '';
   const odds = d.space > 0 ? (d.round_total * 100) / d.space : 0;
   const rakePct = d.rake_percent != null ? d.rake_percent : 1;
   const rake = Math.floor((d.amount || 0) * rakePct / 100);
   const winnerAmt = (d.amount || 0) - rake;
   const winnerName = (d.winner || '').toLowerCase() === mine ? 'You' : short(d.winner);
   const outcome = d.rollover
-    ? `🎲 <b>No winner</b> — the draw missed every entry, so the entire ${Number(d.amount).toLocaleString()}-sat jackpot rolled into the next round.`
-    : `🏆 <b>${winnerName}</b> won the round. The ${Number(d.amount).toLocaleString()}-sat pot paid out <b>${Number(winnerAmt).toLocaleString()}</b> to the winner and a ${rakePct}% operator rake of <b>${Number(rake).toLocaleString()}</b>.`;
+    ? `🎲 <b>No winner</b> — the draw missed every entry, so the entire ${Number(d.amount).toLocaleString()}-sats jackpot rolled into the next round.`
+    : `🏆 <b>${winnerName}</b> won the round. The ${Number(d.amount).toLocaleString()}-sats pot paid out <b>${Number(winnerAmt).toLocaleString()}</b> to the winner and a ${rakePct}% operator rake of <b>${Number(rake).toLocaleString()}</b>.`;
   return `<div class="card round">
     <a class="back" href="#">← back to the jackpot</a>
     <h2>Round ${d.round}</h2>
@@ -597,8 +576,6 @@ function renderRound(d) {
       <div>draw <code>r = seed mod space</code> = <b>${Number(d.r).toLocaleString()}</b>
         ${recomputed !== null ? `<span class="${ok ? 'okv' : 'errv'}">${ok ? '✓ recomputed in your browser' : '✗ recompute=' + recomputed}</span>` : ''}</div>
     </div>
-    <div class="feedtitle" style="margin-top:14px">the number line (${Number(d.space).toLocaleString()} wide)</div>
-    <div class="segs">${segs}${houseRow}</div>
   </div>`;
 }
 // One draw-feed row (shared by the home feed and the full-history page).
@@ -708,7 +685,6 @@ function registerServiceWorker() {
 function main() {
   $('me').textContent = short(ME.accountKey);
   $('faucetbtn').onclick = doFaucet;
-  $('enterbtn').onclick = doEnter;
   $('newbtn').onclick = newPlayer;
   $('exportbtn').onclick = toggleExport;
   $('restorebtn').onclick = doRestore;
@@ -717,9 +693,14 @@ function main() {
     dismissDepositStatus();
     const s = $('fundsub'); s.style.display = s.style.display === 'none' ? '' : 'none';
   };
-  const btcbtn = $('btcdepositbtn'); if (btcbtn) btcbtn.onclick = () => { dismissDepositStatus(); showDepositAddress(); };
+  const btcbtn = $('btcdepositbtn'); if (btcbtn) btcbtn.onclick = () => {
+    dismissDepositStatus();
+    const ln = $('lnbox'); if (ln) ln.style.display = 'none'; // Bitcoin & Lightning are mutually exclusive
+    showDepositAddress();
+  };
   const lnbtn = $('lndepositbtn'); if (lnbtn) lnbtn.onclick = () => {
     dismissDepositStatus();
+    const da = $('depositaddr'); if (da) da.style.display = 'none';
     const box = $('lnbox'); box.style.display = box.style.display === 'none' ? '' : 'none';
   };
   const lncbtn = $('lncreatebtn'); if (lncbtn) lncbtn.onclick = lnDeposit;
@@ -729,9 +710,8 @@ function main() {
   const febtn = $('forceexitbtn'); if (febtn) febtn.onclick = doForceExit;
   const dkbtn = $('downloadkitbtn'); if (dkbtn) dkbtn.onclick = downloadExitKit;
   document.querySelectorAll('#betchips .chip').forEach((c) => {
-    c.onclick = () => selectBet(c.dataset.bet === 'all' ? 'all' : parseInt(c.dataset.bet, 10));
+    c.onclick = () => doEnterBet(c.dataset.bet === 'all' ? 'all' : parseInt(c.dataset.bet, 10));
   });
-  selectBet(5000);
   $('copyphrase').onclick = () => copyText($('phraseout').textContent);
   flash('Welcome, ' + short(ME.accountKey) + '. Keys generated in your browser — back them up to restore later.', 'ok');
   window.addEventListener('hashchange', route);
