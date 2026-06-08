@@ -276,9 +276,14 @@ impl ArcadeState {
         };
         let Some(desc) = checksummed else { return };
         let ts = (Utc::now().timestamp() - 86_400).max(0);
-        let _: Result<Value, _> = wrpc.call("importdescriptors", &[json!([
-            { "desc": desc, "timestamp": ts, "label": label, "internal": false }
+        // NB: do NOT pass `internal: false` — Core 29 rejects an addr() descriptor
+        // with `internal:false` + a label ("Internal addresses should not have a
+        // label"), which silently broke all deposit detection after the v25->v29
+        // upgrade. Omitting it (defaults to a receive/labeled import) works.
+        let res: Result<Value, _> = wrpc.call("importdescriptors", &[json!([
+            { "desc": desc, "timestamp": ts, "label": label }
         ])]);
+        if let Err(e) = res { eprintln!("import_watch_address {address}: {e}"); }
     }
     // Persist the set of credited deposit outpoints (atomic temp + rename).
     async fn persist_credited(&self) {
