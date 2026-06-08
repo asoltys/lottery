@@ -687,6 +687,31 @@ async fn get_exit(State(s): State<ArcadeState>, Query(params): Query<HashMap<Str
 // -> joined) live instead of the player polling or refreshing.
 async fn deposit_watcher(s: ArcadeState) {
     { let s2 = s.clone(); tokio::task::spawn_blocking(move || s2.ensure_watch_wallet()).await.ok(); }
+    // Rebuild the watch map from the wallet's imported addresses (label = account
+    // hex), so deposits keep being tracked across restarts without the client
+    // having to re-register its address.
+    {
+        let s2 = s.clone();
+        let rebuilt = tokio::task::spawn_blocking(move || {
+            let wrpc = s2.watch_rpc()?;
+            let labels: Vec<String> = wrpc.call("listlabels", &[]).ok()?;
+            let mut out: Vec<([u8; 32], String)> = Vec::new();
+            for label in labels {
+                let Some(acct) = parse_hex::<32>(&label) else { continue };
+                if let Ok(Value::Object(addrs)) = wrpc.call::<Value>("getaddressesbylabel", &[json!(label)]) {
+                    for addr in addrs.keys() { out.push((acct, addr.clone())); }
+                }
+            }
+            Some(out)
+        }).await.ok().flatten();
+        if let Some(map) = rebuilt {
+            let mut w = s.deposit_watch.lock().await;
+            for (acct, addr) in map {
+                let e = w.entry(acct).or_default();
+                if e.address.is_empty() { e.address = addr; }
+            }
+        }
+    }
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         let watched: Vec<([u8; 32], String)> = {
