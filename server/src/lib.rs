@@ -1102,16 +1102,34 @@ async fn post_ln_webhook(State(s): State<ArcadeState>, Json(b): Json<Value>) -> 
         }
     };
     let amount = if received > 0 { received } else { inv.amount };
-    let send = json!({ "address": inv.deposit_address, "amount": amount });
-    match coinos_post(&s, "/bitcoin/send", send).await {
-        Ok(p) => {
-            eprintln!("ln-swap: sent {} sat on-chain to {} (coinos id {:?})", amount, inv.deposit_address, p.get("id"));
-            Json(json!({"ok":true}))
+    // Swap on-chain by sending from the dedicated lotto wallet straight to the
+    // LiftV2 deposit address. We do this via OUR bitcoind RPC (a simple
+    // sendtoaddress) rather than Coinos's /bitcoin/send, because the Mutinynet node
+    // has no txindex and Coinos's send path calls getrawtransaction. The LN receipt
+    // accrues in the lotto Coinos/CLN balance; the on-chain float (lotto wallet) is
+    // the operator's swap liquidity (drained/refilled out of band).
+    // helper: undo the idempotency claim so a webhook redelivery can retry.
+    async fn revert(s: &ArcadeState, secret: &str) {
+        if let Some(i) = s.ln_invoices.lock().await.get_mut(secret) { i.swapped = false; }
+    }
+    let addr = match bitcoin::Address::from_str(&inv.deposit_address) {
+        Ok(a) => a.assume_checked(),
+        Err(e) => { revert(&s, &secret).await; return Json(json!({"ok":false,"error":format!("bad deposit address: {e}")})); }
+    };
+    let wallet = std::env::var("COINOS_SWAP_WALLET").unwrap_or_else(|_| "lotto".to_string());
+    let client = match Client::new(&format!("{}/wallet/{}", s.rpc_url.trim_end_matches('/'), wallet), Auth::UserPass(s.rpc_user.clone(), s.rpc_pass.clone())) {
+        Ok(c) => c,
+        Err(e) => { revert(&s, &secret).await; return Json(json!({"ok":false,"error":format!("swap wallet rpc: {e}")})); }
+    };
+    match client.send_to_address(&addr, bitcoin::Amount::from_sat(amount), None, None, None, None, None, None) {
+        Ok(txid) => {
+            eprintln!("ln-swap: sent {amount} sat on-chain to {} txid {txid}", inv.deposit_address);
+            Json(json!({"ok":true,"txid":txid.to_string()}))
         }
         Err(e) => {
-            eprintln!("ln-swap FAILED for {}: {}", inv.deposit_address, e);
-            if let Some(i) = s.ln_invoices.lock().await.get_mut(&secret) { i.swapped = false; } // allow retry
-            Json(json!({"ok":false,"error":e}))
+            eprintln!("ln-swap FAILED for {}: {e}", inv.deposit_address);
+            revert(&s, &secret).await; // allow retry on a later webhook redelivery
+            Json(json!({"ok":false,"error":format!("{e}")}))
         }
     }
 }
