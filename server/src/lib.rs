@@ -57,6 +57,9 @@ pub mod covenant_manager;
 
 const INDEX_HTML: &str = include_str!("../../index.html");
 const BUNDLE_JS: &str = include_str!("../../bundle.js");
+const SW_JS: &str = include_str!("../../sw.js");
+const MANIFEST_JSON: &str = include_str!("../../manifest.webmanifest");
+const EXIT_TOOL_JS: &str = include_str!("../../exit-tool.bundle.js");
 
 // Lottery v2 state keys (mirror tests/lottery_v2.rs).
 const KEY_TOTAL: u8 = 0x54; // running total ever
@@ -411,6 +414,8 @@ fn asset(name: &str, embedded: &'static str) -> String {
 }
 // no-store: the UI ships often and the index/bundle must stay in lockstep, so
 // never let a browser serve a stale bundle against fresh HTML (or vice versa).
+// (The service worker keeps its OWN offline copy via the Cache API, independent
+// of this header, so the operator-gone escape hatch still loads with no server.)
 const NO_CACHE: &str = "no-store, must-revalidate";
 async fn serve_index() -> impl IntoResponse {
     ([(header::CACHE_CONTROL, NO_CACHE)], Html(asset("index.html", INDEX_HTML)))
@@ -423,6 +428,55 @@ async fn serve_bundle() -> impl IntoResponse {
         ],
         asset("bundle.js", BUNDLE_JS),
     )
+}
+// The service worker is served with a short revalidate (no-cache) so browsers
+// re-check it on every navigation and pick up a new shell version promptly.
+async fn serve_sw() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+            // allow the SW to control the whole origin even though it's served from /sw.js
+            (header::HeaderName::from_static("service-worker-allowed"), "/"),
+        ],
+        asset("sw.js", SW_JS),
+    )
+}
+async fn serve_manifest() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/manifest+json; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        asset("manifest.webmanifest", MANIFEST_JSON),
+    )
+}
+// The bundled standalone exit tool — the client fetches this once (online) and
+// inlines it into a self-contained, downloadable HTML escape hatch.
+async fn serve_exit_tool() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, NO_CACHE),
+        ],
+        asset("exit-tool.bundle.js", EXIT_TOOL_JS),
+    )
+}
+
+// The public mempool/REST broadcaster for this chain — the operator-gone fallback
+// the browser uses to push its pre-signed unroll when /api/broadcast is dead.
+// Overridable via CUBE_MEMPOOL_API; None on regtest (no public broadcaster).
+fn mempool_api(s: &ArcadeState) -> Option<String> {
+    if let Ok(v) = std::env::var("CUBE_MEMPOOL_API") {
+        let v = v.trim().trim_end_matches('/').to_string();
+        if !v.is_empty() { return Some(v); }
+    }
+    match s.chain {
+        Chain::Mainnet => Some("https://mempool.space/api".into()),
+        // this deployment's signet IS Mutinynet — its public esplora lives here.
+        Chain::Signet => Some("https://mutinynet.com/api".into()),
+        _ => None,
+    }
 }
 
 // Commit the execution delta to permanent storage.
@@ -1122,7 +1176,8 @@ async fn get_exit_kit(State(s): State<ArcadeState>, Query(params): Query<HashMap
     let leaf = &tree.leaves[leaf_idx];
     let spk = leaf.scriptpubkey().unwrap_or_default();
     let (_lh, script, cb) = leaf.exit_spend_elements().unwrap_or_default();
-    // the precise on-chain leaf value (the last leaf is reduced by the P2A anchor).
+    // the precise on-chain leaf value (the unroll is self-funded — the last leaf
+    // is reduced by the baked fee, so read the actual vout value off the tx).
     let leaf_value = s.rpc()
         .and_then(|c| c.call::<Value>("decoderawtransaction", &[json!(unroll.unroll_tx_hex)]).ok())
         .and_then(|d| d["vout"].as_array().and_then(|o| o.get(leaf_idx)).and_then(|o| o["value"].as_f64()))
@@ -1132,6 +1187,11 @@ async fn get_exit_kit(State(s): State<ArcadeState>, Query(params): Query<HashMap
         "ok": true,
         "unroll_tx_hex": unroll.unroll_tx_hex,
         "unroll_txid": unroll.unroll_txid,
+        // public broadcaster for an operator-gone exit (None on regtest).
+        "mempool_api": mempool_api(&s),
+        // a baked sweep fee for the offline standalone tool (best-effort; live
+        // clients re-fetch /api/feerate instead).
+        "exit_sweep_fee": s.estimate_fee(exit_sweep_vsize()),
         "leaf": {
             "vout": leaf_idx,
             "value": leaf_value,
@@ -1198,7 +1258,8 @@ async fn presign_unroll(s: &ArcadeState, cov_txid: &str, cov_vout: u32, cov_valu
     let txid_internal = match bitcoin::Txid::from_str(cov_txid) { Ok(t) => t.to_byte_array(), Err(_) => return };
     let mut canon = allocs.to_vec();
     canon.sort_by(|a, b| a.0.cmp(&b.0));
-    if let Ok(u) = s.cosign_hub.run_unroll(canon, expiry, txid_internal, cov_vout, cov_value, COVENANT_EXIT_DELAY, 0, None, std::time::Duration::from_secs(30)).await {
+    let fee = s.estimate_fee(unroll_vsize(canon.len() as u64));
+    if let Ok(u) = s.cosign_hub.run_unroll(canon, expiry, txid_internal, cov_vout, cov_value, COVENANT_EXIT_DELAY, fee, None, std::time::Duration::from_secs(30)).await {
         let cov_txid = cov_txid.to_string();
         let _ = s.covenant.update(|st| {
             st.unroll = Some(covenant_manager::PreSignedUnroll { covenant_txid: cov_txid, unroll_txid: u.txid, unroll_tx_hex: u.signed_tx_hex });
@@ -1532,10 +1593,16 @@ async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawRe
             fee, override_out_spk: None, payout: Some((account_key, out, dest_spk.clone())),
         }, None)
     } else {
-        // multi member: payout output to you + a new covenant for the rest. The
-        // surplus (your claim − payout = your gameplay loss) and the fee fold into
-        // the remaining pot (added to the first remaining member). Conserves exactly.
-        let new_cov_value = cov.value - payout - fee;
+        // multi member: payout output to you + a new covenant for the rest.
+        // The LEAVER pays their OWN on-chain exit fee — it comes out of your payout,
+        // never out of the other members' pot. Nobody is charged for an exit they
+        // didn't initiate. (The operator pays nothing either: this is a key-path
+        // spend of the covenant itself, with no operator-funded input.)
+        if payout <= fee { return err("withdraw amount too small to cover its on-chain exit fee"); }
+        let payout_out = payout - fee; // you receive your balance minus your fee
+        // The remaining covenant keeps everything else: the other members' claims
+        // PLUS your gameplay losses (claim − payout), with no fee skimmed off them.
+        let new_cov_value = cov.value - payout;
         let rem_sum: u64 = remaining.iter().map(|(_, v)| v).sum();
         let surplus = new_cov_value as i64 - rem_sum as i64;
         let mut new_allocs = remaining.clone();
@@ -1549,7 +1616,7 @@ async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawRe
             old_allocations: old_allocs.clone(), old_expiry: cov.expiry,
             new_allocations: new_allocs, new_expiry: cov.expiry,
             prev_txid: old_txid_internal, prev_vout: cov.vout, prev_value: cov.value,
-            fee, override_out_spk: None, payout: Some((account_key, payout, dest_spk.clone())),
+            fee, override_out_spk: None, payout: Some((account_key, payout_out, dest_spk.clone())),
         }, Some((new_cov_value, alloc_pairs)))
     };
 
@@ -1939,6 +2006,9 @@ pub async fn run_arcade(
         .route("/cosign", get(cosign::cosign_ws))
         .route("/", get(serve_index))
         .route("/bundle.js", get(serve_bundle))
+        .route("/sw.js", get(serve_sw))
+        .route("/manifest.webmanifest", get(serve_manifest))
+        .route("/exit-tool.bundle.js", get(serve_exit_tool))
         .route("/api/state", get(get_state))
         .route("/api/round/:n", get(get_round))
         .route("/api/exit", get(get_exit))

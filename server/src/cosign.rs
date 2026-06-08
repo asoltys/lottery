@@ -550,18 +550,15 @@ impl CosignHub {
         if outs.is_empty() {
             return Err("no leaves to unroll".into());
         }
-        // The unroll pays NO miner fee itself: it carries a small pay-to-anchor
-        // (P2A) output `OP_1 <0x4e73>` and is broadcast via package-relay CPFP (a
-        // child spends the anchor and pays current fees) — so this pre-signed tx
-        // never has a stale baked-in fee. The anchor is funded with a tiny dust-safe
-        // value (recovered by the CPFP child) rather than 0, so it relays on every
-        // Core 28+ node (ephemeral 0-value anchors are stricter pre-29). TRUC (v3) +
-        // P2A + package relay need a Core 28+ node.
-        let _ = fee; // miner fee is paid by the CPFP child at broadcast time
-        const ANCHOR_VALUE: u64 = 330;
+        // SELF-FUNDED unroll: bake the miner fee into the last leaf so this
+        // pre-signed tx is broadcastable STANDALONE by anyone — the watchtower, or a
+        // stranded player force-exiting with no operator and no CPFP funder (which is
+        // what a browser-only user is). That trustless property is why we don't use
+        // a feeless TRUC+P2A unroll here (CPFP needs an external funder = the
+        // operator). The baked fee is generous; on a busy chain a holder can still
+        // CPFP it from their own UTXO if they have one.
         let li = outs.len() - 1;
-        outs[li].value = Amount::from_sat(outs[li].value.to_sat().saturating_sub(ANCHOR_VALUE));
-        outs.push(TxOut { value: Amount::from_sat(ANCHOR_VALUE), script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x02, 0x4e, 0x73]) });
+        outs[li].value = Amount::from_sat(outs[li].value.to_sat().saturating_sub(fee));
 
         let covenant_taproot = funding_taproot(self.engine_key, &allocations, expiry)
             .ok_or("funding_taproot failed")?;
@@ -569,7 +566,7 @@ impl CosignHub {
         let prev_txout = TxOut { value: Amount::from_sat(prev_value), script_pubkey: covenant_spk };
         let outpoint = OutPoint::new(Txid::from_byte_array(prev_txid), prev_vout);
         let mut unroll_tx = Transaction {
-            version: Version::non_standard(3), // TRUC: lets the feeless parent be CPFP'd via package relay
+            version: Version::TWO, // self-funded (baked fee) → broadcastable standalone, no CPFP
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: outpoint,
@@ -612,9 +609,6 @@ impl CosignHub {
                 disprove_control_block: disprove_cb,
             });
         }
-        // The P2A anchor output (no account/leaf) — included so cosigners rebuild
-        // the exact anchored unroll and verify the sighash.
-        out_json.push(json!({ "value": 330, "spk": "51024e73", "account": "" }));
         let alloc_json = Value::Array(
             allocations.iter().map(|(k, v)| json!({ "account": hex::encode(k), "value": v })).collect(),
         );

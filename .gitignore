@@ -5,5 +5,8 @@ data/
 regtest/fixtures/
 /tmp/
 server/storage/
+storage/
 server/nns_ip_address.txt
 nns_ip_address.txt
+arcade-credited.json
+covenant.json

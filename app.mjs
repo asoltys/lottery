@@ -390,12 +390,34 @@ async function doForceExit() {
     try { kit = await api(`/api/exit_kit?account=${ME.accountKey}`); if (kit && kit.ok) localStorage.setItem('exitkit:' + ME.accountKey, JSON.stringify(kit)); } catch (e) {}
     if (!kit || !kit.ok) { const c = localStorage.getItem('exitkit:' + ME.accountKey); if (c) kit = JSON.parse(c); }
     if (!kit || !kit.ok || !kit.leaf) return flash((kit && kit.error) || 'no exit kit available yet', 'err');
-    const broadcast = async (hex) => { const r = await api('/api/broadcast', { tx_hex: hex }); if (!r.ok) throw new Error(r.error); return r.txid; };
+    const mp = (kit.mempool_api || '').replace(/\/$/, ''); // public broadcaster, if any
+    // Broadcast: prefer the operator's node; if it's gone, push straight to the
+    // public mempool API (esplora /tx accepts a raw-hex body, returns the txid).
+    const broadcast = async (hex) => {
+      try { const r = await api('/api/broadcast', { tx_hex: hex }); if (r && r.ok) return r.txid; if (r && r.error) throw new Error(r.error); } catch (e) {}
+      if (!mp) throw new Error('operator broadcast failed and no public broadcaster for this network');
+      const res = await fetch(mp + '/tx', { method: 'POST', headers: { 'content-type': 'text/plain' }, body: hex });
+      const txt = (await res.text()).trim();
+      if (!res.ok || !/^[0-9a-f]{64}$/i.test(txt)) throw new Error('public broadcast rejected: ' + txt.slice(0, 200));
+      return txt;
+    };
+    // Confirmation depth of utxid: try the operator first, else esplora
+    // (confirmations = tip_height - block_height + 1).
+    const confirmations = async (utxid) => {
+      try { const st = await api(`/api/txstatus?txid=${utxid}&vout=${kit.leaf.vout}`); if (typeof st.confirmations === 'number') return st.confirmations; } catch (e) {}
+      if (!mp) return 0;
+      try {
+        const st = await (await fetch(`${mp}/tx/${utxid}/status`)).json();
+        if (!st || !st.confirmed) return 0;
+        const tip = parseInt(await (await fetch(`${mp}/blocks/tip/height`)).text(), 10);
+        return Number.isFinite(tip) && st.block_height ? tip - st.block_height + 1 : 1;
+      } catch (e) { return 0; }
+    };
     flash('Force exit: broadcasting your unroll, waiting for the CSV delay…');
     const afterUnroll = async (utxid) => {
-      for (let i = 0; i < 150; i++) {
+      for (let i = 0; i < 240; i++) {
         await new Promise((r) => setTimeout(r, 4000));
-        try { const st = await api(`/api/txstatus?txid=${utxid}&vout=${kit.leaf.vout}`); if (st.confirmations >= kit.leaf.exit_delay) return; } catch (e) {}
+        if (await confirmations(utxid) >= kit.leaf.exit_delay) return;
       }
     };
     let fee = 600;
@@ -407,6 +429,62 @@ async function doForceExit() {
     $('wdaddr').value = ''; $('withdrawbox').style.display = 'none';
   } catch (e) { flash('Force exit error: ' + e.message, 'err'); }
   $('forceexitbtn').disabled = false;
+}
+
+// Download a self-contained HTML escape hatch: bakes in the current exit kit + this
+// tab's base secret + the bundled exit tool, so the player can force-exit later from
+// their local disk with NO server, NO DNS, NO operator. The file holds a secret key —
+// treat it like a wallet backup.
+async function downloadExitKit() {
+  try {
+    let kit = null;
+    try { kit = await api(`/api/exit_kit?account=${ME.accountKey}`); if (kit && kit.ok) localStorage.setItem('exitkit:' + ME.accountKey, JSON.stringify(kit)); } catch (e) {}
+    if (!kit || !kit.ok) { const c = localStorage.getItem('exitkit:' + ME.accountKey); if (c) kit = JSON.parse(c); }
+    if (!kit || !kit.ok || !kit.leaf) return flash((kit && kit.error) || 'no exit kit available to download yet', 'err');
+    if (!kit.mempool_api) return flash('this network has no public broadcaster — the offline tool needs one', 'err');
+    if (!confirm('This file contains your SECRET KEY in plain text — anyone who opens it can move your exited funds. Save it somewhere private (like a password manager or encrypted drive). Download it?')) return;
+    const tool = await (await fetch('/exit-tool.bundle.js', { headers: { 'ngrok-skip-browser-warning': 'true' } })).text();
+    const payload = JSON.stringify({ kit, secp: ME.secp });
+    const html = exitToolHtml(payload, tool, ME.accountKey);
+    const blob = new Blob([html], { type: 'text/html' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `cube-exit-${ME.accountKey.slice(0, 8)}.html`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    flash('Exit kit downloaded — keep it private. It can recover your funds even if this site disappears.', 'ok');
+  } catch (e) { flash('Download error: ' + e.message, 'err'); }
+}
+
+// Assemble the standalone HTML around the injected payload + bundled tool.
+function exitToolHtml(payloadJson, toolJs, account) {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cube — Force Exit (${account.slice(0, 8)})</title>
+<style>
+  body { margin:0; background:#0b0e14; color:#d7dce5; font-family:ui-monospace,Menlo,monospace; display:flex; justify-content:center; }
+  .wrap { width:100%; max-width:560px; padding:28px 20px 60px; }
+  h1 { color:#fff; font-size:20px; } .sub { color:#6b7689; font-size:12px; margin-bottom:16px; line-height:1.5; }
+  .warn { color:#f3b6ae; background:#2a1518; border:1px solid #5a2a2a; border-radius:8px; padding:10px 12px; font-size:12px; margin-bottom:16px; line-height:1.5; }
+  input { width:100%; background:#0f141d; border:1px solid #2b3545; border-radius:10px; color:#fff; font-family:inherit; font-size:15px; padding:12px 14px; box-sizing:border-box; }
+  button { margin-top:12px; width:100%; padding:13px; font-size:15px; font-weight:600; border:0; border-radius:10px; cursor:pointer; background:#ffd75e; color:#1a1300; font-family:inherit; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  #summary { color:#8a94a6; font-size:12px; margin:14px 0 8px; line-height:1.5; }
+  #log { margin-top:16px; font-size:12px; }
+  .line { padding:6px 10px; border-left:2px solid #2b3545; margin-bottom:4px; color:#9aa4b5; background:#0f141d; border-radius:0 6px 6px 0; word-break:break-all; }
+  .line.ok { border-color:#5ee08a; color:#bfe9cd; } .line.err { border-color:#f6614f; color:#f3b6ae; }
+</style></head><body><div class="wrap">
+<h1>🎲 Cube — Force Exit</h1>
+<div class="sub">Standalone, offline escape hatch for account <b>${account.slice(0, 8)}…</b>. It broadcasts your pre-signed unroll, waits out the CSV delay, then sweeps your VTXO leaf to your address — with your key alone, no operator needed.</div>
+<div class="warn">⚠️ This file contains your secret key. Anyone who opens it controls your exit. Keep it private.</div>
+<div id="summary">loading…</div>
+<input id="addr" placeholder="your Bitcoin address (tb1…)" autocomplete="off" autocapitalize="off" spellcheck="false" />
+<button id="go">Broadcast &amp; exit</button>
+<div id="log"></div>
+</div>
+<script>window.CUBE_EXIT = ${payloadJson};</script>
+<script>${toolJs}</script>
+</body></html>`;
 }
 
 // ---- round details (provably-fair page, hash-routed: #round/<n>) ----
@@ -534,6 +612,13 @@ async function copyText(t) {
   catch (e) { flash('copy failed — select the text and copy manually', 'err'); }
 }
 
+// Install the service worker that keeps an offline copy of the app shell, so the
+// unilateral "Force exit" remains reachable even if the operator's server is gone.
+function registerServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
+}
+
 function main() {
   $('me').textContent = short(ME.accountKey);
   $('faucetbtn').onclick = doFaucet;
@@ -547,6 +632,7 @@ function main() {
     const box = $('withdrawbox'); box.style.display = box.style.display === 'none' ? '' : 'none';
   };
   const febtn = $('forceexitbtn'); if (febtn) febtn.onclick = doForceExit;
+  const dkbtn = $('downloadkitbtn'); if (dkbtn) dkbtn.onclick = downloadExitKit;
   document.querySelectorAll('#betchips .chip').forEach((c) => {
     c.onclick = () => selectBet(c.dataset.bet === 'all' ? 'all' : parseInt(c.dataset.bet, 10));
   });
@@ -557,6 +643,7 @@ function main() {
   route(); // connects the WS on the home view, or shows a round-details page
   connectCosign(); // participate in non-custodial covenant cosign for this tab
   ensureDepositWatch(); // start server-side watching of our deposit address
+  registerServiceWorker(); // cache the app shell so the escape hatch survives the operator
   setInterval(() => { if (displayTimeLeft > 0 && lastState && lastState.participants >= lastState.min_participants) displayTimeLeft--; renderStatus(); }, 1000);
 }
 main();
