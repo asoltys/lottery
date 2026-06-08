@@ -35,9 +35,10 @@ use cube::transmutative::hash::{sha256, Hash, HashTag};
 use cube::transmutative::secp::schnorr::{verify_xonly, SchnorrSigningMode};
 use cube::transmutative::key::KeyHolder;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRef, Path, Query, State};
+use axum::extract::{FromRef, Path, Query, Request, State};
 use axum::http::header;
-use axum::response::{Html, IntoResponse};
+use axum::middleware::Next;
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use tokio::sync::broadcast;
@@ -481,6 +482,29 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
         }
     }
     out
+}
+
+// Access log: record the real client IP (cloudflared forwards it as
+// CF-Connecting-IP) plus the path and any ?account= so we can tie an account to an
+// IP — e.g. to identify who is playing. Only logs API/ws/cosign paths.
+async fn access_log(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    if path.starts_with("/api/") || path == "/ws" || path == "/cosign" {
+        let h = req.headers();
+        let ip = h.get("cf-connecting-ip")
+            .or_else(|| h.get("x-forwarded-for"))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("?")
+            .to_string();
+        let method = req.method().clone();
+        let acct = req.uri().query()
+            .and_then(|q| q.split('&').find(|kv| kv.starts_with("account=")))
+            .map(|kv| kv.trim_start_matches("account=").chars().take(16).collect::<String>())
+            .unwrap_or_default();
+        let country = h.get("cf-ipcountry").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+        eprintln!("[access] ip={ip} cc={country} {method} {path}{}", if acct.is_empty() { String::new() } else { format!(" account={acct}…") });
+    }
+    next.run(req).await
 }
 
 // WebSocket: push fresh state on every change (and a heartbeat). The client
@@ -1651,6 +1675,7 @@ pub async fn run_arcade(
         .route("/api/faucet", post(post_faucet))
         .route("/api/call", post(post_call))
         .route("/api/withdraw", post(post_withdraw))
+        .layer(axum::middleware::from_fn(access_log))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
