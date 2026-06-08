@@ -279,7 +279,8 @@ async function refreshExitProof() {
   try {
     const x = await api(`/api/exit?account=${ME.accountKey}`);
     if (x.exitable) {
-      el.innerHTML = `🔓 your <b>${Number(x.value_sats).toLocaleString()}</b> sat is withdrawable to Bitcoin with your key alone`;
+      const n = Number(x.value_sats);
+      el.innerHTML = `🔓 your <b>${n.toLocaleString()}</b> sat${n === 1 ? '' : 's'} in the pot ${n === 1 ? 'is' : 'are'} withdrawable to Bitcoin with your key`;
       el.style.display = '';
     } else {
       el.style.display = 'none';
