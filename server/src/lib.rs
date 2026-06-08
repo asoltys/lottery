@@ -138,6 +138,14 @@ struct ArcadeState {
     // Persisted jackpot history: the full per-round settlement records survive
     // restarts so the draw feed + provably-fair pages load for any player.
     history_path: std::path::PathBuf,
+    // Lightning deposits via the Mutinynet Coinos instance: API base + the lotto
+    // account's Bearer token + the webhook URL Coinos calls us back on. All three
+    // present => LN deposits enabled. ln_invoices maps a per-invoice secret (also
+    // the webhook auth token) to the pending swap.
+    coinos_url: Option<String>,
+    coinos_token: Option<String>,
+    coinos_webhook_url: Option<String>,
+    ln_invoices: Arc<tokio::sync::Mutex<HashMap<String, LnInvoice>>>,
     // Serializes auto-genesis attempts from the watcher loop (no concurrent runs).
     auto_genesis_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -601,6 +609,11 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
         // Free L2 faucet + custodial on-chain cash-out are regtest-only; on
         // signet/mainnet there is no free money and no operator-funded payout.
         "faucet_enabled": s.chain == Chain::Regtest,
+        // Lightning deposits show in the UI iff the Coinos swap bridge is configured
+        // AND the operator has flipped COINOS_LN_LIVE on (i.e. inbound liquidity is up).
+        // The /api/ln/deposit endpoint itself works whenever the bridge is configured.
+        "ln_enabled": s.coinos_url.is_some() && s.coinos_token.is_some() && s.coinos_webhook_url.is_some()
+            && std::env::var("COINOS_LN_LIVE").map(|v| !v.is_empty()).unwrap_or(false),
         "network": s.chain.to_string(),
     });
 
@@ -1017,31 +1030,105 @@ async fn deposit_watcher(s: ArcadeState) {
     }
 }
 
-// The LiftV2 deposit address for a player: a taproot {key-path MuSig2(account,
-// engine); script-path CSV-3mo account sweep}. Funding it and lifting it in is how
-// a player trustlessly puts real BTC into the pot covenant.
-async fn get_deposit_address(State(s): State<ArcadeState>, Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+// A pending Lightning deposit: once the invoice is paid, swap `amount` on-chain to
+// the player's LiftV2 deposit address. Keyed in `ln_invoices` by a per-invoice
+// secret that doubles as the webhook auth token.
+#[derive(Clone)]
+struct LnInvoice {
+    deposit_address: String,
+    amount: u64,
+    swapped: bool,
+}
+
+const LN_MIN_DEPOSIT: u64 = 1000; // sats — below this an on-chain swap isn't economical
+
+// POST a JSON body to the Coinos API as the lotto account (Bearer token).
+async fn coinos_post(s: &ArcadeState, path: &str, body: Value) -> Result<Value, String> {
+    let url = s.coinos_url.as_ref().ok_or("Lightning deposits not configured")?;
+    let token = s.coinos_token.as_ref().ok_or("Lightning deposits not configured")?;
+    let resp = reqwest::Client::new()
+        .post(format!("{}{}", url.trim_end_matches('/'), path))
+        .bearer_auth(token)
+        .json(&body)
+        .send().await.map_err(|e| format!("coinos request: {e}"))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    let v: Value = serde_json::from_str(&text).unwrap_or(Value::String(text.clone()));
+    if !status.is_success() { return Err(format!("coinos {status}: {v}")); }
+    Ok(v)
+}
+
+// Lightning deposit: create a Coinos invoice on the lotto account, tagged with a
+// webhook + a per-invoice secret. When paid, Coinos calls /api/ln/webhook and we
+// swap the funds on-chain to the player's LiftV2 deposit address.
+#[derive(Deserialize)]
+struct LnDepositReq { account_key: String, amount: u64 }
+async fn post_ln_deposit(State(s): State<ArcadeState>, Json(b): Json<LnDepositReq>) -> Json<Value> {
+    let webhook = match (&s.coinos_url, &s.coinos_token, &s.coinos_webhook_url) {
+        (Some(_), Some(_), Some(w)) => w.clone(),
+        _ => return Json(json!({"ok":false,"error":"Lightning deposits not available"})),
+    };
+    let account = match parse_hex::<32>(&b.account_key) { Some(a) => a, None => return Json(json!({"ok":false,"error":"bad account"})) };
+    if b.amount < LN_MIN_DEPOSIT { return Json(json!({"ok":false,"error":format!("minimum Lightning deposit is {LN_MIN_DEPOSIT} sats")})); }
+    let (address, _spk) = match register_deposit_address(&s, account).await { Ok(x) => x, Err(e) => return Json(json!({"ok":false,"error":e})) };
+    // per-invoice secret: identifies the invoice in the webhook AND authenticates it.
+    let mut sb = [0u8; 32];
+    if getrandom::getrandom(&mut sb).is_err() { return Json(json!({"ok":false,"error":"rng failure"})); }
+    let secret = hex::encode(sb);
+    let memo = format!("Cube Lotto deposit {}", &hex::encode(account)[..8]);
+    let body = json!({ "invoice": { "amount": b.amount, "type": "lightning", "webhook": webhook, "secret": secret, "memo": memo } });
+    let inv = match coinos_post(&s, "/invoice", body).await { Ok(v) => v, Err(e) => return Json(json!({"ok":false,"error":e})) };
+    let bolt11 = inv["hash"].as_str().or_else(|| inv["text"].as_str()).unwrap_or_default().to_string();
+    if bolt11.is_empty() { return Json(json!({"ok":false,"error":"invoice creation failed"})); }
+    { s.ln_invoices.lock().await.insert(secret, LnInvoice { deposit_address: address.clone(), amount: b.amount, swapped: false }); }
+    Json(json!({ "ok": true, "bolt11": bolt11, "amount": b.amount, "address": address }))
+}
+
+// Coinos invoice-paid webhook: authenticate by the per-invoice secret, then swap
+// the received funds on-chain to the player's LiftV2 deposit address. Idempotent.
+async fn post_ln_webhook(State(s): State<ArcadeState>, Json(b): Json<Value>) -> Json<Value> {
+    let secret = b["secret"].as_str().unwrap_or_default().to_string();
+    if secret.is_empty() { return Json(json!({"ok":false})); }
+    let received = b["amount"].as_u64().unwrap_or_else(|| b["amount"].as_i64().unwrap_or(0).max(0) as u64);
+    // claim the invoice (idempotent): mark swapped under the lock, copy what we need.
+    let inv = {
+        let mut m = s.ln_invoices.lock().await;
+        match m.get_mut(&secret) {
+            Some(i) if !i.swapped => { i.swapped = true; i.clone() }
+            _ => return Json(json!({"ok":true})), // unknown/replayed: ack, do nothing
+        }
+    };
+    let amount = if received > 0 { received } else { inv.amount };
+    let send = json!({ "address": inv.deposit_address, "amount": amount });
+    match coinos_post(&s, "/bitcoin/send", send).await {
+        Ok(p) => {
+            eprintln!("ln-swap: sent {} sat on-chain to {} (coinos id {:?})", amount, inv.deposit_address, p.get("id"));
+            Json(json!({"ok":true}))
+        }
+        Err(e) => {
+            eprintln!("ln-swap FAILED for {}: {}", inv.deposit_address, e);
+            if let Some(i) = s.ln_invoices.lock().await.get_mut(&secret) { i.swapped = false; } // allow retry
+            Json(json!({"ok":false,"error":e}))
+        }
+    }
+}
+
+// Derive a player's LiftV2 deposit address, register it for watching, and import
+// it into the watch-only wallet so the deposit watcher detects funds sent to it.
+// Returns (address, scriptpubkey_hex). Shared by /api/deposit_address and the
+// Lightning-deposit swap (which sends the swapped on-chain funds to this address).
+async fn register_deposit_address(s: &ArcadeState, account: [u8; 32]) -> Result<(String, String), String> {
     use cube::constructive::txout_types::lift::lift_versions::liftv2::liftv2::return_liftv2_taproot;
-    let account = match params.get("account").and_then(|a| parse_hex::<32>(a)) {
-        Some(a) => a,
-        None => return Json(json!({ "error": "bad account" })),
-    };
-    let spk = match return_liftv2_taproot(account, s.engine_key).and_then(|t| t.spk()) {
-        Some(s) => s,
-        None => return Json(json!({ "error": "could not derive deposit taproot" })),
-    };
+    let spk = return_liftv2_taproot(account, s.engine_key).and_then(|t| t.spk())
+        .ok_or("could not derive deposit taproot")?;
     let network = match s.chain {
         Chain::Mainnet => bitcoin::Network::Bitcoin,
         Chain::Signet => bitcoin::Network::Signet,
         _ => bitcoin::Network::Regtest,
     };
     let script = bitcoin::ScriptBuf::from_bytes(spk.clone());
-    let address = match bitcoin::Address::from_script(script.as_script(), network) {
-        Ok(a) => a.to_string(),
-        Err(_) => return Json(json!({ "error": "address encode failed" })),
-    };
-    // Register the address for watching + import it into the watch-only wallet so
-    // the background watcher detects deposits (incl. unconfirmed) and pushes them.
+    let address = bitcoin::Address::from_script(script.as_script(), network)
+        .map_err(|_| "address encode failed")?.to_string();
     {
         let mut w = s.deposit_watch.lock().await;
         let entry = w.entry(account).or_default();
@@ -1056,12 +1143,26 @@ async fn get_deposit_address(State(s): State<ArcadeState>, Query(params): Query<
             tokio::spawn(async move { tokio::task::spawn_blocking(move || s2.import_watch_address(&addr, &label)).await.ok(); });
         }
     }
-    Json(json!({
-        "account": hex::encode(account),
-        "engine": hex::encode(s.engine_key),
-        "address": address,
-        "scriptpubkey": hex::encode(spk),
-    }))
+    Ok((address, hex::encode(spk)))
+}
+
+// The LiftV2 deposit address for a player: a taproot {key-path MuSig2(account,
+// engine); script-path CSV-3mo account sweep}. Funding it and lifting it in is how
+// a player trustlessly puts real BTC into the pot covenant.
+async fn get_deposit_address(State(s): State<ArcadeState>, Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+    let account = match params.get("account").and_then(|a| parse_hex::<32>(a)) {
+        Some(a) => a,
+        None => return Json(json!({ "error": "bad account" })),
+    };
+    match register_deposit_address(&s, account).await {
+        Ok((address, spk)) => Json(json!({
+            "account": hex::encode(account),
+            "engine": hex::encode(s.engine_key),
+            "address": address,
+            "scriptpubkey": spk,
+        })),
+        Err(e) => Json(json!({ "error": e })),
+    }
 }
 
 // Register a confirmed LiftV2 deposit UTXO (verify it exists on bitcoind and its
@@ -2041,6 +2142,10 @@ pub async fn run_arcade(
         credited_deposits: Arc::new(tokio::sync::Mutex::new(credited_set)),
         credited_path,
         history_path,
+        coinos_url: std::env::var("COINOS_URL").ok().filter(|v| !v.is_empty()),
+        coinos_token: std::env::var("COINOS_TOKEN").ok().filter(|v| !v.is_empty()),
+        coinos_webhook_url: std::env::var("COINOS_WEBHOOK_URL").ok().filter(|v| !v.is_empty()),
+        ln_invoices: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         auto_genesis_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
@@ -2072,6 +2177,8 @@ pub async fn run_arcade(
         .route("/api/exit_kit", get(get_exit_kit))
         .route("/api/exit_done", post(post_exit_done))
         .route("/api/deposit_address", get(get_deposit_address))
+        .route("/api/ln/deposit", post(post_ln_deposit))
+        .route("/api/ln/webhook", post(post_ln_webhook))
         .route("/api/deposit", post(post_deposit))
         .route("/api/deposit/claim", post(post_deposit_claim))
         .route("/api/covenant/genesis", post(post_genesis))

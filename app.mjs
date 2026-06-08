@@ -9,6 +9,7 @@ import { sha256, sha512 } from '@noble/hashes/sha2.js';
 import { entropyToMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
 import { bech32, bech32m } from '@scure/base';
+import qrcode from 'qrcode-generator';
 import { attachCosign, setPendingWithdrawSpk } from './cosign_client.mjs';
 import { unilateralExit } from './dispute.mjs';
 
@@ -178,6 +179,7 @@ function render(st) {
   const exp = $('explorerlink');
   if (st.explorer_url) { exp.href = st.explorer_url; exp.style.display = ''; }
   else { exp.style.display = 'none'; }
+  const lnb = $('lndepositbtn'); if (lnb) lnb.style.display = st.ln_enabled ? '' : 'none';
   const mine = ME.accountKey.toLowerCase();
   const feed = (st.recent_draws || []).map((dr) => drawRow(dr, mine)).join('');
   $('draws').innerHTML = feed || '<div class="draw empty">no draws yet</div>';
@@ -251,6 +253,37 @@ async function ensureDepositWatch() {
 }
 
 // Show the player's deposit address (fund it to add money to play with).
+// Render a QR for a string as an SVG on a white tile (scannable on the dark theme).
+function qrSvg(text) {
+  const qr = qrcode(0, 'M');
+  qr.addData(text.toUpperCase()); // uppercase = compact alphanumeric QR; wallets lowercase it
+  qr.make();
+  return `<div style="background:#fff;padding:10px;border-radius:8px;display:inline-block;max-width:240px">${qr.createSvgTag({ cellSize: 3, margin: 0, scalable: true })}</div>`;
+}
+
+// Lightning deposit: create an invoice; the server swaps it on-chain into the
+// player's LiftV2 claim once paid, and the normal deposit flow credits the balance.
+async function lnDeposit() {
+  const amt = parseInt(($('lnamount').value || '').trim(), 10);
+  if (!amt || amt < 1000) return flash('enter at least 1,000 sats', 'err');
+  $('lncreatebtn').disabled = true;
+  flash('Creating a Lightning invoice…');
+  try {
+    const r = await api('/api/ln/deposit', { account_key: ME.accountKey, amount: amt });
+    if (!r.ok) { flash('Lightning deposit: ' + friendly(r.error), 'err'); $('lncreatebtn').disabled = false; return; }
+    const bolt11 = r.bolt11;
+    const res = $('lnresult');
+    res.innerHTML = `${qrSvg(bolt11)}
+      <div style="margin-top:8px;font-size:11px;color:#6b7689">pay this ${amt.toLocaleString()}-sat invoice from any Mutinynet Lightning wallet — your balance updates automatically when it arrives.</div>
+      <div class="kv" style="margin-top:8px"><div class="kvv" style="text-align:left">${bolt11}</div><button class="mini" id="lncopy">copy</button></div>
+      <a href="lightning:${bolt11}" class="rlink" style="font-size:12px;color:#6b8cff">open in wallet →</a>`;
+    res.style.display = '';
+    $('lncopy').onclick = () => copyText(bolt11);
+    flash('Invoice ready — pay it to deposit.', 'ok');
+  } catch (e) { flash('Lightning error: ' + e.message, 'err'); }
+  $('lncreatebtn').disabled = false;
+}
+
 async function showDepositAddress() {
   const el = $('depositaddr');
   if (!el) return;
@@ -653,6 +686,10 @@ function main() {
   $('restorebtn').onclick = doRestore;
   $('withdrawbtn').onclick = doWithdraw;
   const dbtn = $('depositbtn'); if (dbtn) dbtn.onclick = showDepositAddress;
+  const lnbtn = $('lndepositbtn'); if (lnbtn) lnbtn.onclick = () => {
+    const box = $('lnbox'); box.style.display = box.style.display === 'none' ? '' : 'none';
+  };
+  const lncbtn = $('lncreatebtn'); if (lncbtn) lncbtn.onclick = lnDeposit;
   const wbtn = $('withdrawbtn2'); if (wbtn) wbtn.onclick = () => {
     const box = $('withdrawbox'); box.style.display = box.style.display === 'none' ? '' : 'none';
   };

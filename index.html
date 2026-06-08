@@ -120,9 +120,18 @@
       <div style="margin-top:12px;font-size:12px;color:#6b7689">you've put in <b id="yourin" style="color:#d7dce5">0</b> this round · last winner: <span id="winner">—</span></div>
       <div id="fundscard" style="margin-top:12px;padding:10px 12px;border:1px solid #2a3550;border-radius:8px;background:#0c1320;font-size:12px;color:#9fb0d0;line-height:1.5;overflow-wrap:anywhere">
         <button id="depositbtn">Add funds</button>
+        <button id="lndepositbtn" style="display:none;background:#3a2f10;color:#ffd75e;font-size:13px;margin-left:8px">⚡ Lightning</button>
         <button id="withdrawbtn2">Withdraw</button>
         <div id="depositaddr" style="display:none;margin-top:8px;word-break:break-all"></div>
         <div id="depositstatus" style="display:none;margin-top:8px;padding:8px 10px;border:1px solid #2a3550;border-radius:8px;background:#0a1018;color:#bcd0ec"></div>
+        <div id="lnbox" style="display:none;margin-top:8px">
+          <div class="enter-row">
+            <input id="lnamount" type="number" inputmode="numeric" min="1000" placeholder="sats (min 1,000)" autocomplete="off" />
+            <button id="lncreatebtn" style="background:#ffd75e;color:#1a1300;flex:0 0 auto">Create invoice</button>
+          </div>
+          <div style="margin-top:6px;font-size:11px;color:#6b7689">deposit over Lightning — paid in, swapped on-chain into your non-custodial claim.</div>
+          <div id="lnresult" style="display:none;margin-top:10px;text-align:center"></div>
+        </div>
         <div id="withdrawbox" style="display:none;margin-top:8px">
           <div class="enter-row">
             <input id="wdaddr" placeholder="your Bitcoin address (tb1…)" autocomplete="off" autocapitalize="off" spellcheck="false" />
@@ -201,6 +210,6 @@
 
     <div id="round" style="display:none"></div>
   </div>
-  <script type="module" src="/bundle.js?v=b6b20327"></script>
+  <script type="module" src="/bundle.js?v=e3d5a786"></script>
 </body>
 </html>
