@@ -668,6 +668,9 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
                 "your_contribution": your,
                 "odds_pct": if round_total > 0 { (your as f64) * 100.0 / (round_total as f64) } else { 0.0 },
                 "deposit": deposit_json,
+                // your spendable claim in the current on-chain pot (0 if no covenant
+                // or you're not in it) — gates withdraw / force-exit / exit-kit.
+                "onchain_claim": joined_sats,
             });
         }
     }

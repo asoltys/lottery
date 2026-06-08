@@ -187,6 +187,19 @@ function render(st) {
   renderStatus();
   renderDeposit(a.deposit);
   maybeClaimDeposit(a.deposit);
+  // Withdraw / force-exit / exit-kit all act on your on-chain claim. With no claim
+  // (no covenant, or you're not in it) there's nothing to exit — say so plainly
+  // instead of erroring after the click.
+  const claim = a.onchain_claim || 0;
+  const noticeEl = $('wdnotice');
+  if (noticeEl) {
+    if (claim > 0) { noticeEl.style.display = 'none'; }
+    else {
+      noticeEl.textContent = 'No on-chain funds to withdraw or exit yet. Deposit and play — once your funds are pooled in the on-chain jackpot, you can withdraw or force-exit them with your key.';
+      noticeEl.style.display = '';
+    }
+    ['withdrawbtn', 'forceexitbtn', 'downloadkitbtn'].forEach((id) => { const b = $(id); if (b) b.disabled = claim <= 0; });
+  }
   updateEnterLabel();
 }
 
