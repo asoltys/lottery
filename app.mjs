@@ -162,11 +162,9 @@ function render(st) {
   const faucetEnabled = st.faucet_enabled !== false;
   const fbtn = $('faucetbtn');
   if (fbtn) fbtn.style.display = faucetEnabled ? '' : 'none';
-  const cashout = $('cashoutcard');
-  if (cashout) cashout.style.display = faucetEnabled ? '' : 'none';
   $('registered').textContent = a.registered
     ? ''
-    : (faucetEnabled ? ' (hit the faucet to join)' : ' (deposit to play)');
+    : (faucetEnabled ? ' (hit the faucet to join)' : ' (add funds to play)');
   if (a.registered) { ME.registeryIndex = a.registery_index; saveMe(); }
   $('participants').textContent = `${st.participants}`;
   $('roundpot').textContent = st.round_pot.toLocaleString();
@@ -190,8 +188,23 @@ function render(st) {
   renderStatus();
   renderDeposit(a.deposit);
   maybeClaimDeposit(a.deposit);
-  refreshExitProof();
-  refreshCovenant();
+  updateEnterLabel();
+}
+
+// ---- betting: pick a chip (5k/10k/25k/ALL IN), Enter places that bet ----
+let selectedBet = 5000; // sats, or 'all'
+function updateEnterLabel() {
+  const btn = $('enterbtn'); if (!btn) return;
+  const bal = (lastState && lastState.account && lastState.account.balance) || 0;
+  const amt = selectedBet === 'all' ? bal : selectedBet;
+  btn.textContent = selectedBet === 'all' ? `🎰 Bet all (${bal.toLocaleString()})` : `Enter ${amt.toLocaleString()}`;
+}
+function selectBet(v) {
+  selectedBet = v;
+  document.querySelectorAll('#betchips .chip').forEach((c) => {
+    c.classList.toggle('sel', c.dataset.bet === String(v));
+  });
+  updateEnterLabel();
 }
 
 // When a confirmed deposit hasn't been credited to the in-game balance yet,
@@ -253,41 +266,6 @@ async function showDepositAddress() {
   } catch (e) { el.textContent = 'error: ' + e.message; el.style.display = ''; }
 }
 
-// Show the on-chain pot size + your share, only once a pot exists (kept quiet otherwise).
-async function refreshCovenant() {
-  const el = $('covenantstatus');
-  if (!el) return;
-  try {
-    const c = await api('/api/covenant');
-    if (c.covenant) {
-      const mine = (c.covenant.allocations || []).find((a) => (a[0] || '').toLowerCase() === ME.accountKey.toLowerCase());
-      el.innerHTML = mine
-        ? `your on-chain share: <b>${Number(mine[1]).toLocaleString()}</b> sat`
-        : '';
-      el.style.display = mine ? '' : 'none';
-    } else {
-      el.style.display = 'none';
-    }
-  } catch (e) {}
-}
-
-// Non-custodial proof: show the player that their live stake is a unilaterally
-// exitable VTXO (rendered by the engine from the contract's shadow claims).
-async function refreshExitProof() {
-  const el = $('exitproof');
-  if (!el || !ME.accountKey) return;
-  try {
-    const x = await api(`/api/exit?account=${ME.accountKey}`);
-    if (x.exitable) {
-      const n = Number(x.value_sats);
-      el.innerHTML = `🔓 your <b>${n.toLocaleString()}</b> sat${n === 1 ? '' : 's'} in the pot ${n === 1 ? 'is' : 'are'} withdrawable to Bitcoin with your key`;
-      el.style.display = '';
-    } else {
-      el.style.display = 'none';
-    }
-  } catch (e) {}
-}
-
 // ---- WebSocket (push) ----
 let ws = null;
 function connectWS() {
@@ -347,7 +325,9 @@ async function doFaucet() {
 }
 
 async function doEnter() {
-  const amount = Math.max(1, parseInt($('amount').value || '0', 10));
+  const bal = (lastState && lastState.account && lastState.account.balance) || 0;
+  const amount = selectedBet === 'all' ? bal : Math.min(selectedBet, bal);
+  if (amount < 1) return flash('not enough balance — add funds first', 'err');
   $('enterbtn').disabled = true;
   try {
     const r = await enter(amount);
@@ -356,11 +336,12 @@ async function doEnter() {
   } catch (e) { flash('Enter error: ' + e.message, 'err'); }
 }
 
+// Withdraw the WHOLE balance to a Bitcoin address (one balance, get everything).
 async function doWithdraw() {
   const address = ($('wdaddr').value || '').trim();
-  const amount = Math.max(0, parseInt($('wdamount').value || '0', 10));
+  const amount = (lastState && lastState.account && lastState.account.balance) || 0;
   if (!address) return flash('enter a destination address', 'err');
-  if (!amount) return flash('enter an amount', 'err');
+  if (amount < 1) return flash('nothing to withdraw', 'err');
   $('withdrawbtn').disabled = true;
   flash(`Withdrawing ${amount.toLocaleString()} to ${address.slice(0, 14)}…`);
   try {
@@ -368,7 +349,7 @@ async function doWithdraw() {
     const r = await api('/api/withdraw', {
       account_key: ME.accountKey, bls_key: ME.blsKey, address, amount, bls_signature: hx(sig),
     });
-    if (r.ok) { flash(`Withdrew ${amount.toLocaleString()}! tx ${short(r.txid)}`, 'ok'); $('wdamount').value = ''; }
+    if (r.ok) { flash(`Withdrew ${amount.toLocaleString()}! tx ${short(r.txid)}`, 'ok'); $('wdaddr').value = ''; $('withdrawbox').style.display = 'none'; }
     else flash('Withdraw failed: ' + friendly(r.error), 'err');
   } catch (e) { flash('Withdraw error: ' + e.message, 'err'); }
   $('withdrawbtn').disabled = false;
@@ -508,6 +489,13 @@ function main() {
   $('restorebtn').onclick = doRestore;
   $('withdrawbtn').onclick = doWithdraw;
   const dbtn = $('depositbtn'); if (dbtn) dbtn.onclick = showDepositAddress;
+  const wbtn = $('withdrawbtn2'); if (wbtn) wbtn.onclick = () => {
+    const box = $('withdrawbox'); box.style.display = box.style.display === 'none' ? '' : 'none';
+  };
+  document.querySelectorAll('#betchips .chip').forEach((c) => {
+    c.onclick = () => selectBet(c.dataset.bet === 'all' ? 'all' : parseInt(c.dataset.bet, 10));
+  });
+  selectBet(5000);
   $('copyphrase').onclick = () => copyText($('phraseout').textContent);
   flash('Welcome, ' + short(ME.accountKey) + '. Keys generated in your browser — back them up to restore later.', 'ok');
   window.addEventListener('hashchange', route);

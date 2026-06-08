@@ -1411,11 +1411,12 @@ struct WithdrawReq {
 }
 async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawReq>) -> Json<Value> {
     let err = |m: &str| Json(json!({ "ok": false, "error": m }));
-    // Custodial on-chain payout is only allowed on regtest. On signet/mainnet it's
-    // disabled — otherwise faucet-derived (free) L2 balance could be cashed out as
-    // real BTC. Non-custodial exit is via the unilateral VTXO exit (see /api/exit).
-    if s.chain != Chain::Regtest {
-        return err("on-chain withdraw disabled on this network — exit via your VTXO (see how-it-works)");
+    // On-chain payout of the player's balance to their address. Enabled on regtest +
+    // signet (balances there are deposit-backed; the faucet is off on signet). Kept
+    // OFF on mainnet until the payout is funded from the player's own on-chain
+    // deposits rather than the operator wallet.
+    if s.chain == Chain::Mainnet {
+        return err("on-chain withdraw not enabled on mainnet yet");
     }
     let account_key = match parse_hex::<32>(&body.account_key) { Some(a) => a, None => return err("bad account key") };
     let bls_key = match parse_hex::<48>(&body.bls_key) { Some(b) => b, None => return err("bad bls key") };
@@ -1447,7 +1448,7 @@ async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawRe
     if body.amount > balance {
         return err("insufficient balance");
     }
-    let rpc = match s.rpc() { Some(r) => r, None => return err("bitcoin rpc unavailable") };
+    let rpc = match s.fee_wallet_rpc() { Some(r) => r, None => return err("bitcoin rpc unavailable") };
     let txid = match rpc.send_to_address(&address, bitcoin::Amount::from_sat(body.amount), None, None, Some(false), None, None, None) {
         Ok(t) => t,
         Err(e) => return Json(json!({ "ok": false, "error": format!("payout failed: {}", e) })),

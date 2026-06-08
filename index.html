@@ -32,7 +32,11 @@
   #faucetbtn { background: #2f6df6; color: #fff; width: 100%; margin-bottom: 12px; }
   #enterbtn { background: #ffd75e; color: #1a1300; flex: 0 0 auto; }
   .chips { display: flex; gap: 8px; margin-top: 8px; }
-  .chip { background: #1b2230; color: #aab4c4; border: 1px solid #2b3545; border-radius: 999px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  .chips { flex-wrap: wrap; }
+  .chip { background: #1b2230; color: #aab4c4; border: 1px solid #2b3545; border-radius: 999px; padding: 7px 14px; font-size: 13px; cursor: pointer; }
+  .chip.sel { background: #ffd75e; color: #1a1300; border-color: #ffd75e; font-weight: 700; }
+  #depositbtn, #withdrawbtn2 { background: #222b39; color: #cdd6e5; font-size: 13px; }
+  #withdrawbtn2 { margin-left: 8px; }
   .me { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #8a94a6; }
   .me b { color: #d7dce5; }
   #newbtn { background: #222b39; color: #aab4c4; font-size: 12px; padding: 8px 14px; }
@@ -104,36 +108,27 @@
         <div class="stat"><div class="v"><span id="roundpot">0</span></div><div class="k">this round's pot</div></div>
       </div>
       <button id="faucetbtn">💧 Get 10,000 sats from faucet</button>
-      <div class="enter-row">
-        <input id="amount" type="number" min="1" value="2000" />
-        <button id="enterbtn" disabled>Enter</button>
+      <div class="chips" id="betchips">
+        <span class="chip" data-bet="5000">5k</span>
+        <span class="chip" data-bet="10000">10k</span>
+        <span class="chip" data-bet="25000">25k</span>
+        <span class="chip" data-bet="all">🎰 ALL IN</span>
       </div>
-      <div class="chips">
-        <span class="chip" onclick="document.getElementById('amount').value=1000">1k</span>
-        <span class="chip" onclick="document.getElementById('amount').value=2000">2k</span>
-        <span class="chip" onclick="document.getElementById('amount').value=5000">5k</span>
-        <span class="chip" onclick="document.getElementById('amount').value=10000">10k</span>
-      </div>
+      <button id="enterbtn" disabled style="width:100%;margin-top:10px">Enter</button>
       <div style="margin-top:12px;font-size:12px;color:#6b7689">you've put in <b id="yourin" style="color:#d7dce5">0</b> this round · last winner: <span id="winner">—</span></div>
       <div id="fundscard" style="margin-top:12px;padding:10px 12px;border:1px solid #2a3550;border-radius:8px;background:#0c1320;font-size:12px;color:#9fb0d0;line-height:1.5;overflow-wrap:anywhere">
         <button id="depositbtn">Add funds</button>
+        <button id="withdrawbtn2">Withdraw</button>
         <div id="depositaddr" style="display:none;margin-top:8px;word-break:break-all"></div>
         <div id="depositstatus" style="display:none;margin-top:8px;padding:8px 10px;border:1px solid #2a3550;border-radius:8px;background:#0a1018;color:#bcd0ec"></div>
-        <div id="exitproof" style="display:none;margin-top:8px;color:#9fe3bd"></div>
-        <div id="covenantstatus" style="display:none;margin-top:8px;color:#8a94a6"></div>
+        <div id="withdrawbox" style="display:none;margin-top:8px">
+          <div class="enter-row">
+            <input id="wdaddr" placeholder="your Bitcoin address (tb1…)" autocomplete="off" autocapitalize="off" spellcheck="false" />
+            <button id="withdrawbtn">Send all</button>
+          </div>
+          <div style="margin-top:6px;font-size:11px;color:#6b7689">withdraws your whole balance to this address, with your key.</div>
+        </div>
       </div>
-    </div>
-
-    <div class="card" id="cashoutcard">
-      <div class="feedtitle">cash out</div>
-      <div class="enter-row">
-        <input id="wdaddr" placeholder="regtest address (bcrt1…)" autocomplete="off" autocapitalize="off" spellcheck="false" />
-      </div>
-      <div class="enter-row" style="margin-top:8px">
-        <input id="wdamount" type="number" min="1" placeholder="amount in sats" />
-        <button id="withdrawbtn">withdraw</button>
-      </div>
-      <div style="margin-top:10px;font-size:12px;color:#6b7689">sends on-chain from your in-game balance to any regtest address (signed in your browser).</div>
     </div>
 
     <div class="card">
@@ -195,6 +190,6 @@
 
     <div id="round" style="display:none"></div>
   </div>
-  <script type="module" src="/bundle.js?v=6fb37777"></script>
+  <script type="module" src="/bundle.js?v=9016b4cc"></script>
 </body>
 </html>
