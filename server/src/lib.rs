@@ -32,6 +32,7 @@ use cube::inscriptive::utxo_set::utxo_set::UTXO_SET;
 use cube::operative::run_args::chain::Chain;
 use cube::transmutative::bls::verify::bls_verify;
 use cube::transmutative::hash::{sha256, Hash, HashTag};
+use cube::transmutative::secp::schnorr::{verify_xonly, SchnorrSigningMode};
 use cube::transmutative::key::KeyHolder;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{FromRef, Path, Query, State};
@@ -125,6 +126,10 @@ struct ArcadeState {
     // Per-account LiftV2 deposit address watch: detected (mempool + confirmed)
     // deposits, refreshed by the background watcher and pushed over /ws.
     deposit_watch: Arc<tokio::sync::Mutex<HashMap<[u8; 32], DepositWatch>>>,
+    // Deposit outpoints ("txid:vout") already credited to an L2 game balance,
+    // persisted so a restart never double-credits.
+    credited_deposits: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    credited_path: std::path::PathBuf,
 }
 
 // A confirmed LiftV2 deposit UTXO awaiting inclusion in the pot covenant.
@@ -146,6 +151,7 @@ struct DepositWatch {
     confirmations: i64,  // confirmations of the most-confirmed deposit
     txid: Option<String>,
     vout: Option<u32>,
+    confirmed_utxos: Vec<(String, u32, u64)>, // (txid display, vout, value) of confirmed deposits
 }
 
 // bitcoind watch-only descriptor wallet that tracks players' deposit addresses
@@ -220,6 +226,15 @@ impl ArcadeState {
         let _: Result<Value, _> = wrpc.call("importdescriptors", &[json!([
             { "desc": desc, "timestamp": ts, "label": label, "internal": false }
         ])]);
+    }
+    // Persist the set of credited deposit outpoints (atomic temp + rename).
+    async fn persist_credited(&self) {
+        let set: Vec<String> = { self.credited_deposits.lock().await.iter().cloned().collect() };
+        let Ok(bytes) = serde_json::to_vec(&set) else { return };
+        let tmp = self.credited_path.with_extension("tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.credited_path);
+        }
     }
     // Broadcast a fully-signed tx (hex) via bitcoind; returns the display txid.
     fn broadcast(&self, tx_hex: &str) -> Result<String, String> {
@@ -436,6 +451,15 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
                 Some(cov) => cov.allocations.iter().find(|(h, _)| h.eq_ignore_ascii_case(&acct_hex_lc)).map(|(_, v)| *v).unwrap_or(0),
                 None => 0,
             };
+            // How much of the confirmed deposit hasn't been credited to the L2
+            // game balance yet (so the client can auto-claim it).
+            let claimable_sats: u64 = match &dep {
+                Some(d) => {
+                    let credited = s.credited_deposits.lock().await;
+                    d.confirmed_utxos.iter().filter(|(t, v, _)| !credited.contains(&format!("{t}:{v}"))).map(|(_, _, val)| *val).sum()
+                }
+                None => 0,
+            };
             let deposit_json = dep.map(|d| json!({
                 "address": d.address,
                 "pending_sats": d.pending_sats,
@@ -443,6 +467,7 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
                 "confirmations": d.confirmations,
                 "txid": d.txid,
                 "joined_sats": joined_sats,
+                "claimable_sats": claimable_sats,
             }));
 
             out["account"] = json!({
@@ -676,6 +701,8 @@ async fn deposit_watcher(s: ArcadeState) {
 
         // address -> (pending_sats, confirmed_sats, max_confs, deepest confirmed txid/vout)
         let mut agg: HashMap<String, (u64, u64, i64, Option<String>, Option<u32>)> = HashMap::new();
+        // per-address list of confirmed UTXOs: (txid_display, vout, value)
+        let mut addr_confirmed: HashMap<String, Vec<(String, u32, u64)>> = HashMap::new();
         // confirmed UTXOs to queue for the covenant: (address, txid_display, vout, value)
         let mut confirmed_utxos: Vec<(String, String, u32, u64)> = Vec::new();
         for u in &utxos {
@@ -690,7 +717,10 @@ async fn deposit_watcher(s: ArcadeState) {
                 let vout = u.get("vout").and_then(|x| x.as_u64()).map(|v| v as u32);
                 if e.3.is_none() || confs > e.2 { e.3 = txid.clone(); e.4 = vout; }
                 if confs > e.2 { e.2 = confs; }
-                if let (Some(t), Some(v)) = (txid, vout) { confirmed_utxos.push((addr.to_string(), t, v, sats)); }
+                if let (Some(t), Some(v)) = (txid, vout) {
+                    confirmed_utxos.push((addr.to_string(), t.clone(), v, sats));
+                    addr_confirmed.entry(addr.to_string()).or_default().push((t, v, sats));
+                }
             } else {
                 e.0 += sats;
                 if e.3.is_none() && e.0 > 0 { e.3 = u.get("txid").and_then(|x| x.as_str()).map(|t| t.to_string()); }
@@ -702,9 +732,11 @@ async fn deposit_watcher(s: ArcadeState) {
             let mut w = s.deposit_watch.lock().await;
             for (acct, addr) in &watched {
                 let (p, c, confs, txid, vout) = agg.get(addr).cloned().unwrap_or((0, 0, 0, None, None));
+                let cu = addr_confirmed.get(addr).cloned().unwrap_or_default();
                 if let Some(e) = w.get_mut(acct) {
-                    if e.pending_sats != p || e.confirmed_sats != c || e.confirmations != confs { changed = true; }
+                    if e.pending_sats != p || e.confirmed_sats != c || e.confirmations != confs || e.confirmed_utxos != cu { changed = true; }
                     e.pending_sats = p; e.confirmed_sats = c; e.confirmations = confs; e.txid = txid; e.vout = vout;
+                    e.confirmed_utxos = cu;
                 }
             }
         }
@@ -807,6 +839,79 @@ async fn post_deposit(State(s): State<ArcadeState>, Json(b): Json<DepositRegReq>
         }
     }
     Json(json!({ "ok": true, "value": value, "pending": s.pending_deposits.lock().await.len() }))
+}
+
+// Claim confirmed deposits into the player's in-game (L2) balance so they can play.
+// Authenticated by a schnorr signature from the account key (which the deposit
+// address is derived from), so only the depositor can credit. Each deposit outpoint
+// is credited at most once (persisted). The browser calls this automatically when
+// it sees a claimable deposit, so it feels seamless. Backed by the pot covenant —
+// the exit stays non-custodial.
+#[derive(Deserialize)]
+struct DepositClaimReq {
+    account_key: String,
+    bls_key: String,
+    sig: String, // schnorr sig by account_key over (account_key ‖ bls_key)
+}
+async fn post_deposit_claim(State(s): State<ArcadeState>, Json(b): Json<DepositClaimReq>) -> Json<Value> {
+    let (account_key, bls_key, sig) = match (parse_hex::<32>(&b.account_key), parse_hex::<48>(&b.bls_key), parse_hex::<64>(&b.sig)) {
+        (Some(a), Some(k), Some(sg)) => (a, k, sg),
+        _ => return Json(json!({"ok":false,"error":"bad params"})),
+    };
+    // Authenticate: schnorr by the account key over (account_key ‖ bls_key).
+    let mut preimage = Vec::with_capacity(80);
+    preimage.extend_from_slice(&account_key);
+    preimage.extend_from_slice(&bls_key);
+    let sighash = preimage.hash(Some(HashTag::CustomString("Cube/sighash/arcade/deposit-claim".to_string())));
+    if !verify_xonly(account_key, sighash, sig, SchnorrSigningMode::BIP340) {
+        return Json(json!({"ok":false,"error":"bad signature"}));
+    }
+    // Confirmed deposit UTXOs for this account, minus the already-credited ones.
+    let utxos: Vec<(String, u32, u64)> = {
+        match s.deposit_watch.lock().await.get(&account_key) { Some(d) => d.confirmed_utxos.clone(), None => Vec::new() }
+    };
+    let mut to_credit: Vec<String> = Vec::new();
+    let mut total: u64 = 0;
+    {
+        let credited = s.credited_deposits.lock().await;
+        for (t, v, val) in &utxos {
+            let key = format!("{t}:{v}");
+            if !credited.contains(&key) { to_credit.push(key); total += *val; }
+        }
+    }
+    if total == 0 {
+        let balance = { s.coin_manager.lock().await.get_account_balance(account_key).unwrap_or(0) };
+        return Json(json!({"ok":true,"credited":0,"balance":balance}));
+    }
+    let _guard = s.exec_lock.lock().await;
+    let now = Utc::now().timestamp() as u64;
+    let already = { s.registery.lock().await.get_account_info_by_account_key(account_key).is_some() };
+    if !already {
+        let mut reg = s.registery.lock().await;
+        let _ = reg.register_account(account_key, now, Some(bls_key), None, None, None);
+        let _ = reg.apply_changes();
+    }
+    {
+        let mut cm = s.coin_manager.lock().await;
+        match cm.get_account_balance(account_key) {
+            None => { let _ = cm.register_account(account_key, total); }
+            Some(_) => { let _ = cm.account_balance_up(account_key, total); }
+        }
+        let _ = cm.apply_changes();
+        if cm.get_shadow_alloc_value_in_satoshis(s.contract_id, account_key).is_none() {
+            let _ = cm.contract_shadow_alloc_account(s.contract_id, account_key);
+            let _ = cm.apply_changes();
+        }
+    }
+    { let mut credited = s.credited_deposits.lock().await; for k in &to_credit { credited.insert(k.clone()); } }
+    s.persist_credited().await;
+    let (balance, reg_index) = {
+        let bal = s.coin_manager.lock().await.get_account_balance(account_key).unwrap_or(0);
+        let idx = s.registery.lock().await.get_account_info_by_account_key(account_key).map(|(_, _, i, _)| i).unwrap_or(0);
+        (bal, idx)
+    };
+    let _ = s.tx.send(());
+    Json(json!({"ok":true,"credited":total,"balance":balance,"registery_index":reg_index}))
 }
 
 // GENESIS: combine all queued deposits into the pot covenant via N-of-N cosign
@@ -1417,6 +1522,15 @@ pub async fn run_arcade(
         .unwrap_or_else(|_| std::path::PathBuf::from("arcade-covenant.json"));
     let covenant = covenant_manager::CovenantManager::load(covenant_path);
 
+    let credited_path = std::env::var("CUBE_CREDITED_STATE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("arcade-credited.json"));
+    let credited_set: std::collections::HashSet<String> = std::fs::read(&credited_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+        .map(|v| v.into_iter().collect())
+        .unwrap_or_default();
+
     let (tx, _rx) = broadcast::channel::<()>(64);
     let state = ArcadeState {
         chain: _chain,
@@ -1448,6 +1562,8 @@ pub async fn run_arcade(
         covenant,
         pending_deposits: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         deposit_watch: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        credited_deposits: Arc::new(tokio::sync::Mutex::new(credited_set)),
+        credited_path,
     };
 
     tokio::spawn(lifecycle(state.clone()));
@@ -1471,6 +1587,7 @@ pub async fn run_arcade(
         .route("/api/covenant", get(get_covenant))
         .route("/api/deposit_address", get(get_deposit_address))
         .route("/api/deposit", post(post_deposit))
+        .route("/api/deposit/claim", post(post_deposit_claim))
         .route("/api/covenant/genesis", post(post_genesis))
         .route("/api/covenant/refresh", post(post_refresh))
         .route("/api/covenant/unroll", post(post_unroll))

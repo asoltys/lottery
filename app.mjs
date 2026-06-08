@@ -191,8 +191,28 @@ function render(st) {
   $('draws').innerHTML = feed || '<div class="draw empty">no draws yet</div>';
   renderStatus();
   renderDeposit(a.deposit);
+  maybeClaimDeposit(a.deposit);
   refreshExitProof();
   refreshCovenant();
+}
+
+// When a confirmed deposit hasn't been credited to the in-game balance yet,
+// auto-claim it: schnorr-sign (account_key ‖ bls_key) with the account key (which
+// the deposit address derives from) so the server credits only the depositor.
+let claiming = false;
+async function maybeClaimDeposit(d) {
+  if (!d || !(d.claimable_sats > 0) || claiming || !ME.secp) return;
+  claiming = true;
+  try {
+    const sighash = tag256('Cube/sighash/arcade/deposit-claim', cat(fromHex(ME.accountKey), fromHex(ME.blsKey)));
+    const sig = hx(schnorr.sign(sighash, fromHex(ME.secp)));
+    const r = await api('/api/deposit/claim', { account_key: ME.accountKey, bls_key: ME.blsKey, sig });
+    if (r.ok && r.credited > 0) {
+      if (r.registery_index !== undefined) { ME.registeryIndex = r.registery_index; saveMe(); }
+      flash(`Deposit credited — ${Number(r.credited).toLocaleString()} sats added to your balance.`, 'ok');
+    }
+  } catch (e) { /* a later push will retry */ }
+  claiming = false;
 }
 
 // Live deposit-address status, pushed over the same /ws as the rest of state:
@@ -204,7 +224,11 @@ function renderDeposit(d) {
   const parts = [];
   if (d) {
     if (d.joined_sats > 0) parts.push(`🔐 <b>${sat(d.joined_sats)}</b> sat in the pot covenant (exitable with your key)`);
-    if (d.confirmed_sats > 0) parts.push(`✅ <b>${sat(d.confirmed_sats)}</b> sat confirmed (${d.confirmations} conf) — joins the pot at the next round`);
+    if (d.confirmed_sats > 0) {
+      parts.push(d.claimable_sats > 0
+        ? `✅ <b>${sat(d.confirmed_sats)}</b> sat confirmed (${d.confirmations} conf) — crediting to your balance…`
+        : `✅ <b>${sat(d.confirmed_sats)}</b> sat confirmed & credited to your balance — joins the pot at the next round`);
+    }
     if (d.pending_sats > 0) parts.push(`⏳ <b>${sat(d.pending_sats)}</b> sat detected, unconfirmed — waiting for a block…`);
   }
   if (!parts.length) { el.style.display = 'none'; return; }
