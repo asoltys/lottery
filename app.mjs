@@ -377,6 +377,7 @@ async function doEnter() {
     if (r.ok) flash(`Entered ${amount.toLocaleString()} into the jackpot!`, 'ok');
     else flash('Enter failed: ' + friendly(r.error), 'err');
   } catch (e) { flash('Enter error: ' + e.message, 'err'); }
+  $('enterbtn').disabled = false; // re-enable (next state push re-derives it)
 }
 
 // Decode a bech32/bech32m address to its scriptPubKey hex (so we can verify the
@@ -698,7 +699,10 @@ function main() {
   $('exportbtn').onclick = toggleExport;
   $('restorebtn').onclick = doRestore;
   $('withdrawbtn').onclick = doWithdraw;
-  const dbtn = $('depositbtn'); if (dbtn) dbtn.onclick = showDepositAddress;
+  const dbtn = $('depositbtn'); if (dbtn) dbtn.onclick = () => {
+    const s = $('fundsub'); s.style.display = s.style.display === 'none' ? '' : 'none';
+  };
+  const btcbtn = $('btcdepositbtn'); if (btcbtn) btcbtn.onclick = showDepositAddress;
   const lnbtn = $('lndepositbtn'); if (lnbtn) lnbtn.onclick = () => {
     const box = $('lnbox'); box.style.display = box.style.display === 'none' ? '' : 'none';
   };

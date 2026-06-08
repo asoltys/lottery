@@ -1043,6 +1043,7 @@ async fn deposit_watcher(s: ArcadeState) {
 // secret that doubles as the webhook auth token.
 #[derive(Clone)]
 struct LnInvoice {
+    account: [u8; 32],
     deposit_address: String,
     amount: u64,
     swapped: bool,
@@ -1088,7 +1089,7 @@ async fn post_ln_deposit(State(s): State<ArcadeState>, Json(b): Json<LnDepositRe
     let inv = match coinos_post(&s, "/invoice", body).await { Ok(v) => v, Err(e) => return Json(json!({"ok":false,"error":e})) };
     let bolt11 = inv["hash"].as_str().or_else(|| inv["text"].as_str()).unwrap_or_default().to_string();
     if bolt11.is_empty() { return Json(json!({"ok":false,"error":"invoice creation failed"})); }
-    { s.ln_invoices.lock().await.insert(secret, LnInvoice { deposit_address: address.clone(), amount: b.amount, swapped: false }); }
+    { s.ln_invoices.lock().await.insert(secret, LnInvoice { account, deposit_address: address.clone(), amount: b.amount, swapped: false }); }
     Json(json!({ "ok": true, "bolt11": bolt11, "amount": b.amount, "address": address }))
 }
 
@@ -1129,6 +1130,17 @@ async fn post_ln_webhook(State(s): State<ArcadeState>, Json(b): Json<Value>) -> 
     match client.send_to_address(&addr, bitcoin::Amount::from_sat(amount), None, None, None, None, None, None) {
         Ok(txid) => {
             eprintln!("ln-swap: sent {amount} sat on-chain to {} txid {txid}", inv.deposit_address);
+            // Surface a pending status immediately (the deposit watcher reconciles
+            // with the real mempool/confirmed values on its next cycle) so the LN
+            // payer sees "incoming" right away, like an on-chain deposit.
+            {
+                let mut w = s.deposit_watch.lock().await;
+                let e = w.entry(inv.account).or_default();
+                if e.address.is_empty() { e.address = inv.deposit_address.clone(); }
+                if e.pending_sats < amount { e.pending_sats = amount; }
+                if e.txid.is_none() { e.txid = Some(txid.to_string()); }
+            }
+            s.notify();
             Json(json!({"ok":true,"txid":txid.to_string()}))
         }
         Err(e) => {
