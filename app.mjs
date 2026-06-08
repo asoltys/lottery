@@ -162,6 +162,11 @@ function render(st) {
   const faucetEnabled = st.faucet_enabled !== false;
   const fbtn = $('faucetbtn');
   if (fbtn) fbtn.style.display = faucetEnabled ? '' : 'none';
+  // The custodial cash-out is regtest-only; hide Withdraw off-regtest until the
+  // non-custodial exit is wired up (no operator funds, ever, on signet/mainnet).
+  const wbtn = $('withdrawbtn2');
+  if (wbtn) wbtn.style.display = faucetEnabled ? '' : 'none';
+  if (!faucetEnabled) { const wb = $('withdrawbox'); if (wb) wb.style.display = 'none'; }
   $('registered').textContent = a.registered
     ? ''
     : (faucetEnabled ? ' (hit the faucet to join)' : ' (add funds to play)');
