@@ -204,10 +204,16 @@ function render(st) {
 
 // ---- betting: clicking a chip (5k/10k/25k/ALL IN) places that bet immediately ----
 let betting = false;
+// The VM keeps a small fixed per-call reserve, so you can't stake your very last
+// sats (measured at ~12; we leave a safe margin). Cap every bet — including
+// "ALL IN" — at balance − reserve so it never fails with "balance would go below
+// zero".
+const BET_RESERVE = 50;
 async function doEnterBet(betSpec) {
   if (betting) return;
   const bal = (lastState && lastState.account && lastState.account.balance) || 0;
-  const amount = betSpec === 'all' ? bal : Math.min(betSpec, bal);
+  const maxBet = Math.max(0, bal - BET_RESERVE);
+  const amount = betSpec === 'all' ? maxBet : Math.min(betSpec, maxBet);
   if (amount < 1) return flash('not enough balance — add funds first', 'err');
   betting = true;
   const chips = $('betchips'); if (chips) chips.classList.add('busy');
