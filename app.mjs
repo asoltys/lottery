@@ -9,8 +9,6 @@ import { sha256, sha512 } from '@noble/hashes/sha2.js';
 import { entropyToMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
 import { attachCosign } from './cosign_client.mjs';
-import { challenge, verifyCutChoose } from './garble.mjs';
-import { disputeAndReclaim } from './dispute.mjs';
 
 const Fr = bls.fields.Fr;
 const enc = new TextEncoder();
@@ -223,13 +221,12 @@ function renderDeposit(d) {
   const sat = (n) => Number(n || 0).toLocaleString();
   const parts = [];
   if (d) {
-    if (d.joined_sats > 0) parts.push(`🔐 <b>${sat(d.joined_sats)}</b> sat in the pot covenant (exitable with your key)`);
     if (d.confirmed_sats > 0) {
       parts.push(d.claimable_sats > 0
-        ? `✅ <b>${sat(d.confirmed_sats)}</b> sat confirmed (${d.confirmations} conf) — crediting to your balance…`
-        : `✅ <b>${sat(d.confirmed_sats)}</b> sat confirmed & credited to your balance — joins the pot at the next round`);
+        ? `✅ <b>${sat(d.confirmed_sats)}</b> sat received — adding to your balance…`
+        : `✅ <b>${sat(d.confirmed_sats)}</b> sat received & added to your balance`);
     }
-    if (d.pending_sats > 0) parts.push(`⏳ <b>${sat(d.pending_sats)}</b> sat detected, unconfirmed — waiting for a block…`);
+    if (d.pending_sats > 0) parts.push(`⏳ <b>${sat(d.pending_sats)}</b> sat incoming — waiting for confirmation…`);
   }
   if (!parts.length) { el.style.display = 'none'; return; }
   el.innerHTML = parts.join('<br>');
@@ -243,97 +240,20 @@ async function ensureDepositWatch() {
   try { await api(`/api/deposit_address?account=${ME.accountKey}`); } catch (e) {}
 }
 
-// Verify the round's settle in the browser via the garbled fraud-proof. Honest →
-// no secret (draw stands); dishonest engine → the browser derives the disprove
-// secret (the stake is reclaimable). `cheat` asks the engine to assert a wrong
-// winner so the disprove path can be demonstrated.
-const DRAW_SEED = 5000;
-const ODDS_PLUS1 = 476n; // house multiplier (ODDS_DENOM+1)
-const trueRgOf = (total) => Number(BigInt(DRAW_SEED) % (BigInt(total) * ODDS_PLUS1));
-
-// Verify the honest settle in your browser (no chain action).
-async function doVerifyDraw() {
-  const el = $('drawverify');
-  if (!el) return;
-  el.textContent = 'garble-evaluating the proof in your browser…';
-  try {
-    const r = await api('/api/settle_assertion', { seed: DRAW_SEED });
-    if (!r.ok) { el.textContent = r.error || 'no covenant to verify yet — deposit first'; return; }
-    const secret = challenge(r.assertion, trueRgOf(r.total));
-    if (secret === null) {
-      el.innerHTML = `✓ <b>Draw verified</b> in your browser — winner is entry <b>${r.honest_winner}</b> (draw rg=${r.rg}). ` +
-        `The engine's claim is correct. <i>Checked with no server trust and no WASM.</i>`;
-    } else {
-      el.innerHTML = `🚨 <b>Fraud!</b> The engine's claim is wrong — your browser derived the disprove secret <code>${secret.slice(0, 20)}…</code>.`;
-    }
-  } catch (e) { el.textContent = 'verify error: ' + e.message; }
-}
-
-// Simulate a dishonest engine, then DETECT + RECLAIM in the browser end-to-end.
-async function doDisputeReclaim() {
-  const el = $('drawverify');
-  if (!el) return;
-  el.textContent = 'engine is settling (dishonestly)…';
-  try {
-    const honest = await api('/api/settle_assertion', { seed: DRAW_SEED });
-    if (!honest.ok) { el.textContent = honest.error || 'no covenant yet — deposit first'; return; }
-    const wrong = honest.honest_winner === 1 ? 2 : 1;
-    const settle = await api('/api/settle', { seed: DRAW_SEED, winner: wrong });
-    if (!settle.ok) { el.textContent = 'settle failed: ' + settle.error; return; }
-    // cut-and-choose: re-garble the opened instances to enforce honest garbling.
-    try { const opened = verifyCutChoose(settle); el.textContent = `cut-and-choose: re-garbled ${opened}/${settle.k} instances ✓ — challenging the settle…`; }
-    catch (e) { el.innerHTML = `🛑 <b>Cut-and-choose failed</b> — the engine garbled dishonestly: ${e.message}`; return; }
-    const trueRg = trueRgOf(settle.total);
-    const leaf = (settle.leaves || []).find((l) => l.account.toLowerCase() === ME.accountKey.toLowerCase());
-    if (!leaf || !leaf.disprove_script) {
-      const secret = challenge(settle.assertion, trueRg);
-      el.innerHTML = `🚨 <b>Fraud detected</b> (engine claimed winner ${settle.claimed_winner}, true ${settle.honest_winner}); ` +
-        `secret <code>${secret ? secret.slice(0, 16) + '…' : '—'}</code>. You have no stake in this covenant to reclaim.`;
-      return;
-    }
-    el.textContent = '🚨 fraud — reclaiming your stake on-chain…';
-    const broadcast = async (hex) => { const r = await api('/api/broadcast', { tx_hex: hex }); if (!r.ok) throw new Error(r.error); return r.txid; };
-    // size the sweep fee to current network conditions (dynamic, mainnet-safe)
-    let sweepFee = 600;
-    try { const fr = await api('/api/feerate'); if (fr && fr.exit_sweep_fee > 0) sweepFee = fr.exit_sweep_fee; } catch (e) {}
-    const res = await disputeAndReclaim({
-      assertion: settle.assertion, trueRg, unrollTxHex: settle.unroll_tx_hex, unrollTxid: settle.unroll_txid,
-      leaf, secpHex: ME.secp, destSpk: '5120' + ME.accountKey, broadcast, fee: sweepFee,
-      // the unroll is broadcast feeless as a TRUC(v3) CPFP package; wait for it to
-      // confirm before sweeping the leaf (a v3 parent allows only its CPFP child until confirmed).
-      afterUnroll: async (utxid) => {
-        el.textContent = '🚨 fraud — unroll broadcast, waiting for it to confirm…';
-        for (let i = 0; i < 45; i++) {
-          await new Promise((r) => setTimeout(r, 4000));
-          try { const stx = await api(`/api/txstatus?txid=${utxid}&vout=${leaf.vout}`); if (stx.confirmations >= 1) return; } catch (e) {}
-        }
-      },
-    });
-    if (res.fraud) {
-      el.innerHTML = `🚨 <b>Fraud caught & funds reclaimed!</b> Your browser derived the disprove secret, broadcast the unroll, ` +
-        `and swept your <b>${res.outValue.toLocaleString()}</b>-sat leaf back via the disprove path. ` +
-        `reclaim tx <code>${res.reclaimTxid.slice(0, 16)}…</code> — no server trust, no WASM.`;
-      flash('Reclaimed your stake from a dishonest settle!', 'ok');
-    } else {
-      el.textContent = 'engine settled honestly — nothing to reclaim.';
-    }
-  } catch (e) { el.textContent = 'dispute error: ' + e.message; }
-}
-
-// Show the player's LiftV2 deposit address (fund it to put real BTC into the pot).
+// Show the player's deposit address (fund it to add money to play with).
 async function showDepositAddress() {
   const el = $('depositaddr');
   if (!el) return;
   try {
     const d = await api(`/api/deposit_address?account=${ME.accountKey}`);
     if (d.address) {
-      el.innerHTML = `send BTC here to join the pot (2-of-2 with the engine, CSV-refundable):<br><code>${d.address}</code>`;
+      el.innerHTML = `Send BTC to this address to add funds:<br><code>${d.address}</code>`;
       el.style.display = '';
     } else { el.textContent = d.error || 'unavailable'; el.style.display = ''; }
   } catch (e) { el.textContent = 'error: ' + e.message; el.style.display = ''; }
 }
 
-// Reflect the on-chain pot covenant + the tab's exitable claim in it.
+// Show the on-chain pot size + your share, only once a pot exists (kept quiet otherwise).
 async function refreshCovenant() {
   const el = $('covenantstatus');
   if (!el) return;
@@ -341,11 +261,12 @@ async function refreshCovenant() {
     const c = await api('/api/covenant');
     if (c.covenant) {
       const mine = (c.covenant.allocations || []).find((a) => (a[0] || '').toLowerCase() === ME.accountKey.toLowerCase());
-      el.innerHTML = `pot covenant <b>${Number(c.covenant.value).toLocaleString()}</b> sat across <b>${(c.covenant.allocations || []).length}</b> players` +
-        (mine ? ` · your claim <b>${Number(mine[1]).toLocaleString()}</b> sat (exitable${c.unroll_present ? ', unroll pre-signed' : ''})` : ' · you have no claim yet') +
-        ` · ${c.cosign_connected} online to co-sign`;
+      el.innerHTML = mine
+        ? `your on-chain share: <b>${Number(mine[1]).toLocaleString()}</b> sat`
+        : '';
+      el.style.display = mine ? '' : 'none';
     } else {
-      el.textContent = 'no on-chain covenant yet — deposit and the engine forms one';
+      el.style.display = 'none';
     }
   } catch (e) {}
 }
@@ -358,20 +279,11 @@ async function refreshExitProof() {
   try {
     const x = await api(`/api/exit?account=${ME.accountKey}`);
     if (x.exitable) {
-      el.innerHTML =
-        `🔓 <b>Non-custodial</b> — your <b>${Number(x.value_sats).toLocaleString()}</b> sat stake is a ` +
-        `Projector value-bound VTXO you can sweep to Bitcoin with <b>only your key</b> ` +
-        `(CSV ${x.exit_delay_blocks} blocks); the operator can't hold it.` +
-        `<details><summary>exit proof</summary>` +
-        `<code>vtxo spk: ${x.vtxo_scriptpubkey}</code>` +
-        `<code>exit script: ${x.exit_script}</code>` +
-        `<code>control block: ${x.exit_control_block}</code></details>`;
+      el.innerHTML = `🔓 your <b>${Number(x.value_sats).toLocaleString()}</b> sat is withdrawable to Bitcoin with your key alone`;
+      el.style.display = '';
     } else {
-      el.innerHTML =
-        `🔓 <b>Non-custodial</b> — no live stake this round. Winnings are paid to your ` +
-        `exitable account balance; stake in a round and it becomes an exitable VTXO claim.`;
+      el.style.display = 'none';
     }
-    el.style.display = '';
   } catch (e) {}
 }
 
@@ -522,19 +434,29 @@ function renderRound(d) {
 async function showRound(n) {
   if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; } // pause home updates
   $('home').style.display = 'none';
+  const help = $('help'); if (help) help.style.display = 'none';
   const el = $('round'); el.style.display = '';
   el.innerHTML = `<div class="card">loading round ${n}…</div>`;
   try { el.innerHTML = renderRound(await api('/api/round/' + n)); }
   catch (e) { el.innerHTML = `<div class="card"><a class="back" href="#">← back</a><p>failed to load round ${n}</p></div>`; }
 }
+function showHelp() {
+  if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; }
+  $('home').style.display = 'none';
+  $('round').style.display = 'none';
+  const help = $('help'); if (help) { help.style.display = ''; window.scrollTo(0, 0); }
+}
 function showHome() {
   $('round').style.display = 'none';
+  const help = $('help'); if (help) help.style.display = 'none';
   $('home').style.display = '';
   if (!ws) connectWS(); // resume push updates
 }
 function route() {
   const m = (location.hash || '').match(/^#round\/(\d+)/);
-  if (m) showRound(parseInt(m[1], 10)); else showHome();
+  if (m) showRound(parseInt(m[1], 10));
+  else if ((location.hash || '') === '#help') showHelp();
+  else showHome();
 }
 
 function hideBackup() {
@@ -585,8 +507,6 @@ function main() {
   $('restorebtn').onclick = doRestore;
   $('withdrawbtn').onclick = doWithdraw;
   const dbtn = $('depositbtn'); if (dbtn) dbtn.onclick = showDepositAddress;
-  const vbtn = $('verifybtn'); if (vbtn) vbtn.onclick = doVerifyDraw;
-  const cbtn = $('cheatbtn'); if (cbtn) cbtn.onclick = doDisputeReclaim;
   $('copyphrase').onclick = () => copyText($('phraseout').textContent);
   flash('Welcome, ' + short(ME.accountKey) + '. Keys generated in your browser — back them up to restore later.', 'ok');
   window.addEventListener('hashchange', route);
