@@ -691,6 +691,7 @@ function registerServiceWorker() {
 function main() {
   $('me').textContent = short(ME.accountKey);
   $('faucetbtn').onclick = doFaucet;
+  const logo = $('logo'); if (logo) logo.onclick = () => { if (location.hash) location.hash = ''; else showHome(); };
   $('newbtn').onclick = newPlayer;
   $('exportbtn').onclick = toggleExport;
   $('restorebtn').onclick = doRestore;
