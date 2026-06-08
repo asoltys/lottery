@@ -155,7 +155,8 @@ struct DepositWatch {
     confirmations: i64,  // confirmations of the most-confirmed deposit
     txid: Option<String>,
     vout: Option<u32>,
-    confirmed_utxos: Vec<(String, u32, u64)>, // (txid display, vout, value) of confirmed deposits
+    confirmed_utxos: Vec<(String, u32, u64)>, // (txid display, vout, value) of CURRENTLY-UNSPENT confirmed deposits
+    seen: Vec<(String, u32, u64)>, // every confirmed deposit ever seen (durable; for L2 crediting regardless of genesis timing)
 }
 
 // bitcoind watch-only descriptor wallet that tracks players' deposit addresses
@@ -555,7 +556,7 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
             let claimable_sats: u64 = match &dep {
                 Some(d) => {
                     let credited = s.credited_deposits.lock().await;
-                    d.confirmed_utxos.iter().filter(|(t, v, _)| !credited.contains(&format!("{t}:{v}"))).map(|(_, _, val)| *val).sum()
+                    d.seen.iter().filter(|(t, v, _)| !credited.contains(&format!("{t}:{v}"))).map(|(_, _, val)| *val).sum()
                 }
                 None => 0,
             };
@@ -883,7 +884,12 @@ async fn deposit_watcher(s: ArcadeState) {
                 if let Some(e) = w.get_mut(acct) {
                     if e.pending_sats != p || e.confirmed_sats != c || e.confirmations != confs || e.confirmed_utxos != cu { changed = true; }
                     e.pending_sats = p; e.confirmed_sats = c; e.confirmations = confs; e.txid = txid; e.vout = vout;
-                    e.confirmed_utxos = cu;
+                    e.confirmed_utxos = cu.clone();
+                    // remember every confirmed deposit durably, so the L2 credit
+                    // survives the deposit being spent into the covenant by genesis.
+                    for (t, v, val) in cu {
+                        if !e.seen.iter().any(|(st, sv, _)| st == &t && *sv == v) { e.seen.push((t, v, val)); }
+                    }
                 }
             }
         }
@@ -1001,6 +1007,16 @@ async fn post_deposit(State(s): State<ArcadeState>, Json(b): Json<DepositRegReq>
             pd.push(PendingDeposit { account, txid_internal: txid.to_byte_array(), vout: b.vout, value });
         }
     }
+    // Record it durably in the watch so the L2 credit (claim) works regardless of
+    // when genesis spends the deposit — this explicit registration is reliable even
+    // if the watch-wallet import hasn't caught up yet.
+    {
+        let mut w = s.deposit_watch.lock().await;
+        let e = w.entry(account).or_default();
+        if !e.seen.iter().any(|(t, v, _)| t == &b.txid && *v == b.vout) {
+            e.seen.push((b.txid.clone(), b.vout, value));
+        }
+    }
     Json(json!({ "ok": true, "value": value, "pending": s.pending_deposits.lock().await.len() }))
 }
 
@@ -1031,7 +1047,7 @@ async fn post_deposit_claim(State(s): State<ArcadeState>, Json(b): Json<DepositC
     }
     // Confirmed deposit UTXOs for this account, minus the already-credited ones.
     let utxos: Vec<(String, u32, u64)> = {
-        match s.deposit_watch.lock().await.get(&account_key) { Some(d) => d.confirmed_utxos.clone(), None => Vec::new() }
+        match s.deposit_watch.lock().await.get(&account_key) { Some(d) => d.seen.clone(), None => Vec::new() }
     };
     let mut to_credit: Vec<String> = Vec::new();
     let mut total: u64 = 0;
@@ -1165,7 +1181,7 @@ async fn post_refresh(State(s): State<ArcadeState>, Json(b): Json<RefreshReq>) -
     let params = cosign::RefreshParams {
         old_allocations: old_allocs, old_expiry: cov.expiry, new_allocations: new_allocs.clone(),
         new_expiry, prev_txid: old_txid_internal, prev_vout: cov.vout, prev_value: cov.value,
-        fee: refresh_fee, override_out_spk: None,
+        fee: refresh_fee, override_out_spk: None, payout: None,
     };
     let res = match s.cosign_hub.run_refresh(params, "arcade-refresh", std::time::Duration::from_secs(30)).await {
         Ok(r) => r, Err(e) => return Json(json!({"ok":false,"error":e})),
@@ -1409,60 +1425,105 @@ struct WithdrawReq {
     amount: u64,
     bls_signature: String,
 }
+// NON-CUSTODIAL withdraw: a cooperative covenant refresh that pays the player's
+// not-in-play balance straight to their own Bitcoin address and re-pools the rest.
+// Nothing leaves the operator wallet — the funds are the player's own on-chain
+// claim, released by an N-of-N cosign of the current pot members (each verifies the
+// tx before signing). Capped at the player's on-chain claim (winnings beyond it
+// need a settle, not yet wired). Authorized by the player's BLS signature.
 async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawReq>) -> Json<Value> {
     let err = |m: &str| Json(json!({ "ok": false, "error": m }));
-    // Operator-funded cash-out is CUSTODIAL — disabled outside regtest (which is
-    // local test only). Real withdrawals are non-custodial: the player exits their
-    // own on-chain VTXO claim with their key (nothing leaves the operator wallet).
-    if s.chain != Chain::Regtest {
-        return err("custodial withdraw disabled — use the non-custodial exit");
-    }
     let account_key = match parse_hex::<32>(&body.account_key) { Some(a) => a, None => return err("bad account key") };
     let bls_key = match parse_hex::<48>(&body.bls_key) { Some(b) => b, None => return err("bad bls key") };
     let signature = match parse_hex::<96>(&body.bls_signature) { Some(x) => x, None => return err("bad signature") };
-    if body.amount == 0 {
-        return err("amount must be positive");
-    }
-    let address = match bitcoin::Address::from_str(&body.address) {
-        Ok(a) => a.assume_checked(),
-        Err(_) => return err("invalid address"),
-    };
+    if body.amount == 0 { return err("amount must be positive"); }
+    let address = match bitcoin::Address::from_str(&body.address) { Ok(a) => a.assume_checked(), Err(_) => return err("invalid address") };
+    let dest_spk = address.script_pubkey().to_bytes();
 
-    // Authorize: BLS-verify a sighash over (account_key ‖ amount ‖ address) so
-    // only the key owner can move their balance.
+    // Authorize: BLS sig over (account_key ‖ amount ‖ address).
     let mut preimage = Vec::with_capacity(32 + 8 + body.address.len());
     preimage.extend_from_slice(&account_key);
     preimage.extend_from_slice(&body.amount.to_le_bytes());
     preimage.extend_from_slice(body.address.as_bytes());
     let sighash = preimage.hash(Some(HashTag::CustomString("Cube/sighash/arcade/withdraw".to_string())));
-    if !bls_verify(&bls_key, sighash, signature) {
-        return err("signature verification failed");
-    }
+    if !bls_verify(&bls_key, sighash, signature) { return err("signature verification failed"); }
 
     let _guard = s.exec_lock.lock().await;
-    let balance = match s.coin_manager.lock().await.get_account_balance(account_key) {
-        Some(b) => b,
-        None => return err("account has no balance"),
+    let cov = match s.covenant.current().await { Some(c) => c, None => return err("no on-chain pot yet — nothing to exit (your funds aren't pooled on-chain)") };
+    let acct_hex = hex::encode(account_key);
+    let alloc = match cov.allocations.iter().find(|(h, _)| h.eq_ignore_ascii_case(&acct_hex)) { Some((_, v)) => *v, None => return err("you have no claim in the on-chain pot") };
+    let balance = s.coin_manager.lock().await.get_account_balance(account_key).unwrap_or(0);
+    if balance == 0 { return err("nothing to withdraw"); }
+    // pay out your balance, capped by your on-chain claim and the authorized amount.
+    let payout = alloc.min(balance).min(body.amount);
+    if payout == 0 { return err("nothing withdrawable"); }
+
+    let old_allocs: Vec<([u8; 32], u64)> = cov.allocations.iter().filter_map(|(h, v)| parse_hex::<32>(h).map(|a| (a, *v))).collect();
+    let old_txid_internal = match bitcoin::Txid::from_str(&cov.txid) { Ok(t) => t.to_byte_array(), Err(_) => return err("bad covenant txid") };
+    let remaining: Vec<([u8; 32], u64)> = old_allocs.iter().cloned().filter(|(a, _)| a != &account_key).collect();
+    let fee = s.estimate_fee(refresh_vsize() + VB_TAPROOT_OUT);
+
+    // build the cosign params; compute the new covenant state to record on success.
+    let (params, new_state): (cosign::RefreshParams, Option<(u64, Vec<(String, u64)>)>) = if remaining.is_empty() {
+        // last member out: a payout-only tx (no new covenant) pays the whole pot
+        // (minus fee) to your address.
+        let out = cov.value.saturating_sub(fee);
+        (cosign::RefreshParams {
+            old_allocations: old_allocs.clone(), old_expiry: cov.expiry,
+            new_allocations: vec![], new_expiry: cov.expiry,
+            prev_txid: old_txid_internal, prev_vout: cov.vout, prev_value: cov.value,
+            fee, override_out_spk: None, payout: Some((account_key, out, dest_spk.clone())),
+        }, None)
+    } else {
+        // multi member: payout output to you + a new covenant for the rest. The
+        // surplus (your claim − payout = your gameplay loss) and the fee fold into
+        // the remaining pot (added to the first remaining member). Conserves exactly.
+        let new_cov_value = cov.value - payout - fee;
+        let rem_sum: u64 = remaining.iter().map(|(_, v)| v).sum();
+        let surplus = new_cov_value as i64 - rem_sum as i64;
+        let mut new_allocs = remaining.clone();
+        let first = new_allocs[0].1 as i64 + surplus;
+        if first < 0 { return err("withdraw exceeds covenant"); }
+        new_allocs[0].1 = first as u64;
+        let mut canon = new_allocs.clone();
+        canon.sort_by(|a, b| a.0.cmp(&b.0));
+        let alloc_pairs: Vec<(String, u64)> = canon.iter().map(|(k, v)| (hex::encode(k), *v)).collect();
+        (cosign::RefreshParams {
+            old_allocations: old_allocs.clone(), old_expiry: cov.expiry,
+            new_allocations: new_allocs, new_expiry: cov.expiry,
+            prev_txid: old_txid_internal, prev_vout: cov.vout, prev_value: cov.value,
+            fee, override_out_spk: None, payout: Some((account_key, payout, dest_spk.clone())),
+        }, Some((new_cov_value, alloc_pairs)))
     };
-    if body.amount > balance {
-        return err("insufficient balance");
-    }
-    let rpc = match s.fee_wallet_rpc() { Some(r) => r, None => return err("bitcoin rpc unavailable") };
-    let txid = match rpc.send_to_address(&address, bitcoin::Amount::from_sat(body.amount), None, None, Some(false), None, None, None) {
-        Ok(t) => t,
-        Err(e) => return Json(json!({ "ok": false, "error": format!("payout failed: {}", e) })),
+
+    let res = match s.cosign_hub.run_refresh(params, "arcade-withdraw", std::time::Duration::from_secs(30)).await {
+        Ok(r) => r, Err(e) => return err(&e),
     };
-    {
-        let mut cm = s.coin_manager.lock().await;
-        if cm.account_balance_down(account_key, body.amount).is_err() {
-            return err("debit failed");
+    let txid = match s.broadcast(&res.signed_tx_hex) { Ok(t) => t, Err(e) => return err(&format!("broadcast: {e}")) };
+    s.mine(1);
+
+    // record the resulting covenant (payout is output 0, new covenant is output 1),
+    // or clear it if the last member exited.
+    match &new_state {
+        None => { let _ = s.covenant.update(|st| { st.covenant = None; st.unroll = None; }).await; }
+        Some((value, allocs)) => {
+            let txid = txid.clone();
+            let allocs = allocs.clone();
+            let value = *value;
+            let expiry = cov.expiry;
+            let _ = s.covenant.update(|st| {
+                st.covenant = Some(covenant_manager::CovenantState { txid, vout: 1, value, allocations: allocs, expiry });
+                st.unroll = None;
+            }).await;
         }
-        let _ = cm.apply_changes();
     }
-    s.mine(1); // confirm the payout
+
+    // debit the player's L2 balance by what was paid out.
+    let debited = payout.min(balance);
+    { let mut cm = s.coin_manager.lock().await; let _ = cm.account_balance_down(account_key, debited); let _ = cm.apply_changes(); }
     s.notify();
-    let new_balance = { s.coin_manager.lock().await.get_account_balance(account_key).unwrap_or(0) };
-    Json(json!({ "ok": true, "txid": txid.to_string(), "balance": new_balance }))
+    let new_balance = s.coin_manager.lock().await.get_account_balance(account_key).unwrap_or(0);
+    Json(json!({ "ok": true, "txid": txid, "withdrawn": debited, "balance": new_balance }))
 }
 
 // The round-lifecycle loop: close + settle when a round is ripe.

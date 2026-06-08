@@ -16,29 +16,50 @@ const rand32 = () => {
 
 const sumAlloc = (allocs) => allocs.reduce((s, a) => s + Number(a.value), 0);
 
-// Independently rebuild the refresh tx from the context and confirm: (1) the
-// sighash matches what we'd compute (server can't lie about what we sign),
-// (2) the output is the correct next-state covenant, (3) value is conserved,
-// (4) we keep an exitable claim. Returns { ok, errors, mySighash, myNewValue }.
+// The scriptPubKey this tab authorized for a withdraw payout (set by the app before
+// it asks to withdraw). When THIS tab is the leaver, its cosign refuses unless the
+// payout output goes to exactly this spk — so the operator can't redirect it.
+let pendingWithdrawSpk = null;
+export function setPendingWithdrawSpk(spkHex) { pendingWithdrawSpk = spkHex ? spkHex.toLowerCase() : null; }
+
+// Independently rebuild the refresh tx from the context and confirm: the sighash
+// matches what we'd compute, value is conserved, and — for a normal refresh — we
+// keep an exitable claim. For a cooperative WITHDRAW (extra payout output): if I'm
+// the leaver, the payout must go to the address I authorized; otherwise I must keep
+// my claim. Returns { ok, errors, mySighash, myNewValue }.
 function verifyRefresh(ctx, message, myAccountHex) {
   const errors = [];
   let mySighash = null;
   try {
+    const me = myAccountHex.toLowerCase();
     const prevSpk = covenantSpk(ctx.engine, ctx.old_allocations, ctx.old_expiry).spk;
-    const nextSpk = covenantSpk(ctx.engine, ctx.new_allocations, ctx.new_expiry).spk;
+    const isWithdraw = ctx.payout_account != null;
+    const outputs = [];
+    if (isWithdraw) outputs.push({ value: Number(ctx.payout_value), spk: ctx.payout_spk }); // payout is output 0
+    if ((ctx.new_allocations || []).length > 0) {
+      const nextSpk = covenantSpk(ctx.engine, ctx.new_allocations, ctx.new_expiry).spk;
+      outputs.push({ value: Number(ctx.out_value), spk: nextSpk });
+    }
     mySighash = keyPathSighash({
       version: 2, lockTime: 0, inputIndex: 0,
       inputs: [{ txid: ctx.prev_txid, vout: ctx.prev_vout, value: ctx.prev_value, spk: prevSpk, sequence: 0xffffffff }],
-      outputs: [{ value: ctx.out_value, spk: nextSpk }],
+      outputs,
     });
     if (mySighash.toLowerCase() !== (message || '').toLowerCase())
       errors.push('sighash mismatch — server asserted a different tx than the one described');
-    if (Number(ctx.out_value) !== sumAlloc(ctx.new_allocations))
+    if (Number(ctx.out_value || 0) !== sumAlloc(ctx.new_allocations || []))
       errors.push('covenant value != Σ new allocations (value would leak)');
-    if (Number(ctx.prev_value) < Number(ctx.out_value))
-      errors.push('negative fee (prev_value < out_value)');
-    const mine = (ctx.new_allocations || []).find((a) => a.account.toLowerCase() === myAccountHex.toLowerCase());
-    if (!mine) errors.push('no exitable claim for me in the new covenant');
+    const outSum = outputs.reduce((s, o) => s + Number(o.value), 0);
+    if (Number(ctx.prev_value) < outSum)
+      errors.push('outputs exceed input (negative fee)');
+    const mine = (ctx.new_allocations || []).find((a) => a.account.toLowerCase() === me);
+    if (isWithdraw && ctx.payout_account.toLowerCase() === me) {
+      // I'm withdrawing — the payout MUST go to the address I authorized.
+      if (!pendingWithdrawSpk || (ctx.payout_spk || '').toLowerCase() !== pendingWithdrawSpk)
+        errors.push('payout does not go to the address I authorized');
+    } else if (!mine) {
+      errors.push('no exitable claim for me in the new covenant');
+    }
     return { ok: errors.length === 0, errors, mySighash, myNewValue: mine ? Number(mine.value) : 0 };
   } catch (e) {
     return { ok: false, errors: ['verify exception: ' + e.message], mySighash };

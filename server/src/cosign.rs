@@ -135,6 +135,12 @@ pub struct RefreshParams {
     /// allocations — models a malicious engine trying to divert the pot. A
     /// verifying client recomputes the covenant + sighash and must refuse.
     pub override_out_spk: Option<Vec<u8>>,
+    /// Cooperative WITHDRAW: if set, the refresh tx gets an extra FIRST output that
+    /// pays `(value, dest_spk)` to a leaving player's own address, and the new
+    /// covenant holds the rest. (leaver_account, value, dest_spk). All current
+    /// members co-sign; the leaver verifies the payout is to their address, the
+    /// others verify their claim is preserved. Nothing leaves the operator wallet.
+    pub payout: Option<([u8; 32], u64, Vec<u8>)>,
 }
 
 /// The signed refresh, ready to broadcast.
@@ -257,22 +263,33 @@ impl CosignHub {
             value: Amount::from_sat(p.prev_value),
             script_pubkey: old_spk,
         };
-        let new_spk = ScriptBuf::from_bytes(
-            covenant_scriptpubkey(self.engine_key, &p.new_allocations, p.new_expiry)
-                .ok_or("covenant_scriptpubkey(new) failed")?,
-        );
         // The new covenant holds exactly the sum of its leaves; the tx fee is
         // whatever's left over (prev_value - out_value). Conservation: the client
-        // checks out_value == Σ new_allocations and prev_value >= out_value.
+        // checks out_value == Σ new_allocations and prev_value >= outputs.
         let new_total: u64 = p.new_allocations.iter().map(|(_, v)| v).sum();
         let out_value = new_total;
-        if p.prev_value < out_value {
-            return Err("prev_value < new covenant total".into());
+        let outpoint = OutPoint::new(Txid::from_byte_array(p.prev_txid), p.prev_vout);
+        let payout_value = p.payout.as_ref().map(|(_, v, _)| *v).unwrap_or(0);
+        if p.prev_value < out_value + payout_value {
+            return Err("prev_value < outputs (payout + new covenant)".into());
         }
-        let outpoint = OutPoint::new(
-            Txid::from_byte_array(p.prev_txid),
-            p.prev_vout,
-        );
+        // Build the outputs: a WITHDRAW payout (to a leaver's address) comes FIRST,
+        // then the new covenant (omitted when the last member exits → empty allocs).
+        let mut outputs: Vec<TxOut> = Vec::new();
+        if let Some((_, pv, dest_spk)) = &p.payout {
+            outputs.push(TxOut { value: Amount::from_sat(*pv), script_pubkey: ScriptBuf::from_bytes(dest_spk.clone()) });
+        }
+        if !p.new_allocations.is_empty() {
+            let new_spk = ScriptBuf::from_bytes(
+                covenant_scriptpubkey(self.engine_key, &p.new_allocations, p.new_expiry)
+                    .ok_or("covenant_scriptpubkey(new) failed")?,
+            );
+            outputs.push(TxOut {
+                value: Amount::from_sat(out_value),
+                script_pubkey: match &p.override_out_spk { Some(spk) => ScriptBuf::from_bytes(spk.clone()), None => new_spk },
+            });
+        }
+        if outputs.is_empty() { return Err("refresh has no outputs".into()); }
         let mut refresh_tx = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
@@ -282,13 +299,7 @@ impl CosignHub {
                 sequence: Sequence::MAX,
                 witness: Witness::new(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(out_value),
-                script_pubkey: match &p.override_out_spk {
-                    Some(spk) => ScriptBuf::from_bytes(spk.clone()),
-                    None => new_spk,
-                },
-            }],
+            output: outputs,
         };
         let sighash = SighashCache::new(&refresh_tx)
             .taproot_key_spend_signature_hash(
@@ -382,6 +393,10 @@ impl CosignHub {
             "prev_vout": p.prev_vout,
             "prev_value": p.prev_value,
             "out_value": out_value,
+            // present iff this refresh is a cooperative withdraw (extra payout output).
+            "payout_account": p.payout.as_ref().map(|(a, _, _)| hex::encode(a)),
+            "payout_value": p.payout.as_ref().map(|(_, v, _)| *v),
+            "payout_spk": p.payout.as_ref().map(|(_, _, spk)| hex::encode(spk)),
         });
 
         // round 1: ask each participant for a nonce.

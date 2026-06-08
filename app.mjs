@@ -8,7 +8,8 @@ import { schnorr } from '@noble/curves/secp256k1.js';
 import { sha256, sha512 } from '@noble/hashes/sha2.js';
 import { entropyToMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/bip39';
 import { wordlist } from '@scure/bip39/wordlists/english.js';
-import { attachCosign } from './cosign_client.mjs';
+import { bech32, bech32m } from '@scure/base';
+import { attachCosign, setPendingWithdrawSpk } from './cosign_client.mjs';
 
 const Fr = bls.fields.Fr;
 const enc = new TextEncoder();
@@ -162,11 +163,6 @@ function render(st) {
   const faucetEnabled = st.faucet_enabled !== false;
   const fbtn = $('faucetbtn');
   if (fbtn) fbtn.style.display = faucetEnabled ? '' : 'none';
-  // The custodial cash-out is regtest-only; hide Withdraw off-regtest until the
-  // non-custodial exit is wired up (no operator funds, ever, on signet/mainnet).
-  const wbtn = $('withdrawbtn2');
-  if (wbtn) wbtn.style.display = faucetEnabled ? '' : 'none';
-  if (!faucetEnabled) { const wb = $('withdrawbox'); if (wb) wb.style.display = 'none'; }
   $('registered').textContent = a.registered
     ? ''
     : (faucetEnabled ? ' (hit the faucet to join)' : ' (add funds to play)');
@@ -341,22 +337,40 @@ async function doEnter() {
   } catch (e) { flash('Enter error: ' + e.message, 'err'); }
 }
 
-// Withdraw the WHOLE balance to a Bitcoin address (one balance, get everything).
+// Decode a bech32/bech32m address to its scriptPubKey hex (so we can verify the
+// withdraw payout goes to exactly this address before our key co-signs it).
+function addressToSpk(addr) {
+  let words;
+  try { words = bech32m.decode(addr, 1023).words; }
+  catch { words = bech32.decode(addr, 1023).words; }
+  const ver = words[0];
+  const prog = bech32.fromWords(words.slice(1));
+  const op = ver === 0 ? 0x00 : (0x50 + ver);
+  return hx(Uint8Array.from([op, prog.length, ...prog]));
+}
+
+// Withdraw your whole (not-in-play) balance to a Bitcoin address — NON-CUSTODIAL:
+// a cooperative covenant refresh pays you out from your own on-chain claim. We tell
+// the cosign client the exact destination spk so our key won't sign a redirected payout.
 async function doWithdraw() {
   const address = ($('wdaddr').value || '').trim();
   const amount = (lastState && lastState.account && lastState.account.balance) || 0;
   if (!address) return flash('enter a destination address', 'err');
   if (amount < 1) return flash('nothing to withdraw', 'err');
+  let spk;
+  try { spk = addressToSpk(address); } catch (e) { return flash('invalid Bitcoin address', 'err'); }
   $('withdrawbtn').disabled = true;
-  flash(`Withdrawing ${amount.toLocaleString()} to ${address.slice(0, 14)}…`);
+  flash(`Withdrawing to ${address.slice(0, 16)}… (co-signing your exit)`);
+  setPendingWithdrawSpk(spk);
   try {
     const sig = sign(fromHex(ME.secp), withdrawSighash(ME.accountKey, amount, address));
     const r = await api('/api/withdraw', {
       account_key: ME.accountKey, bls_key: ME.blsKey, address, amount, bls_signature: hx(sig),
     });
-    if (r.ok) { flash(`Withdrew ${amount.toLocaleString()}! tx ${short(r.txid)}`, 'ok'); $('wdaddr').value = ''; $('withdrawbox').style.display = 'none'; }
+    if (r.ok) { flash(`Withdrew ${Number(r.withdrawn || amount).toLocaleString()} sats to your address! tx ${short(r.txid)}`, 'ok'); $('wdaddr').value = ''; $('withdrawbox').style.display = 'none'; }
     else flash('Withdraw failed: ' + friendly(r.error), 'err');
   } catch (e) { flash('Withdraw error: ' + e.message, 'err'); }
+  setPendingWithdrawSpk(null);
   $('withdrawbtn').disabled = false;
 }
 

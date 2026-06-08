@@ -115,6 +115,7 @@ async fn run_trigger(hub: CosignHub, req: TriggerReq, evil: bool) -> Json<Value>
         prev_value,
         fee: req.fee,
         override_out_spk,
+        payout: None,
     };
 
     let label = if evil { "harness-refresh-EVIL" } else { "harness-refresh" };
