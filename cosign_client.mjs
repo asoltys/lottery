@@ -56,8 +56,9 @@ function verifyUnroll(ctx, message, myAccountHex) {
     const me = myAccountHex.toLowerCase();
     const prevSpk = covenantSpk(ctx.engine, ctx.allocations, Number(ctx.expiry)).spk;
     const inputs = [{ txid: ctx.prev_txid, vout: ctx.prev_vout, value: ctx.prev_value, spk: prevSpk, sequence: 0xffffffff }];
+    // ctx.outputs includes the 0-value P2A anchor (last); the unroll is TRUC (v3).
     const outputs = (ctx.outputs || []).map((o) => ({ value: o.value, spk: o.spk }));
-    mySighash = keyPathSighash({ version: 2, lockTime: 0, inputIndex: 0, inputs, outputs });
+    mySighash = keyPathSighash({ version: 3, lockTime: 0, inputIndex: 0, inputs, outputs });
     if (mySighash.toLowerCase() !== (message || '').toLowerCase())
       errors.push('sighash mismatch — not the unroll described');
     if (!(ctx.outputs || []).some((o) => (o.account || '').toLowerCase() === me))

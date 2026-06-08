@@ -299,6 +299,15 @@ async function doDisputeReclaim() {
     const res = await disputeAndReclaim({
       assertion: settle.assertion, trueRg, unrollTxHex: settle.unroll_tx_hex, unrollTxid: settle.unroll_txid,
       leaf, secpHex: ME.secp, destSpk: '5120' + ME.accountKey, broadcast, fee: sweepFee,
+      // the unroll is broadcast feeless as a TRUC(v3) CPFP package; wait for it to
+      // confirm before sweeping the leaf (a v3 parent allows only its CPFP child until confirmed).
+      afterUnroll: async (utxid) => {
+        el.textContent = '🚨 fraud — unroll broadcast, waiting for it to confirm…';
+        for (let i = 0; i < 45; i++) {
+          await new Promise((r) => setTimeout(r, 4000));
+          try { const stx = await api(`/api/txstatus?txid=${utxid}&vout=${leaf.vout}`); if (stx.confirmations >= 1) return; } catch (e) {}
+        }
+      },
     });
     if (res.fraud) {
       el.innerHTML = `🚨 <b>Fraud caught & funds reclaimed!</b> Your browser derived the disprove secret, broadcast the unroll, ` +

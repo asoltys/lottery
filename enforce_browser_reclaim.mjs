@@ -84,6 +84,8 @@ async function main() {
     assertion: settle.assertion, trueRg,
     unrollTxHex: settle.unroll_tx_hex, unrollTxid: settle.unroll_txid,
     leaf, secpHex: tab.secpHex, destSpk, broadcast: browserBroadcast,
+    // the v3 unroll is broadcast as a CPFP package; confirm it before sweeping a leaf (TRUC)
+    afterUnroll: async () => { cli('-generate 1'); },
   });
   for (const ws of sockets) ws.close();
 

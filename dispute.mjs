@@ -29,7 +29,7 @@ function serializeSpend({ inTxidInternal, vout, witnessItems, outValue, outSpk }
 
 // Verify a settle and, on fraud, reclaim the tab's own leaf. Returns
 // { fraud:false } | { fraud:true, secret, unrollTxid, reclaimTxid, outValue }.
-export async function disputeAndReclaim({ assertion, trueRg, unrollTxHex, unrollTxid, leaf, secpHex, destSpk, broadcast, fee = 600 }) {
+export async function disputeAndReclaim({ assertion, trueRg, unrollTxHex, unrollTxid, leaf, secpHex, destSpk, broadcast, afterUnroll, fee = 600 }) {
   const secret = challenge(assertion, trueRg);
   if (!secret) return { fraud: false };
 
@@ -37,6 +37,10 @@ export async function disputeAndReclaim({ assertion, trueRg, unrollTxHex, unroll
   //    be in the chain/mempool from another challenger).
   let utxid = unrollTxid;
   try { utxid = await broadcast(unrollTxHex); } catch (_e) { /* already broadcast */ }
+
+  // The unroll is TRUC (v3): until it confirms it may have only its CPFP child, so
+  // wait for confirmation before spending a leaf (the reclaim would be a 2nd child).
+  if (afterUnroll) await afterUnroll(utxid);
 
   // 2) spend the tab's own leaf via the disprove path with the garbled secret.
   const outValue = leaf.value - fee;
@@ -83,11 +87,13 @@ function serialize2({ inputs, witnesses, outValue, outSpk }) {
 // connector included), so the dispute is bound to the canonical exit-ladder — the
 // engine can't dodge it onto a fork. `provideConnector(spkHex)` must fund + return
 // the connector { txidInternal, vout, value } (the exit-ladder output).
-export async function forkAttestReclaim({ assertion, trueRg, unrollTxHex, unrollTxid, leaf, secpHex, accountKey, destSpk, broadcast, provideConnector, fee = 800 }) {
+export async function forkAttestReclaim({ assertion, trueRg, unrollTxHex, unrollTxid, leaf, secpHex, accountKey, destSpk, broadcast, provideConnector, afterUnroll, fee = 800 }) {
   const secret = challenge(assertion, trueRg);
   if (!secret) return { fraud: false };
   let utxid = unrollTxid;
   try { utxid = await broadcast(unrollTxHex); } catch (_e) { /* already broadcast */ }
+  // TRUC: wait for the v3 unroll to confirm before spending a leaf (see disputeAndReclaim).
+  if (afterUnroll) await afterUnroll(utxid);
 
   // the connector: a BIP86 P2TR of the challenger's own key, funded by the exit-ladder.
   const tweak = mod(big(taggedHash('TapTweak', hexToBytes(accountKey))));

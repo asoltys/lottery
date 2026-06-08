@@ -110,6 +110,7 @@ struct ArcadeState {
     rpc_url: String,
     rpc_user: String,
     rpc_pass: String,
+    btc_wallet: String, // engine fee/spending wallet name (for CPFP funding)
     mine_address: String,
     settler_account: [u8; 32],
     settler_bls: [u8; 48],
@@ -277,6 +278,67 @@ impl ArcadeState {
     fn broadcast(&self, tx_hex: &str) -> Result<String, String> {
         let rpc = self.rpc().ok_or("bitcoin rpc unavailable")?;
         rpc.send_raw_transaction(tx_hex).map(|t| t.to_string()).map_err(|e| format!("{e}"))
+    }
+    // A bitcoind RPC client scoped to the engine's fee/spending wallet.
+    fn fee_wallet_rpc(&self) -> Option<Client> {
+        let url = format!("{}/wallet/{}", self.rpc_url.trim_end_matches('/'), self.btc_wallet);
+        Client::new(&url, Auth::UserPass(self.rpc_user.clone(), self.rpc_pass.clone())).ok()
+    }
+    // Broadcast, auto-CPFP'ing a feeless TRUC(v3)+P2A parent (e.g. the pre-signed
+    // unroll) via package relay; otherwise a plain sendrawtransaction.
+    fn smart_broadcast(&self, tx_hex: &str) -> Result<String, String> {
+        if tx_hex.len() >= 8 && &tx_hex[..8] == "03000000" && tx_hex.contains("0451024e73") {
+            self.cpfp_broadcast(tx_hex)
+        } else {
+            self.broadcast(tx_hex)
+        }
+    }
+    // Build a CPFP child (funded from the engine wallet) that spends the parent's
+    // P2A anchor + a wallet UTXO and pays the package fee, then submit [parent,
+    // child] as a package. Returns the parent txid.
+    fn cpfp_broadcast(&self, parent_hex: &str) -> Result<String, String> {
+        let rpc = self.rpc().ok_or("bitcoin rpc unavailable")?;
+        let wrpc = self.fee_wallet_rpc().ok_or("fee wallet rpc unavailable")?;
+        let pdec: Value = rpc.call("decoderawtransaction", &[json!(parent_hex)]).map_err(|e| format!("decode: {e}"))?;
+        let ptxid = pdec["txid"].as_str().ok_or("no parent txid")?.to_string();
+        let pvsize = pdec["vsize"].as_u64().unwrap_or(200);
+        let anchor = pdec["vout"].as_array()
+            .and_then(|outs| outs.iter().find(|o| o["scriptPubKey"]["hex"].as_str() == Some("51024e73")))
+            .ok_or("parent has no P2A anchor")?;
+        let anchor_vout = anchor["n"].as_u64().ok_or("anchor vout")?;
+        let anchor_amt = anchor["value"].as_f64().unwrap_or(0.0); // BTC; spent by the child
+        // pick the largest confirmed wallet UTXO to fund the package fee
+        let utxos: Value = wrpc.call("listunspent", &[json!(1)]).map_err(|e| format!("listunspent: {e}"))?;
+        let u = utxos.as_array().and_then(|a| a.iter().max_by(|x, y|
+            x["amount"].as_f64().unwrap_or(0.0).partial_cmp(&y["amount"].as_f64().unwrap_or(0.0)).unwrap()))
+            .ok_or("no wallet UTXO to fund CPFP")?;
+        let u_txid = u["txid"].as_str().ok_or("utxo txid")?;
+        let u_vout = u["vout"].as_u64().ok_or("utxo vout")?;
+        let u_amt = u["amount"].as_f64().ok_or("utxo amount")?;
+        let u_spk = u["scriptPubKey"].as_str().ok_or("utxo spk")?;
+        let change_addr: String = wrpc.call("getnewaddress", &[]).map_err(|e| format!("getnewaddress: {e}"))?;
+        // the child pays for the whole package (feeless parent + child); it spends
+        // the anchor + a wallet UTXO, so child out = anchor + utxo − package fee.
+        let fee_sats = self.estimate_fee(pvsize + 150);
+        let in_sats = ((u_amt + anchor_amt) * 1e8).round() as i64;
+        let out_sats = in_sats - fee_sats as i64;
+        if out_sats <= 330 { return Err("CPFP funding UTXO too small for fee".into()); }
+        let out_btc = out_sats as f64 / 1e8;
+        let inputs = json!([{ "txid": ptxid, "vout": anchor_vout }, { "txid": u_txid, "vout": u_vout }]);
+        let outputs = json!([{ change_addr: out_btc }]);
+        let craw: String = wrpc.call("createrawtransaction", &[inputs, outputs]).map_err(|e| format!("createrawtransaction: {e}"))?;
+        let cv3 = format!("03000000{}", &craw[8..]); // TRUC v3 child
+        let prevtxs = json!([
+            { "txid": ptxid, "vout": anchor_vout, "scriptPubKey": "51024e73", "amount": anchor_amt },
+            { "txid": u_txid, "vout": u_vout, "scriptPubKey": u_spk, "amount": u_amt },
+        ]);
+        let signed: Value = wrpc.call("signrawtransactionwithwallet", &[json!(cv3), prevtxs]).map_err(|e| format!("sign child: {e}"))?;
+        let chex = signed["hex"].as_str().ok_or("no signed child")?;
+        let res: Value = rpc.call("submitpackage", &[json!([parent_hex, chex])]).map_err(|e| format!("submitpackage: {e}"))?;
+        if res["package_msg"].as_str() != Some("success") {
+            return Err(format!("package not accepted: {res}"));
+        }
+        Ok(ptxid)
     }
     fn best_block_hash(&self) -> [u8; 32] {
         self.rpc()
@@ -1015,6 +1077,18 @@ async fn post_deposit_claim(State(s): State<ArcadeState>, Json(b): Json<DepositC
     Json(json!({"ok":true,"credited":total,"balance":balance,"registery_index":reg_index}))
 }
 
+// Confirmations of an (unspent) output, via gettxout (no txindex needed). Used by
+// the browser to wait for the TRUC v3 unroll to confirm before sweeping a leaf.
+async fn get_txstatus(State(s): State<ArcadeState>, Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+    let txid = match params.get("txid") { Some(t) => t.clone(), None => return Json(json!({"confirmations": 0})) };
+    let vout: u32 = params.get("vout").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let confs = s.rpc()
+        .and_then(|c| c.call::<Value>("gettxout", &[json!(txid), json!(vout)]).ok())
+        .and_then(|o| o.get("confirmations").and_then(|c| c.as_i64()))
+        .unwrap_or(0);
+    Json(json!({ "confirmations": confs }))
+}
+
 // Current fee conditions, for clients that build their own txs (the unilateral
 // exit / dispute sweep): the node's sat/vB estimate + a ready-to-use sweep fee.
 async fn get_feerate(State(s): State<ArcadeState>) -> Json<Value> {
@@ -1123,7 +1197,7 @@ async fn post_refresh(State(s): State<ArcadeState>, Json(b): Json<RefreshReq>) -
 async fn post_unroll(State(s): State<ArcadeState>) -> Json<Value> {
     let snap = s.covenant.snapshot().await;
     let unroll = match snap.unroll { Some(u) => u, None => return Json(json!({"ok":false,"error":"no pre-signed unroll"})) };
-    let txid = match s.broadcast(&unroll.unroll_tx_hex) { Ok(t) => t, Err(e) => return Json(json!({"ok":false,"error":format!("broadcast: {e}")})) };
+    let txid = match s.smart_broadcast(&unroll.unroll_tx_hex) { Ok(t) => t, Err(e) => return Json(json!({"ok":false,"error":format!("broadcast: {e}")})) };
     s.mine(1);
     Json(json!({ "ok": true, "unroll_txid": txid }))
 }
@@ -1201,7 +1275,9 @@ struct BroadcastReq {
     tx_hex: String,
 }
 async fn post_broadcast(State(s): State<ArcadeState>, Json(b): Json<BroadcastReq>) -> Json<Value> {
-    match s.broadcast(&b.tx_hex) {
+    // smart_broadcast auto-CPFPs a feeless v3+P2A parent (the pre-signed unroll)
+    // via package relay, so a browser/watchtower can broadcast it with no wallet.
+    match s.smart_broadcast(&b.tx_hex) {
         Ok(txid) => Json(json!({ "ok": true, "txid": txid })),
         Err(e) => Json(json!({ "ok": false, "error": e })),
     }
@@ -1655,6 +1731,12 @@ pub async fn run_arcade(
         .map(|v| v.into_iter().collect())
         .unwrap_or_default();
 
+    // The engine's bitcoind fee/spending wallet (funds CPFP children for the
+    // feeless package-broadcast unroll). regtest harness uses "cube", mut "mutiny".
+    let btc_wallet = std::env::var("CUBE_BTC_WALLET").unwrap_or_else(|_| match &_chain {
+        Chain::Regtest => "cube".to_string(),
+        _ => "mutiny".to_string(),
+    });
     let (tx, _rx) = broadcast::channel::<()>(64);
     let state = ArcadeState {
         chain: _chain,
@@ -1673,6 +1755,7 @@ pub async fn run_arcade(
         rpc_url,
         rpc_user,
         rpc_pass,
+        btc_wallet,
         mine_address,
         settler_account,
         settler_bls,
@@ -1711,6 +1794,7 @@ pub async fn run_arcade(
         .route("/api/exit", get(get_exit))
         .route("/api/covenant", get(get_covenant))
         .route("/api/feerate", get(get_feerate))
+        .route("/api/txstatus", get(get_txstatus))
         .route("/api/deposit_address", get(get_deposit_address))
         .route("/api/deposit", post(post_deposit))
         .route("/api/deposit/claim", post(post_deposit_claim))
