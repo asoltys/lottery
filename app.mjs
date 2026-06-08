@@ -238,11 +238,23 @@ async function maybeClaimDeposit(d) {
   claiming = false;
 }
 
+// A stable identity for the current deposit state, so a dismissal sticks until the
+// deposit actually changes (a new payment) rather than reappearing on every push.
+const depositKey = (d) => (d ? `${d.txid || ''}|${d.confirmed_sats || 0}|${d.pending_sats || 0}` : '');
+let depositDismissKey = null;
+// Hide the current deposit status (called when the player clicks a deposit button —
+// the "x sat received & added" confirmation shouldn't linger into a new deposit).
+function dismissDepositStatus() {
+  depositDismissKey = depositKey(lastState && lastState.account && lastState.account.deposit);
+  const el = $('depositstatus'); if (el) el.style.display = 'none';
+}
+
 // Live deposit-address status, pushed over the same /ws as the rest of state:
 // unconfirmed (mempool) -> confirmed -> joined the pot covenant.
 function renderDeposit(d) {
   const el = $('depositstatus');
   if (!el) return;
+  if (d && depositKey(d) === depositDismissKey) { el.style.display = 'none'; return; }
   const sat = (n) => Number(n || 0).toLocaleString();
   const parts = [];
   if (d) {
@@ -271,7 +283,9 @@ function qrSvg(text) {
   const qr = qrcode(0, 'M');
   qr.addData(text.toUpperCase()); // uppercase = compact alphanumeric QR; wallets lowercase it
   qr.make();
-  return `<div style="background:#fff;padding:10px;border-radius:8px;display:inline-block;max-width:240px">${qr.createSvgTag({ cellSize: 3, margin: 0, scalable: true })}</div>`;
+  // fixed pixel dims (no `scalable` — that collapses to a tiny blob with no width)
+  const svg = qr.createSvgTag({ cellSize: 4, margin: 2 }).replace('<svg ', '<svg style="display:block;width:100%;height:auto" ');
+  return `<div style="background:#fff;padding:8px;border-radius:8px;display:inline-block;max-width:260px">${svg}</div>`;
 }
 
 // Lightning deposit: create an invoice; the server swaps it on-chain into the
@@ -700,10 +714,12 @@ function main() {
   $('restorebtn').onclick = doRestore;
   $('withdrawbtn').onclick = doWithdraw;
   const dbtn = $('depositbtn'); if (dbtn) dbtn.onclick = () => {
+    dismissDepositStatus();
     const s = $('fundsub'); s.style.display = s.style.display === 'none' ? '' : 'none';
   };
-  const btcbtn = $('btcdepositbtn'); if (btcbtn) btcbtn.onclick = showDepositAddress;
+  const btcbtn = $('btcdepositbtn'); if (btcbtn) btcbtn.onclick = () => { dismissDepositStatus(); showDepositAddress(); };
   const lnbtn = $('lndepositbtn'); if (lnbtn) lnbtn.onclick = () => {
+    dismissDepositStatus();
     const box = $('lnbox'); box.style.display = box.style.display === 'none' ? '' : 'none';
   };
   const lncbtn = $('lncreatebtn'); if (lncbtn) lncbtn.onclick = lnDeposit;
