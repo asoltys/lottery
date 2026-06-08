@@ -1122,6 +1122,11 @@ async fn post_ln_webhook(State(s): State<ArcadeState>, Json(b): Json<Value>) -> 
 // Lightning-deposit swap (which sends the swapped on-chain funds to this address).
 async fn register_deposit_address(s: &ArcadeState, account: [u8; 32]) -> Result<(String, String), String> {
     use cube::constructive::txout_types::lift::lift_versions::liftv2::liftv2::return_liftv2_taproot;
+    // The LiftV2 taproot does point math on the account key and panics on a
+    // non-curve x-only value — validate first so a bad key is a clean error.
+    if bitcoin::secp256k1::XOnlyPublicKey::from_slice(&account).is_err() {
+        return Err("invalid account key (not a valid x-only public key)".into());
+    }
     let spk = return_liftv2_taproot(account, s.engine_key).and_then(|t| t.spk())
         .ok_or("could not derive deposit taproot")?;
     let network = match s.chain {
