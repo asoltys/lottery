@@ -293,9 +293,12 @@ async function doDisputeReclaim() {
     }
     el.textContent = '🚨 fraud — reclaiming your stake on-chain…';
     const broadcast = async (hex) => { const r = await api('/api/broadcast', { tx_hex: hex }); if (!r.ok) throw new Error(r.error); return r.txid; };
+    // size the sweep fee to current network conditions (dynamic, mainnet-safe)
+    let sweepFee = 600;
+    try { const fr = await api('/api/feerate'); if (fr && fr.exit_sweep_fee > 0) sweepFee = fr.exit_sweep_fee; } catch (e) {}
     const res = await disputeAndReclaim({
       assertion: settle.assertion, trueRg, unrollTxHex: settle.unroll_tx_hex, unrollTxid: settle.unroll_txid,
-      leaf, secpHex: ME.secp, destSpk: '5120' + ME.accountKey, broadcast,
+      leaf, secpHex: ME.secp, destSpk: '5120' + ME.accountKey, broadcast, fee: sweepFee,
     });
     if (res.fraud) {
       el.innerHTML = `🚨 <b>Fraud caught & funds reclaimed!</b> Your browser derived the disprove secret, broadcast the unroll, ` +

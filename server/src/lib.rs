@@ -162,9 +162,26 @@ struct DepositWatch {
 const DEPOSIT_WATCH_WALLET: &str = "lotto-deposit-watch";
 
 // Covenant lifecycle tuning (regtest-friendly small values).
-const COVENANT_FEE: u64 = 1_000; // per genesis/refresh/unroll tx
 const COVENANT_EXIT_DELAY: u16 = 6; // CSV blocks for the demo (vs 144 in prod)
 const COVENANT_EXPIRY_WINDOW: u64 = 12_960; // CLTV engine-reclaim window above tip
+
+// --- dynamic fee estimation (mainnet-grade) ---
+// Fees are estimated from the node's estimatesmartfee × the tx's vsize, with a
+// safety margin and a relay floor, instead of a flat constant — so the protocol's
+// txs confirm under real fee conditions. (TRUC v3 + P2A anchors + package-relay
+// CPFP for the *pre-signed* unroll/exit need a Core 28+ node; this node is v25.99,
+// so those activate on capable nodes / mainnet — see fee_rate_sat_vb notes.)
+const FEE_MARGIN: f64 = 1.25; // headroom over the point estimate
+const FEE_CONF_TARGET: i64 = 6; // blocks
+// taproot tx component vsizes (key-path spends; close enough for fee sizing).
+const VB_OVERHEAD: u64 = 11;
+const VB_TAPROOT_KEYPATH_IN: u64 = 58;
+const VB_TAPROOT_OUT: u64 = 43;
+const VB_TAPROOT_SCRIPTPATH_EXIT_IN: u64 = 110; // leaf script-path spend (sig+script+control block)
+fn genesis_vsize(n_in: u64) -> u64 { VB_OVERHEAD + n_in * VB_TAPROOT_KEYPATH_IN + VB_TAPROOT_OUT }
+fn refresh_vsize() -> u64 { VB_OVERHEAD + VB_TAPROOT_KEYPATH_IN + VB_TAPROOT_OUT }
+fn unroll_vsize(n_out: u64) -> u64 { VB_OVERHEAD + VB_TAPROOT_KEYPATH_IN + n_out * VB_TAPROOT_OUT }
+fn exit_sweep_vsize() -> u64 { VB_OVERHEAD + VB_TAPROOT_SCRIPTPATH_EXIT_IN + VB_TAPROOT_OUT }
 
 impl ArcadeState {
     fn notify(&self) {
@@ -197,6 +214,23 @@ impl ArcadeState {
     }
     fn rpc(&self) -> Option<Client> {
         Client::new(&self.rpc_url, Auth::UserPass(self.rpc_user.clone(), self.rpc_pass.clone())).ok()
+    }
+    // Current fee rate in sat/vB from the node's estimator, floored at the relay
+    // minimum (1 sat/vB). estimatesmartfee returns BTC/kvB; falls back to 1 if the
+    // estimator has no data (e.g. an empty signet mempool).
+    fn fee_rate_sat_vb(&self) -> f64 {
+        self.rpc()
+            .and_then(|c| c.call::<Value>("estimatesmartfee", &[json!(FEE_CONF_TARGET)]).ok())
+            .and_then(|v| v.get("feerate").and_then(|f| f.as_f64()))
+            .map(|btc_per_kvb| btc_per_kvb * 1e8 / 1000.0)
+            .filter(|r| r.is_finite() && *r > 0.0)
+            .unwrap_or(1.0)
+    }
+    // Estimate a tx fee (sats) for a given vsize: rate × margin × vsize, floored
+    // at 1 sat/vB so we never underpay relay.
+    fn estimate_fee(&self, vsize: u64) -> u64 {
+        let rate = (self.fee_rate_sat_vb() * FEE_MARGIN).max(1.0);
+        (((vsize as f64) * rate).ceil() as u64).max(vsize)
     }
     // A bitcoind RPC client scoped to the deposit-watch wallet.
     fn watch_rpc(&self) -> Option<Client> {
@@ -981,6 +1015,15 @@ async fn post_deposit_claim(State(s): State<ArcadeState>, Json(b): Json<DepositC
     Json(json!({"ok":true,"credited":total,"balance":balance,"registery_index":reg_index}))
 }
 
+// Current fee conditions, for clients that build their own txs (the unilateral
+// exit / dispute sweep): the node's sat/vB estimate + a ready-to-use sweep fee.
+async fn get_feerate(State(s): State<ArcadeState>) -> Json<Value> {
+    Json(json!({
+        "sat_vb": s.fee_rate_sat_vb(),
+        "exit_sweep_fee": s.estimate_fee(exit_sweep_vsize()),
+    }))
+}
+
 // GENESIS core: combine queued deposits from currently-connected depositors into
 // the pot covenant via N-of-N cosign, broadcast it, and record the covenant.
 // Returns (txid, covenant_value, participants). Shared by the manual endpoint and
@@ -996,10 +1039,11 @@ async fn do_genesis(s: &ArcadeState) -> Result<(String, u64, usize), String> {
         account_key: d.account, prev_txid: d.txid_internal, prev_vout: d.vout, prev_value: d.value,
     }).collect();
     let mut allocs: Vec<([u8; 32], u64)> = deposits.iter().map(|d| (d.account, d.value)).collect();
-    if let Some(max) = allocs.iter_mut().max_by_key(|(_, v)| *v) { max.1 = max.1.saturating_sub(COVENANT_FEE); }
+    let fee = s.estimate_fee(genesis_vsize(deposits.len() as u64));
+    if let Some(max) = allocs.iter_mut().max_by_key(|(_, v)| *v) { max.1 = max.1.saturating_sub(fee); }
     let tip = { s.sync_manager.lock().await.bitcoin_sync_height_tip() };
     let expiry = (tip + COVENANT_EXPIRY_WINDOW) as u32;
-    let res = s.cosign_hub.run_genesis(gdeposits, allocs.clone(), expiry, COVENANT_FEE, std::time::Duration::from_secs(30)).await?;
+    let res = s.cosign_hub.run_genesis(gdeposits, allocs.clone(), expiry, fee, std::time::Duration::from_secs(30)).await?;
     let txid = s.broadcast(&res.signed_tx_hex).map_err(|e| format!("broadcast: {e}"))?;
     s.mine(1);
     let mut canonical = allocs.clone();
@@ -1040,12 +1084,14 @@ async fn post_refresh(State(s): State<ArcadeState>, Json(b): Json<RefreshReq>) -
         None => old_allocs.clone(),
     };
     if new_allocs.is_empty() { return Json(json!({"ok":false,"error":"empty new allocations"})); }
-    if let Some(max) = new_allocs.iter_mut().max_by_key(|(_, v)| *v) { max.1 = max.1.saturating_sub(COVENANT_FEE); }
+    let refresh_fee = s.estimate_fee(refresh_vsize());
+    let unroll_fee = s.estimate_fee(unroll_vsize(new_allocs.len() as u64));
+    if let Some(max) = new_allocs.iter_mut().max_by_key(|(_, v)| *v) { max.1 = max.1.saturating_sub(refresh_fee); }
     let new_expiry = cov.expiry;
     let params = cosign::RefreshParams {
         old_allocations: old_allocs, old_expiry: cov.expiry, new_allocations: new_allocs.clone(),
         new_expiry, prev_txid: old_txid_internal, prev_vout: cov.vout, prev_value: cov.value,
-        fee: COVENANT_FEE, override_out_spk: None,
+        fee: refresh_fee, override_out_spk: None,
     };
     let res = match s.cosign_hub.run_refresh(params, "arcade-refresh", std::time::Duration::from_secs(30)).await {
         Ok(r) => r, Err(e) => return Json(json!({"ok":false,"error":e})),
@@ -1057,7 +1103,7 @@ async fn post_refresh(State(s): State<ArcadeState>, Json(b): Json<RefreshReq>) -
     let new_value: u64 = canonical.iter().map(|(_, v)| v).sum();
     let alloc_pairs: Vec<(String, u64)> = canonical.iter().map(|(k, v)| (hex::encode(k), *v)).collect();
     let new_txid_internal = match bitcoin::Txid::from_str(&refresh_txid) { Ok(t) => t.to_byte_array(), Err(_) => return Json(json!({"ok":false,"error":"bad refresh txid"})) };
-    let unroll = match s.cosign_hub.run_unroll(canonical.clone(), new_expiry, new_txid_internal, 0, new_value, COVENANT_EXIT_DELAY, COVENANT_FEE, None, std::time::Duration::from_secs(30)).await {
+    let unroll = match s.cosign_hub.run_unroll(canonical.clone(), new_expiry, new_txid_internal, 0, new_value, COVENANT_EXIT_DELAY, unroll_fee, None, std::time::Duration::from_secs(30)).await {
         Ok(u) => u, Err(e) => return Json(json!({"ok":false,"error":format!("unroll presign: {e}")})),
     };
     let _ = s.covenant.update(|st| {
@@ -1231,9 +1277,10 @@ async fn post_settle(State(s): State<ArcadeState>, Json(b): Json<SettleAssertReq
         Ok(t) => t.to_byte_array(),
         Err(_) => return Json(json!({"ok":false,"error":"bad covenant txid"})),
     };
+    let settle_unroll_fee = s.estimate_fee(unroll_vsize(allocs.len() as u64));
     let unroll = match s
         .cosign_hub
-        .run_unroll(allocs.clone(), cov.expiry, prev_txid_internal, cov.vout, cov.value, COVENANT_EXIT_DELAY, COVENANT_FEE, Some(disprove_hash), std::time::Duration::from_secs(30))
+        .run_unroll(allocs.clone(), cov.expiry, prev_txid_internal, cov.vout, cov.value, COVENANT_EXIT_DELAY, settle_unroll_fee, Some(disprove_hash), std::time::Duration::from_secs(30))
         .await
     {
         Ok(u) => u,
@@ -1663,6 +1710,7 @@ pub async fn run_arcade(
         .route("/api/round/:n", get(get_round))
         .route("/api/exit", get(get_exit))
         .route("/api/covenant", get(get_covenant))
+        .route("/api/feerate", get(get_feerate))
         .route("/api/deposit_address", get(get_deposit_address))
         .route("/api/deposit", post(post_deposit))
         .route("/api/deposit/claim", post(post_deposit_claim))
