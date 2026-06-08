@@ -1105,6 +1105,44 @@ async fn get_txstatus(State(s): State<ArcadeState>, Query(params): Query<HashMap
     Json(json!({ "confirmations": confs }))
 }
 
+// The unilateral ESCAPE HATCH kit: the pre-signed unroll (broadcastable by anyone,
+// no cosign) + this player's VTXO leaf (its CSV exit path). With this a player can
+// force-exit to their own address with only their key — no operator, no other
+// players. The CSV delay + self-paid fees are what discourage griefing.
+async fn get_exit_kit(State(s): State<ArcadeState>, Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+    use cube::constructive::txout_types::timeout_tree::TimeoutTree;
+    let account = match params.get("account").and_then(|a| parse_hex::<32>(a)) { Some(a) => a, None => return Json(json!({"ok":false,"error":"bad account"})) };
+    let cov = match s.covenant.current().await { Some(c) => c, None => return Json(json!({"ok":false,"error":"no on-chain pot to exit"})) };
+    let snap = s.covenant.snapshot().await;
+    let unroll = match snap.unroll { Some(u) if u.covenant_txid == cov.txid => u, _ => return Json(json!({"ok":false,"error":"no pre-signed unroll for the current pot yet"})) };
+    let mut allocs: Vec<([u8; 32], u64)> = cov.allocations.iter().filter_map(|(h, v)| parse_hex::<32>(h).map(|a| (a, *v))).collect();
+    allocs.sort_by(|a, b| a.0.cmp(&b.0));
+    let tree = match TimeoutTree::build(s.engine_key, &allocs, cov.expiry, COVENANT_EXIT_DELAY, None) { Some(t) => t, None => return Json(json!({"ok":false,"error":"tree build failed"})) };
+    let leaf_idx = match tree.leaves.iter().position(|l| l.account_key == account) { Some(i) => i, None => return Json(json!({"ok":false,"error":"you have no leaf in the pot"})) };
+    let leaf = &tree.leaves[leaf_idx];
+    let spk = leaf.scriptpubkey().unwrap_or_default();
+    let (_lh, script, cb) = leaf.exit_spend_elements().unwrap_or_default();
+    // the precise on-chain leaf value (the last leaf is reduced by the P2A anchor).
+    let leaf_value = s.rpc()
+        .and_then(|c| c.call::<Value>("decoderawtransaction", &[json!(unroll.unroll_tx_hex)]).ok())
+        .and_then(|d| d["vout"].as_array().and_then(|o| o.get(leaf_idx)).and_then(|o| o["value"].as_f64()))
+        .map(|btc| (btc * 1e8).round() as u64)
+        .unwrap_or(leaf.value_in_satoshis);
+    Json(json!({
+        "ok": true,
+        "unroll_tx_hex": unroll.unroll_tx_hex,
+        "unroll_txid": unroll.unroll_txid,
+        "leaf": {
+            "vout": leaf_idx,
+            "value": leaf_value,
+            "scriptpubkey": hex::encode(spk),
+            "exit_script": hex::encode(script),
+            "control_block": hex::encode(cb),
+            "exit_delay": COVENANT_EXIT_DELAY,
+        },
+    }))
+}
+
 // Current fee conditions, for clients that build their own txs (the unilateral
 // exit / dispute sweep): the node's sat/vB estimate + a ready-to-use sweep fee.
 async fn get_feerate(State(s): State<ArcadeState>) -> Json<Value> {
@@ -1145,8 +1183,27 @@ async fn do_genesis(s: &ArcadeState) -> Result<(String, u64, usize), String> {
         st.unroll = None;
     }).await;
     { s.pending_deposits.lock().await.clear(); }
+    // Pre-sign the unroll now (everyone's online) so each player holds the trustless
+    // escape hatch — they can force-exit their leaf later with no one's cooperation.
+    presign_unroll(s, &txid, 0, cov_value, &canonical, expiry).await;
     s.notify();
     Ok((txid, cov_value, canonical.len()))
+}
+
+// Pre-sign (N-of-N) the covenant's unroll and store it, so any participant can
+// later broadcast it and unilaterally exit their VTXO leaf with only their key.
+// Best-effort: if cosign can't complete (someone offline), the unroll is just
+// absent until the next refresh — the cooperative path still works.
+async fn presign_unroll(s: &ArcadeState, cov_txid: &str, cov_vout: u32, cov_value: u64, allocs: &[([u8; 32], u64)], expiry: u32) {
+    let txid_internal = match bitcoin::Txid::from_str(cov_txid) { Ok(t) => t.to_byte_array(), Err(_) => return };
+    let mut canon = allocs.to_vec();
+    canon.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Ok(u) = s.cosign_hub.run_unroll(canon, expiry, txid_internal, cov_vout, cov_value, COVENANT_EXIT_DELAY, 0, None, std::time::Duration::from_secs(30)).await {
+        let cov_txid = cov_txid.to_string();
+        let _ = s.covenant.update(|st| {
+            st.unroll = Some(covenant_manager::PreSignedUnroll { covenant_txid: cov_txid, unroll_txid: u.txid, unroll_tx_hex: u.signed_tx_hex });
+        }).await;
+    }
 }
 
 async fn post_genesis(State(s): State<ArcadeState>) -> Json<Value> {
@@ -1507,14 +1564,18 @@ async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawRe
     match &new_state {
         None => { let _ = s.covenant.update(|st| { st.covenant = None; st.unroll = None; }).await; }
         Some((value, allocs)) => {
-            let txid = txid.clone();
-            let allocs = allocs.clone();
             let value = *value;
+            let allocs = allocs.clone();
+            let new_allocs: Vec<([u8; 32], u64)> = allocs.iter().filter_map(|(h, v)| parse_hex::<32>(h).map(|a| (a, *v))).collect();
             let expiry = cov.expiry;
-            let _ = s.covenant.update(|st| {
-                st.covenant = Some(covenant_manager::CovenantState { txid, vout: 1, value, allocations: allocs, expiry });
+            let st_txid = txid.clone();
+            let st_allocs = allocs.clone();
+            let _ = s.covenant.update(move |st| {
+                st.covenant = Some(covenant_manager::CovenantState { txid: st_txid, vout: 1, value, allocations: st_allocs, expiry });
                 st.unroll = None;
             }).await;
+            // re-arm the escape hatch for the new (smaller) covenant.
+            presign_unroll(&s, &txid, 1, value, &new_allocs, cov.expiry).await;
         }
     }
 
@@ -1524,6 +1585,34 @@ async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawRe
     s.notify();
     let new_balance = s.coin_manager.lock().await.get_account_balance(account_key).unwrap_or(0);
     Json(json!({ "ok": true, "txid": txid, "withdrawn": debited, "balance": new_balance }))
+}
+
+// After a UNILATERAL exit (the player broadcast the unroll + swept their leaf with
+// their own key), tidy the L2 ledger when the operator is up: clear the now-spent
+// covenant and zero the exiter's balance. Best-effort + BLS-authed; if the operator
+// is gone this is moot (the player already has their coins on-chain).
+#[derive(Deserialize)]
+struct ExitDoneReq { account_key: String, bls_key: String, bls_signature: String }
+async fn post_exit_done(State(s): State<ArcadeState>, Json(b): Json<ExitDoneReq>) -> Json<Value> {
+    let err = |m: &str| Json(json!({ "ok": false, "error": m }));
+    let account = match parse_hex::<32>(&b.account_key) { Some(a) => a, None => return err("bad account") };
+    let bls_key = match parse_hex::<48>(&b.bls_key) { Some(k) => k, None => return err("bad bls key") };
+    let sig = match parse_hex::<96>(&b.bls_signature) { Some(x) => x, None => return err("bad signature") };
+    let sighash = account.to_vec().hash(Some(HashTag::CustomString("Cube/sighash/arcade/exit-done".to_string())));
+    if !bls_verify(&bls_key, sighash, sig) { return err("signature verification failed"); }
+    let _guard = s.exec_lock.lock().await;
+    // only clear the covenant if it's actually been spent on-chain (the unroll).
+    if let Some(cov) = s.covenant.current().await {
+        let spent = s.rpc()
+            .and_then(|c| c.call::<Value>("gettxout", &[json!(cov.txid), json!(cov.vout)]).ok())
+            .map(|v| v.is_null())
+            .unwrap_or(false);
+        if spent { let _ = s.covenant.update(|st| { st.covenant = None; st.unroll = None; }).await; }
+    }
+    let bal = s.coin_manager.lock().await.get_account_balance(account).unwrap_or(0);
+    if bal > 0 { let mut cm = s.coin_manager.lock().await; let _ = cm.account_balance_down(account, bal); let _ = cm.apply_changes(); }
+    s.notify();
+    Json(json!({ "ok": true }))
 }
 
 // The round-lifecycle loop: close + settle when a round is ripe.
@@ -1856,6 +1945,8 @@ pub async fn run_arcade(
         .route("/api/covenant", get(get_covenant))
         .route("/api/feerate", get(get_feerate))
         .route("/api/txstatus", get(get_txstatus))
+        .route("/api/exit_kit", get(get_exit_kit))
+        .route("/api/exit_done", post(post_exit_done))
         .route("/api/deposit_address", get(get_deposit_address))
         .route("/api/deposit", post(post_deposit))
         .route("/api/deposit/claim", post(post_deposit_claim))

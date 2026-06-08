@@ -10,6 +10,7 @@ import { entropyToMnemonic, mnemonicToSeedSync, validateMnemonic } from '@scure/
 import { wordlist } from '@scure/bip39/wordlists/english.js';
 import { bech32, bech32m } from '@scure/base';
 import { attachCosign, setPendingWithdrawSpk } from './cosign_client.mjs';
+import { unilateralExit } from './dispute.mjs';
 
 const Fr = bls.fields.Fr;
 const enc = new TextEncoder();
@@ -374,6 +375,40 @@ async function doWithdraw() {
   $('withdrawbtn').disabled = false;
 }
 
+// UNILATERAL escape hatch: broadcast your pre-signed unroll and sweep your own VTXO
+// leaf with only your key — works with no other players (and, once cached, even if
+// the operator vanishes). Disincentivized by the CSV wait + self-paid fees.
+async function doForceExit() {
+  const address = ($('wdaddr').value || '').trim();
+  if (!address) return flash('enter a destination address', 'err');
+  let destSpk;
+  try { destSpk = addressToSpk(address); } catch (e) { return flash('invalid Bitcoin address', 'err'); }
+  $('forceexitbtn').disabled = true;
+  try {
+    // fetch the exit kit (and cache it for an operator-gone future); fall back to cache.
+    let kit = null;
+    try { kit = await api(`/api/exit_kit?account=${ME.accountKey}`); if (kit && kit.ok) localStorage.setItem('exitkit:' + ME.accountKey, JSON.stringify(kit)); } catch (e) {}
+    if (!kit || !kit.ok) { const c = localStorage.getItem('exitkit:' + ME.accountKey); if (c) kit = JSON.parse(c); }
+    if (!kit || !kit.ok || !kit.leaf) return flash((kit && kit.error) || 'no exit kit available yet', 'err');
+    const broadcast = async (hex) => { const r = await api('/api/broadcast', { tx_hex: hex }); if (!r.ok) throw new Error(r.error); return r.txid; };
+    flash('Force exit: broadcasting your unroll, waiting for the CSV delay…');
+    const afterUnroll = async (utxid) => {
+      for (let i = 0; i < 150; i++) {
+        await new Promise((r) => setTimeout(r, 4000));
+        try { const st = await api(`/api/txstatus?txid=${utxid}&vout=${kit.leaf.vout}`); if (st.confirmations >= kit.leaf.exit_delay) return; } catch (e) {}
+      }
+    };
+    let fee = 600;
+    try { const fr = await api('/api/feerate'); if (fr && fr.exit_sweep_fee > 0) fee = fr.exit_sweep_fee; } catch (e) {}
+    const res = await unilateralExit({ unrollTxHex: kit.unroll_tx_hex, unrollTxid: kit.unroll_txid, leaf: kit.leaf, secpHex: ME.secp, destSpk, broadcast, afterUnroll, fee });
+    // best-effort: tidy the operator's ledger (no-op / irrelevant if it's gone).
+    try { const sig = hx(sign(fromHex(ME.secp), tag256('Cube/sighash/arcade/exit-done', fromHex(ME.accountKey)))); await api('/api/exit_done', { account_key: ME.accountKey, bls_key: ME.blsKey, bls_signature: sig }); } catch (e) {}
+    flash(`Force-exited ${Number(res.outValue).toLocaleString()} sats to your address! sweep ${short(res.sweepTxid)}`, 'ok');
+    $('wdaddr').value = ''; $('withdrawbox').style.display = 'none';
+  } catch (e) { flash('Force exit error: ' + e.message, 'err'); }
+  $('forceexitbtn').disabled = false;
+}
+
 // ---- round details (provably-fair page, hash-routed: #round/<n>) ----
 function bandRow(label, lo, hi, space, cls, note) {
   const pct = space > 0 ? Math.max(0.5, ((hi - lo) * 100) / space) : 0;
@@ -511,6 +546,7 @@ function main() {
   const wbtn = $('withdrawbtn2'); if (wbtn) wbtn.onclick = () => {
     const box = $('withdrawbox'); box.style.display = box.style.display === 'none' ? '' : 'none';
   };
+  const febtn = $('forceexitbtn'); if (febtn) febtn.onclick = doForceExit;
   document.querySelectorAll('#betchips .chip').forEach((c) => {
     c.onclick = () => selectBet(c.dataset.bet === 'all' ? 'all' : parseInt(c.dataset.bet, 10));
   });

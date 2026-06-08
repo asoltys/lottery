@@ -19,12 +19,44 @@ const varint = (n) => (n < 0xfd ? Uint8Array.from([n]) : Uint8Array.from([0xfd, 
 const reverseHex = (h) => h.match(/../g).reverse().join('');
 
 // minimal segwit serializer: 1 taproot script-path input -> 1 output.
-function serializeSpend({ inTxidInternal, vout, witnessItems, outValue, outSpk }) {
+function serializeSpend({ inTxidInternal, vout, witnessItems, outValue, outSpk, sequence = 0xffffffff }) {
   const H = hexToBytes;
-  const vin = cat(H(inTxidInternal), u32le(vout), Uint8Array.from([0x00]), u32le(0xffffffff));
+  const vin = cat(H(inTxidInternal), u32le(vout), Uint8Array.from([0x00]), u32le(sequence));
   const out = cat(u64le(outValue), varint(H(outSpk).length), H(outSpk));
   const wit = cat(varint(witnessItems.length), ...witnessItems.map((w) => cat(varint(H(w).length), H(w))));
   return bytesToHex(cat(u32le(2), Uint8Array.from([0x00, 0x01]), varint(1), vin, varint(1), out, wit, u32le(0)));
+}
+
+// UNILATERAL ESCAPE HATCH (no cooperation): broadcast the pre-signed unroll, wait
+// for it to confirm + mature past the CSV delay, then sweep YOUR leaf to `destSpk`
+// with only your key via the leaf's CSV exit path. `afterUnroll(utxid)` should
+// resolve once the unroll has >= exit_delay confirmations. Returns { unrollTxid,
+// sweepTxid, outValue }. Native JS; works against any broadcaster (operator relay,
+// a public mempool API, or your own node).
+export async function unilateralExit({ unrollTxHex, unrollTxid, leaf, secpHex, destSpk, broadcast, afterUnroll, fee = 600 }) {
+  let utxid = unrollTxid;
+  try { utxid = await broadcast(unrollTxHex); } catch (_e) { /* already broadcast */ }
+  if (afterUnroll) await afterUnroll(utxid); // wait for confirm + CSV maturity
+  const outValue = leaf.value - fee;
+  if (outValue <= 0) throw new Error('leaf too small to cover the exit fee');
+  const tapleafHash = bytesToHex(taggedHash('TapLeaf', cat(
+    Uint8Array.from([0xc0]),
+    compactSize(hexToBytes(leaf.exit_script).length),
+    hexToBytes(leaf.exit_script),
+  )));
+  const inTxidInternal = reverseHex(utxid);
+  const sighashHex = scriptPathSighash({
+    version: 2, lockTime: 0, inputIndex: 0,
+    inputs: [{ txid: inTxidInternal, vout: leaf.vout, value: leaf.value, spk: leaf.scriptpubkey, sequence: leaf.exit_delay }],
+    outputs: [{ value: outValue, spk: destSpk }],
+  }, tapleafHash);
+  const sig = bytesToHex(schnorr.sign(hexToBytes(sighashHex), hexToBytes(secpHex)));
+  const txHex = serializeSpend({
+    inTxidInternal, vout: leaf.vout, sequence: leaf.exit_delay,
+    witnessItems: [sig, leaf.exit_script, leaf.control_block], outValue, outSpk: destSpk,
+  });
+  const sweepTxid = await broadcast(txHex);
+  return { unrollTxid: utxid, sweepTxid, outValue };
 }
 
 // Verify a settle and, on fraud, reclaim the tab's own leaf. Returns
