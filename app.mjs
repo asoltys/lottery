@@ -278,7 +278,7 @@ function qrSvg(text) {
 // player's LiftV2 claim once paid, and the normal deposit flow credits the balance.
 async function lnDeposit() {
   const amt = parseInt(($('lnamount').value || '').trim(), 10);
-  if (!amt || amt < 1000) return flash('enter at least 1,000 sats', 'err');
+  if (!amt || amt < 5000) return flash('enter at least 5,000 sats', 'err');
   $('lncreatebtn').disabled = true;
   flash('Creating a Lightning invoice…');
   try {

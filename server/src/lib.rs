@@ -1048,7 +1048,7 @@ struct LnInvoice {
     swapped: bool,
 }
 
-const LN_MIN_DEPOSIT: u64 = 1000; // sats — below this an on-chain swap isn't economical
+const LN_MIN_DEPOSIT: u64 = 5000; // sats — matches the minimum bet chip (5k)
 
 // POST a JSON body to the Coinos API as the lotto account (Bearer token).
 async fn coinos_post(s: &ArcadeState, path: &str, body: Value) -> Result<Value, String> {
