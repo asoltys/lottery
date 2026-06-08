@@ -135,6 +135,9 @@ struct ArcadeState {
     // persisted so a restart never double-credits.
     credited_deposits: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     credited_path: std::path::PathBuf,
+    // Persisted jackpot history: the full per-round settlement records survive
+    // restarts so the draw feed + provably-fair pages load for any player.
+    history_path: std::path::PathBuf,
     // Serializes auto-genesis attempts from the watcher loop (no concurrent runs).
     auto_genesis_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -276,6 +279,16 @@ impl ArcadeState {
         let tmp = self.credited_path.with_extension("tmp");
         if std::fs::write(&tmp, &bytes).is_ok() {
             let _ = std::fs::rename(&tmp, &self.credited_path);
+        }
+    }
+    // Persist the full jackpot history (every round's settlement record), atomic
+    // temp + rename, so a restart/redeploy never loses the draw feed.
+    async fn persist_history(&self) {
+        let map: HashMap<u64, Value> = { self.round_details.lock().await.clone() };
+        let Ok(bytes) = serde_json::to_vec(&map) else { return };
+        let tmp = self.history_path.with_extension("tmp");
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.history_path);
         }
     }
     // Broadcast a fully-signed tx (hex) via bitcoind; returns the display txid.
@@ -541,6 +554,19 @@ async fn get_state(State(s): State<ArcadeState>, Query(params): Query<HashMap<St
     Json(build_state(&s, params.get("account").map(|x| x.as_str())).await)
 }
 
+// Project a full per-round settlement record down to a compact feed event
+// (round, kind, winner, amount, ts) — the shape the draw feed + history serve.
+fn feed_event(d: &Value) -> Value {
+    let round = d["round"].as_u64().unwrap_or(0);
+    let amount = d["amount"].as_u64().unwrap_or(0);
+    let ts = d["ts"].as_u64().unwrap_or(0);
+    if d["kind"].as_str() == Some("rollover") {
+        json!({ "round": round, "kind": "rollover", "amount": amount, "ts": ts })
+    } else {
+        json!({ "round": round, "kind": "win", "winner": d["winner"].as_str().unwrap_or(""), "amount": amount, "ts": ts })
+    }
+}
+
 async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
     let (g, rs, t, k, d, w, total, b, count, _seed) = round_view(s).await;
     let round_total = total.saturating_sub(b);
@@ -793,6 +819,15 @@ async fn get_round(State(s): State<ArcadeState>, Path(n): Path<u64>) -> Json<Val
         Some(v) => Json(v.clone()),
         None => Json(json!({ "error": "unknown or not-yet-settled round" })),
     }
+}
+
+// The WHOLE jackpot history (every persisted round) as compact feed events,
+// newest first — so any player, even a brand-new one, can load all past draws.
+async fn get_history(State(s): State<ArcadeState>) -> Json<Value> {
+    let rd = s.round_details.lock().await;
+    let mut draws: Vec<Value> = rd.values().map(feed_event).collect();
+    draws.sort_by(|a, b| b["round"].as_u64().unwrap_or(0).cmp(&a["round"].as_u64().unwrap_or(0)));
+    Json(json!({ "draws": draws, "count": draws.len() }))
 }
 
 // Non-custodial proof: render the contract's current shadow claims as a timeout
@@ -1765,26 +1800,28 @@ async fn lifecycle(s: ArcadeState) {
         match run_call(&s, &settle_call).await {
             Ok(_) => {
                 s.mine(1);
-                {
-                    let mut rd = s.round_details.lock().await;
-                    rd.insert(round_no, detail);
-                    while rd.len() > 500 {
-                        if let Some(&min) = rd.keys().min() { rd.remove(&min); } else { break; }
-                    }
-                }
-                let event = if rollover {
+                let event = feed_event(&detail);
+                if rollover {
                     println!("arcade: round {} rolled over (jackpot grows to {})", round_no, pot);
-                    json!({ "round": round_no, "kind": "rollover", "amount": pot, "ts": now })
                 } else {
                     let wk = winner_key.clone().unwrap_or_default();
                     println!("arcade: round {} winner {} wins {}", round_no, &wk[..wk.len().min(12)], pot);
                     *s.last_winner.lock().await = winner_key.clone();
-                    json!({ "round": round_no, "kind": "win", "winner": wk, "amount": pot, "ts": now })
-                };
-                let mut feed = s.recent_draws.lock().await;
-                feed.insert(0, event);
-                feed.truncate(12);
-                drop(feed);
+                }
+                {
+                    let mut rd = s.round_details.lock().await;
+                    rd.insert(round_no, detail);
+                    // keep the whole jackpot history (bounded generously to cap disk).
+                    while rd.len() > 5000 {
+                        if let Some(&min) = rd.keys().min() { rd.remove(&min); } else { break; }
+                    }
+                }
+                {
+                    let mut feed = s.recent_draws.lock().await;
+                    feed.insert(0, event);
+                    feed.truncate(12);
+                }
+                s.persist_history().await; // survive restarts
                 s.notify();
             }
             Err(e) => eprintln!("arcade: settle failed: {}", e),
@@ -1948,6 +1985,21 @@ pub async fn run_arcade(
         .map(|v| v.into_iter().collect())
         .unwrap_or_default();
 
+    // Load persisted jackpot history and rebuild the live feed (most-recent 12) from
+    // it, so the draw history survives restarts and shows for every player.
+    let history_path = std::env::var("CUBE_HISTORY_STATE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("arcade-history.json"));
+    let round_details_map: HashMap<u64, Value> = std::fs::read(&history_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<HashMap<u64, Value>>(&b).ok())
+        .unwrap_or_default();
+    let recent_feed: Vec<Value> = {
+        let mut rounds: Vec<&Value> = round_details_map.values().collect();
+        rounds.sort_by(|a, b| b["round"].as_u64().unwrap_or(0).cmp(&a["round"].as_u64().unwrap_or(0)));
+        rounds.into_iter().take(12).map(|d| feed_event(d)).collect()
+    };
+
     // The engine's bitcoind fee/spending wallet (funds CPFP children for the
     // feeless package-broadcast unroll). regtest harness uses "cube", mut "mutiny".
     let btc_wallet = std::env::var("CUBE_BTC_WALLET").unwrap_or_else(|_| match &_chain {
@@ -1978,8 +2030,8 @@ pub async fn run_arcade(
         settler_bls,
         settler_reg_index,
         last_winner: Arc::new(tokio::sync::Mutex::new(None)),
-        recent_draws: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-        round_details: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        recent_draws: Arc::new(tokio::sync::Mutex::new(recent_feed)),
+        round_details: Arc::new(tokio::sync::Mutex::new(round_details_map)),
         exec_lock: Arc::new(tokio::sync::Mutex::new(())),
         tx: tx.clone(),
         cosign_hub,
@@ -1988,6 +2040,7 @@ pub async fn run_arcade(
         deposit_watch: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         credited_deposits: Arc::new(tokio::sync::Mutex::new(credited_set)),
         credited_path,
+        history_path,
         auto_genesis_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
@@ -2011,6 +2064,7 @@ pub async fn run_arcade(
         .route("/exit-tool.bundle.js", get(serve_exit_tool))
         .route("/api/state", get(get_state))
         .route("/api/round/:n", get(get_round))
+        .route("/api/history", get(get_history))
         .route("/api/exit", get(get_exit))
         .route("/api/covenant", get(get_covenant))
         .route("/api/feerate", get(get_feerate))

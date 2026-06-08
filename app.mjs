@@ -179,14 +179,9 @@ function render(st) {
   if (st.explorer_url) { exp.href = st.explorer_url; exp.style.display = ''; }
   else { exp.style.display = 'none'; }
   const mine = ME.accountKey.toLowerCase();
-  const rlink = (n) => `<a class="rlink" href="#round/${n}">round ${n}</a>`;
-  const feed = (st.recent_draws || []).map((dr) => {
-    if (dr.kind === 'rollover')
-      return `<div class="draw roll">${rlink(dr.round)} · 🎲 no winner — ${Number(dr.amount).toLocaleString()} rolled over</div>`;
-    const won = (dr.winner || '').toLowerCase() === mine;
-    return `<div class="draw ${won ? 'mywin' : 'win'}">${rlink(dr.round)} · 🏆 ${won ? 'YOU' : short(dr.winner)} won ${Number(dr.amount).toLocaleString()}</div>`;
-  }).join('');
+  const feed = (st.recent_draws || []).map((dr) => drawRow(dr, mine)).join('');
   $('draws').innerHTML = feed || '<div class="draw empty">no draws yet</div>';
+  const showall = $('showall'); if (showall) showall.style.display = (st.recent_draws || []).length ? '' : 'none';
   renderStatus();
   renderDeposit(a.deposit);
   maybeClaimDeposit(a.deposit);
@@ -545,6 +540,35 @@ function renderRound(d) {
     <div class="segs">${segs}${houseRow}</div>
   </div>`;
 }
+// One draw-feed row (shared by the home feed and the full-history page).
+function drawRow(dr, mine) {
+  const rlink = `<a class="rlink" href="#round/${dr.round}">round ${dr.round}</a>`;
+  if (dr.kind === 'rollover')
+    return `<div class="draw roll">${rlink} · 🎲 no winner — ${Number(dr.amount).toLocaleString()} rolled over</div>`;
+  const won = (dr.winner || '').toLowerCase() === mine;
+  return `<div class="draw ${won ? 'mywin' : 'win'}">${rlink} · 🏆 ${won ? 'YOU' : short(dr.winner)} won ${Number(dr.amount).toLocaleString()}</div>`;
+}
+
+// Full jackpot history page (#history): every persisted round, newest first.
+async function showHistory() {
+  if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; } // pause home updates
+  $('home').style.display = 'none';
+  const help = $('help'); if (help) help.style.display = 'none';
+  const el = $('round'); el.style.display = '';
+  el.innerHTML = `<div class="card">loading jackpot history…</div>`;
+  try {
+    const h = await api('/api/history');
+    const mine = ME.accountKey.toLowerCase();
+    const rows = (h.draws || []).map((dr) => drawRow(dr, mine)).join('');
+    el.innerHTML = `<div class="card"><a class="back" href="#">← back</a>
+      <div class="feedtitle" style="margin-top:8px">all draws (${h.count || 0})</div>
+      ${rows || '<div class="draw empty">no draws yet</div>'}</div>`;
+    window.scrollTo(0, 0);
+  } catch (e) {
+    el.innerHTML = `<div class="card"><a class="back" href="#">← back</a><p>failed to load history</p></div>`;
+  }
+}
+
 async function showRound(n) {
   if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; } // pause home updates
   $('home').style.display = 'none';
@@ -570,6 +594,7 @@ function route() {
   const m = (location.hash || '').match(/^#round\/(\d+)/);
   if (m) showRound(parseInt(m[1], 10));
   else if ((location.hash || '') === '#help') showHelp();
+  else if ((location.hash || '') === '#history') showHistory();
   else showHome();
 }
 
