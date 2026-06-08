@@ -130,6 +130,8 @@ struct ArcadeState {
     // persisted so a restart never double-credits.
     credited_deposits: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     credited_path: std::path::PathBuf,
+    // Serializes auto-genesis attempts from the watcher loop (no concurrent runs).
+    auto_genesis_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 // A confirmed LiftV2 deposit UTXO awaiting inclusion in the pot covenant.
@@ -756,6 +758,22 @@ async fn deposit_watcher(s: ArcadeState) {
         }
 
         if changed { let _ = s.tx.send(()); }
+
+        // Auto-form the covenant once an online depositor has a confirmed deposit
+        // queued (matches the UI's "deposit and the engine forms one"). Guarded so
+        // only one attempt runs at a time; offline depositors are skipped.
+        if s.covenant.current().await.is_none() {
+            if let Ok(_g) = s.auto_genesis_lock.try_lock() {
+                let connected: std::collections::HashSet<[u8; 32]> = s.cosign_hub.connected().await.into_iter().collect();
+                let has_connected_deposit = { s.pending_deposits.lock().await.iter().any(|d| connected.contains(&d.account)) };
+                if has_connected_deposit {
+                    match do_genesis(&s).await {
+                        Ok((txid, v, n)) => eprintln!("auto-genesis: covenant {txid} value {v} ({n} participants)"),
+                        Err(e) => eprintln!("auto-genesis skipped: {e}"),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -914,12 +932,17 @@ async fn post_deposit_claim(State(s): State<ArcadeState>, Json(b): Json<DepositC
     Json(json!({"ok":true,"credited":total,"balance":balance,"registery_index":reg_index}))
 }
 
-// GENESIS: combine all queued deposits into the pot covenant via N-of-N cosign
-// (depositors must be connected to /cosign), broadcast it, and record the covenant.
-async fn post_genesis(State(s): State<ArcadeState>) -> Json<Value> {
-    let deposits = { s.pending_deposits.lock().await.clone() };
-    if deposits.is_empty() { return Json(json!({"ok":false,"error":"no pending deposits"})); }
-    if s.covenant.current().await.is_some() { return Json(json!({"ok":false,"error":"covenant exists; use refresh to add"})); }
+// GENESIS core: combine queued deposits from currently-connected depositors into
+// the pot covenant via N-of-N cosign, broadcast it, and record the covenant.
+// Returns (txid, covenant_value, participants). Shared by the manual endpoint and
+// the auto-genesis loop. Offline/abandoned deposits are skipped (they'd block it).
+async fn do_genesis(s: &ArcadeState) -> Result<(String, u64, usize), String> {
+    let all_deposits = { s.pending_deposits.lock().await.clone() };
+    if all_deposits.is_empty() { return Err("no pending deposits".into()); }
+    if s.covenant.current().await.is_some() { return Err("covenant exists; use refresh to add".into()); }
+    let connected: std::collections::HashSet<[u8; 32]> = s.cosign_hub.connected().await.into_iter().collect();
+    let deposits: Vec<PendingDeposit> = all_deposits.into_iter().filter(|d| connected.contains(&d.account)).collect();
+    if deposits.is_empty() { return Err("no connected depositors online to form the covenant — keep the tab open".into()); }
     let gdeposits: Vec<cosign::GenesisDeposit> = deposits.iter().map(|d| cosign::GenesisDeposit {
         account_key: d.account, prev_txid: d.txid_internal, prev_vout: d.vout, prev_value: d.value,
     }).collect();
@@ -927,10 +950,8 @@ async fn post_genesis(State(s): State<ArcadeState>) -> Json<Value> {
     if let Some(max) = allocs.iter_mut().max_by_key(|(_, v)| *v) { max.1 = max.1.saturating_sub(COVENANT_FEE); }
     let tip = { s.sync_manager.lock().await.bitcoin_sync_height_tip() };
     let expiry = (tip + COVENANT_EXPIRY_WINDOW) as u32;
-    let res = match s.cosign_hub.run_genesis(gdeposits, allocs.clone(), expiry, COVENANT_FEE, std::time::Duration::from_secs(30)).await {
-        Ok(r) => r, Err(e) => return Json(json!({"ok":false,"error":e})),
-    };
-    let txid = match s.broadcast(&res.signed_tx_hex) { Ok(t) => t, Err(e) => return Json(json!({"ok":false,"error":format!("broadcast: {e}")})) };
+    let res = s.cosign_hub.run_genesis(gdeposits, allocs.clone(), expiry, COVENANT_FEE, std::time::Duration::from_secs(30)).await?;
+    let txid = s.broadcast(&res.signed_tx_hex).map_err(|e| format!("broadcast: {e}"))?;
     s.mine(1);
     let mut canonical = allocs.clone();
     canonical.sort_by(|a, b| a.0.cmp(&b.0));
@@ -942,7 +963,14 @@ async fn post_genesis(State(s): State<ArcadeState>) -> Json<Value> {
     }).await;
     { s.pending_deposits.lock().await.clear(); }
     s.notify();
-    Json(json!({ "ok": true, "txid": txid, "covenant_value": cov_value, "participants": canonical.len() }))
+    Ok((txid, cov_value, canonical.len()))
+}
+
+async fn post_genesis(State(s): State<ArcadeState>) -> Json<Value> {
+    match do_genesis(&s).await {
+        Ok((txid, cov_value, participants)) => Json(json!({ "ok": true, "txid": txid, "covenant_value": cov_value, "participants": participants })),
+        Err(e) => Json(json!({ "ok": false, "error": e })),
+    }
 }
 
 // REFRESH: move the pot covenant to a new allocation state (default: mirror the
@@ -1564,6 +1592,7 @@ pub async fn run_arcade(
         deposit_watch: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         credited_deposits: Arc::new(tokio::sync::Mutex::new(credited_set)),
         credited_path,
+        auto_genesis_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
 
     tokio::spawn(lifecycle(state.clone()));
