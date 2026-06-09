@@ -1025,14 +1025,23 @@ async fn deposit_watcher(s: ArcadeState) {
         // Auto-form the covenant once an online depositor has a confirmed deposit
         // queued (matches the UI's "deposit and the engine forms one"). Guarded so
         // only one attempt runs at a time; offline depositors are skipped.
-        if s.covenant.current().await.is_none() {
-            if let Ok(_g) = s.auto_genesis_lock.try_lock() {
-                let connected: std::collections::HashSet<[u8; 32]> = s.cosign_hub.connected().await.into_iter().collect();
-                let has_connected_deposit = { s.pending_deposits.lock().await.iter().any(|d| connected.contains(&d.account)) };
-                if has_connected_deposit {
+        if let Ok(_g) = s.auto_genesis_lock.try_lock() {
+            let connected: std::collections::HashSet<[u8; 32]> = s.cosign_hub.connected().await.into_iter().collect();
+            let has_connected_deposit = { s.pending_deposits.lock().await.iter().any(|d| connected.contains(&d.account)) };
+            if has_connected_deposit {
+                if s.covenant.current().await.is_none() {
                     match do_genesis(&s).await {
                         Ok((txid, v, n)) => eprintln!("auto-genesis: covenant {txid} value {v} ({n} participants)"),
                         Err(e) => eprintln!("auto-genesis skipped: {e}"),
+                    }
+                } else {
+                    // a covenant exists — ABSORB the new deposits into it (join), so
+                    // post-genesis depositors become covenant-backed and can play +
+                    // withdraw winnings. Needs every old member online (input 0 is
+                    // N-of-N); skips otherwise and retries on the next tick.
+                    match do_join(&s).await {
+                        Ok((txid, v, n)) => eprintln!("auto-join: absorbed deposits -> covenant {txid} value {v} ({n} claimants)"),
+                        Err(e) => eprintln!("auto-join skipped: {e}"),
                     }
                 }
             }
@@ -1439,6 +1448,62 @@ async fn do_genesis(s: &ArcadeState) -> Result<(String, u64, usize), String> {
     { s.pending_deposits.lock().await.clear(); }
     // Pre-sign the unroll now (everyone's online) so each player holds the trustless
     // escape hatch — they can force-exit their leaf later with no one's cooperation.
+    presign_unroll(s, &txid, 0, cov_value, &canonical, expiry).await;
+    s.notify();
+    Ok((txid, cov_value, canonical.len()))
+}
+
+// Absorb pending deposits into the EXISTING covenant (a "join"): spend [covenant +
+// each new deposit] into one bigger covenant that includes the new depositors, so
+// post-genesis deposits become covenant-backed (otherwise they sit at separate
+// LiftV2 addresses, the covenant decouples from the ledger, and the settle reconcile
+// can't attribute winnings to them). Requires every OLD covenant member online
+// (input 0 is N-of-N) plus the new depositors; skips otherwise.
+async fn do_join(s: &ArcadeState) -> Result<(String, u64, usize), String> {
+    let cov = match s.covenant.current().await { Some(c) => c, None => return Err("no covenant; use genesis".into()) };
+    let all_deposits = { s.pending_deposits.lock().await.clone() };
+    if all_deposits.is_empty() { return Err("no pending deposits".into()); }
+    let connected: std::collections::HashSet<[u8; 32]> = s.cosign_hub.connected().await.into_iter().collect();
+    // input 0 (the covenant) is N-of-N — every current member must be online to cosign.
+    let old_allocs: Vec<([u8; 32], u64)> = cov.allocations.iter().filter_map(|(h, v)| parse_hex::<32>(h).map(|a| (a, *v))).collect();
+    for (m, _) in &old_allocs {
+        if !connected.contains(m) { return Err(format!("covenant member {} offline — can't absorb yet", &hex::encode(m)[..12])); }
+    }
+    // only absorb deposits whose depositor is online (they must cosign their input).
+    let deposits: Vec<PendingDeposit> = all_deposits.iter().filter(|d| connected.contains(&d.account)).cloned().collect();
+    if deposits.is_empty() { return Err("no connected depositors to absorb".into()); }
+    let gdeposits: Vec<cosign::GenesisDeposit> = deposits.iter().map(|d| cosign::GenesisDeposit {
+        account_key: d.account, prev_txid: d.txid_internal, prev_vout: d.vout, prev_value: d.value,
+    }).collect();
+    // new allocations = old members + each new deposit (merged by account).
+    let mut new_allocs: Vec<([u8; 32], u64)> = old_allocs.clone();
+    for d in &deposits {
+        match new_allocs.iter_mut().find(|(a, _)| a == &d.account) {
+            Some(e) => e.1 += d.value,
+            None => new_allocs.push((d.account, d.value)),
+        }
+    }
+    // fee (covenant input + N deposit inputs + one covenant output) off the largest.
+    let fee = s.estimate_fee(genesis_vsize(deposits.len() as u64 + 1));
+    if let Some(max) = new_allocs.iter_mut().max_by_key(|(_, v)| *v) { max.1 = max.1.saturating_sub(fee); }
+    let prev_txid = match bitcoin::Txid::from_str(&cov.txid) { Ok(t) => t.to_byte_array(), Err(_) => return Err("bad covenant txid".into()) };
+    let res = s.cosign_hub.run_join(old_allocs, cov.expiry, prev_txid, cov.vout, cov.value, gdeposits, new_allocs.clone(), cov.expiry, fee, std::time::Duration::from_secs(30)).await?;
+    let txid = s.broadcast(&res.signed_tx_hex).map_err(|e| format!("broadcast: {e}"))?;
+    s.mine(1);
+    let mut canonical = new_allocs.clone();
+    canonical.sort_by(|a, b| a.0.cmp(&b.0));
+    let cov_value: u64 = canonical.iter().map(|(_, v)| v).sum();
+    let alloc_pairs: Vec<(String, u64)> = canonical.iter().map(|(k, v)| (hex::encode(k), *v)).collect();
+    let expiry = cov.expiry;
+    let st_txid = txid.clone();
+    let _ = s.covenant.update(move |st| {
+        st.covenant = Some(covenant_manager::CovenantState { txid: st_txid, vout: 0, value: cov_value, allocations: alloc_pairs, expiry });
+        st.unroll = None;
+        st.last_settle = None;
+    }).await;
+    // drop the absorbed deposits from the pending queue (offline ones stay for later).
+    { let absorbed: std::collections::HashSet<_> = deposits.iter().map(|d| (d.txid_internal, d.vout)).collect();
+      s.pending_deposits.lock().await.retain(|d| !absorbed.contains(&(d.txid_internal, d.vout))); }
     presign_unroll(s, &txid, 0, cov_value, &canonical, expiry).await;
     s.notify();
     Ok((txid, cov_value, canonical.len()))

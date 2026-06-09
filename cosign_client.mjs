@@ -137,6 +137,48 @@ function verifyDeposit(ctx, message, myAccountHex) {
   }
 }
 
+// Verify a JOIN (absorb new deposits into the existing covenant): rebuild the
+// multi-input tx — input 0 spends the OLD covenant, inputs 1..N spend each new
+// LiftV2 deposit, output 0 is the new (bigger) covenant — and confirm OUR input's
+// sighash, that value is conserved, and that we keep an exitable claim in the new
+// covenant. Works for both an old member (signing input 0, the key path) and a new
+// depositor (signing their deposit input).
+function verifyJoin(ctx, message, myAccountHex) {
+  const errors = [];
+  let mySighash = null;
+  try {
+    const me = myAccountHex.toLowerCase();
+    const ci = ctx.covenant_in || {};
+    const inputs = [{
+      txid: ci.txid, vout: Number(ci.vout), value: Number(ci.value),
+      spk: covenantSpk(ctx.engine, ci.allocations, Number(ci.expiry)).spk, sequence: 0xffffffff,
+    }];
+    for (const d of (ctx.deposits || [])) {
+      inputs.push({ txid: d.txid, vout: Number(d.vout), value: Number(d.value), spk: liftV2Spk(d.account, ctx.engine).spk, sequence: 0xffffffff });
+    }
+    const nextSpk = covenantSpk(ctx.engine, ctx.new_allocations, Number(ctx.new_expiry)).spk;
+    const outputs = [{ value: Number(ctx.out_value), spk: nextSpk }];
+    const idx = Number(ctx.input_index);
+    mySighash = keyPathSighash({ version: 2, lockTime: 0, inputIndex: idx, inputs, outputs });
+    if (mySighash.toLowerCase() !== (message || '').toLowerCase())
+      errors.push('sighash mismatch — not the join described');
+    if (Number(ctx.out_value || 0) !== sumAlloc(ctx.new_allocations || []))
+      errors.push('covenant value != Σ new allocations (value would leak)');
+    const totalIn = inputs.reduce((s, i) => s + Number(i.value), 0);
+    if (totalIn < Number(ctx.out_value || 0)) errors.push('outputs exceed inputs (negative fee)');
+    if (!(ctx.new_allocations || []).find((a) => a.account.toLowerCase() === me))
+      errors.push('no exitable claim for me in the joined covenant');
+    // if this is my deposit input, it must spend MY deposit.
+    if (idx > 0) {
+      const d = (ctx.deposits || [])[idx - 1];
+      if (!d || (d.account || '').toLowerCase() !== me) errors.push('my input index does not spend my deposit');
+    }
+    return { ok: errors.length === 0, errors, mySighash };
+  } catch (e) {
+    return { ok: false, errors: ['verify exception: ' + e.message], mySighash };
+  }
+}
+
 // Attach cosign handling to an open WebSocket. `secpHex` is the player's 32-byte
 // base secret; `accountKeyHex` is their 32-byte x-only account key (even-Y).
 // `onEvent(kind, detail)` is an optional progress callback. Returns a function to
@@ -167,6 +209,10 @@ export function attachCosign(ws, secpHex, accountKeyHex, onEvent = () => {}) {
           mySighash = v.mySighash;
         } else if (msg.ctx && msg.ctx.kind === 'unroll') {
           const v = verifyUnroll(msg.ctx, msg.message, accountKeyHex);
+          if (!v.ok) { onEvent('reject', { session: msg.session, errors: v.errors }); break; }
+          mySighash = v.mySighash;
+        } else if (msg.ctx && msg.ctx.kind === 'join') {
+          const v = verifyJoin(msg.ctx, msg.message, accountKeyHex);
           if (!v.ok) { onEvent('reject', { session: msg.session, errors: v.errors }); break; }
           mySighash = v.mySighash;
         }
