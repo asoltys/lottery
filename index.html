@@ -14,6 +14,9 @@
   .wrap { width: 100%; max-width: 560px; padding: 28px 20px 60px; }
   h1 { font-size: 22px; margin: 0 0 4px; color: #fff; letter-spacing: .5px; }
   .sub { color: #6b7689; font-size: 12px; margin-bottom: 20px; }
+  .hdr { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .netbadge { flex: 0 0 auto; font-size: 10px; font-weight: 800; letter-spacing: 1.5px; color: #ffcf5e;
+              background: #3a2f10; border: 1px solid #8a6a16; border-radius: 999px; padding: 5px 10px; white-space: nowrap; }
   .card { background: #141a24; border: 1px solid #222b39; border-radius: 12px; padding: 18px 20px; margin-bottom: 14px; }
   .jackpot { text-align: center; }
   .jackpot .amt { font-size: 46px; font-weight: 800; color: #ffd75e; line-height: 1.1; }
@@ -102,7 +105,10 @@
 </head>
 <body>
   <div class="wrap">
-    <h1 id="logo" style="cursor:pointer">🎰 Cube Jackpot</h1>
+    <div class="hdr">
+      <h1 id="logo" style="cursor:pointer;margin:0">🎰 Cube Jackpot</h1>
+      <span class="netbadge">⚡ MUTINYNET</span>
+    </div>
     <div class="sub">a non-custodial Bitcoin jackpot · <a href="#help" style="color:#6b8cff;text-decoration:none">how it works</a></div>
 
     <div id="home">
