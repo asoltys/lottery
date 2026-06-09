@@ -370,10 +370,10 @@ function qrSvg(text) {
 
 // Lightning deposit: create an invoice; the server swaps it on-chain into the
 // player's LiftV2 claim once paid, and the normal deposit flow credits the balance.
-async function lnDeposit() {
-  const amt = parseInt(($('lnamount').value || '').trim(), 10);
+async function lnDeposit(amount) {
+  const amt = amount || parseInt(($('lnamount').value || '').trim(), 10);
   if (!amt || amt < 5000) return flash('enter at least 5,000 sats', 'err');
-  $('lncreatebtn').disabled = true;
+  const cbtn = $('lncreatebtn'); if (cbtn) cbtn.disabled = true;
   flash('Creating a Lightning invoice…');
   try {
     const r = await api('/api/ln/deposit', { account_key: ME.accountKey, amount: amt });
@@ -824,9 +824,19 @@ function main() {
     dismissDepositStatus();
     const da = $('depositaddr'); if (da) da.style.display = 'none';
     const box = $('lnbox'); if (box) box.style.display = '';
+    // reset to the quick-pick chips (custom input + any prior invoice hidden).
+    const cu = $('lncustom'); if (cu) cu.style.display = 'none';
+    const lr = $('lnresult'); if (lr) lr.style.display = 'none';
     setDepositTab('ln');
   };
-  const lncbtn = $('lncreatebtn'); if (lncbtn) lncbtn.onclick = lnDeposit;
+  const lncbtn = $('lncreatebtn'); if (lncbtn) lncbtn.onclick = () => lnDeposit();
+  const lnchips = $('lnchips'); if (lnchips) lnchips.querySelectorAll('.chip').forEach((c) => {
+    c.onclick = () => {
+      const v = c.dataset.ln;
+      if (v === 'custom') { const cu = $('lncustom'); if (cu) cu.style.display = ''; const a = $('lnamount'); if (a) a.focus(); }
+      else { const cu = $('lncustom'); if (cu) cu.style.display = 'none'; lnDeposit(parseInt(v, 10)); }
+    };
+  });
   const wbtn = $('withdrawbtn2'); if (wbtn) wbtn.onclick = () => {
     const box = $('withdrawbox'); box.style.display = box.style.display === 'none' ? '' : 'none';
   };

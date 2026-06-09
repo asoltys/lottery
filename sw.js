@@ -12,7 +12,7 @@
 // index/bundle stay in lockstep), with a cache fallback only when the network is
 // unreachable. API/WS traffic is never intercepted — those need the live server.
 
-const VERSION = '883b46dc'; // stamped with the bundle hash by build.sh
+const VERSION = 'b28c552a'; // stamped with the bundle hash by build.sh
 const CACHE = 'cube-shell-' + VERSION;
 // The shell we keep offline. The hashed bundle URL is added at runtime (we can't
 // know ?v=<hash> at install time); precache the entry points we do know.

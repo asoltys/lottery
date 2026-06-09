@@ -137,11 +137,17 @@
         <div id="depositaddr" style="display:none;margin-top:8px;text-align:center"></div>
         <div id="depositstatus" style="display:none;margin-top:8px;padding:8px 10px;border:1px solid #2a3550;border-radius:8px;background:#0a1018;color:#bcd0ec"></div>
         <div id="lnbox" style="display:none;margin-top:8px">
-          <div class="enter-row" style="flex-wrap:wrap">
-            <input id="lnamount" type="number" inputmode="numeric" min="5000" placeholder="sats (min 5,000)" autocomplete="off" />
+          <div id="lnchips" class="chips">
+            <div class="chip" data-ln="5000">5k</div>
+            <div class="chip" data-ln="10000">10k</div>
+            <div class="chip" data-ln="25000">25k</div>
+            <div class="chip" data-ln="custom">custom</div>
+          </div>
+          <div id="lncustom" class="enter-row" style="display:none;flex-wrap:wrap;margin-top:8px">
+            <input id="lnamount" type="number" inputmode="numeric" min="5000" placeholder="sats (min 5,000)" autocomplete="off" style="padding:13px 14px;flex:1 1 100%" />
             <button id="lncreatebtn" style="background:#ffd75e;color:#1a1300;flex:1 1 100%">Create invoice</button>
           </div>
-          <div style="margin-top:6px;font-size:11px;color:#6b7689">deposit over Lightning — paid in, swapped on-chain into your non-custodial claim.</div>
+          <div class="depcap">deposit over Lightning — paid in, swapped on-chain into your non-custodial claim.</div>
           <div id="lnresult" style="display:none;margin-top:10px;text-align:center"></div>
         </div>
         <div id="withdrawbox" style="display:none;margin-top:8px">
@@ -237,6 +243,6 @@
 
     <div id="round" style="display:none"></div>
   </div>
-  <script type="module" src="/bundle.js?v=883b46dc"></script>
+  <script type="module" src="/bundle.js?v=b28c552a"></script>
 </body>
 </html>
