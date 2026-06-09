@@ -96,7 +96,7 @@
 <body>
   <div class="wrap">
     <h1 id="logo" style="cursor:pointer">🎰 Cube Jackpot</h1>
-    <div class="sub">a non-custodial Bitcoin jackpot — your odds are your share of the pot · <a href="#help" style="color:#6b8cff;text-decoration:none">how it works</a></div>
+    <div class="sub">a non-custodial Bitcoin jackpot · <a href="#help" style="color:#6b8cff;text-decoration:none">how it works</a></div>
 
     <div id="home">
     <div class="card jackpot">
@@ -109,7 +109,7 @@
       <div class="grid" style="margin-bottom:12px">
         <div class="stat"><div class="v bal"><span id="balance">0</span></div><div class="k">your balance<span id="registered"></span></div></div>
         <div class="stat"><div class="v"><span id="participants">0 / 5</span></div><div class="k">players this round</div></div>
-        <div class="stat"><div class="v"><span id="yourodds">0%</span></div><div class="k">your share of the pot</div></div>
+        <div class="stat"><div class="v"><span id="yourodds">0%</span></div><div class="k">your chance to win</div></div>
         <div class="stat"><div class="v"><span id="roundpot">0</span></div><div class="k">this round's pot</div></div>
       </div>
       <button id="faucetbtn">💧 Get 10,000 sats from faucet</button>
@@ -205,7 +205,7 @@
         <a class="back" href="#">← back</a>
         <h2 style="margin:8px 0 10px;color:#fff;font-size:20px">How it works</h2>
         <div style="font-size:13px;color:#aab4c4;line-height:1.7">
-          <p style="margin:0 0 12px"><b style="color:#fff">Playing.</b> Add funds, then enter any amount into the round. Your chance of winning is your share of the pot. Each round runs on a short timer and picks a winner from a Bitcoin block hash nobody can predict. Most rounds have no winner and roll the pot forward into a bigger prize; the operator takes a 1% rake on each win.</p>
+          <p style="margin:0 0 12px"><b style="color:#fff">Playing.</b> Add funds, then enter any amount into the round. Most rounds have no winner — the pot rolls forward into a bigger prize — and your chance of winning is your share of the pot times the round's overall win chance (so the house's rollover odds are baked in). If you do win, you take the whole pot; the operator takes a 1% rake. Each round runs on a short timer and picks the winner from a Bitcoin block hash nobody can predict.</p>
           <p style="margin:0 0 12px"><b style="color:#9fe3bd">It's non-custodial.</b> We never hold your money. Funds you add go into a Bitcoin output only <i>you</i> can spend with your own key — the operator can't move it or freeze it, and you can withdraw on your own even if this site disappears. Winnings work the same way.</p>
           <p style="margin:0 0 12px"><b style="color:#fff">It's provably fair.</b> Every draw comes from a public Bitcoin block hash. Tap any round under “recent draws” to recompute it yourself and check the result.</p>
           <p style="margin:0 0 12px"><b style="color:#fff">Your account is a key.</b> It's generated in your browser and never sent anywhere. Save your seed phrase (under “backup &amp; restore”) to come back later or play from another device. Open the page in a new tab to play as someone else.</p>
@@ -230,6 +230,6 @@
 
     <div id="round" style="display:none"></div>
   </div>
-  <script type="module" src="/bundle.js?v=7012b127"></script>
+  <script type="module" src="/bundle.js?v=f8f14b85"></script>
 </body>
 </html>

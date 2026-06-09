@@ -172,7 +172,7 @@ function render(st) {
   if (a.registered) { ME.registeryIndex = a.registery_index; saveMe(); }
   $('participants').textContent = `${st.participants}`;
   $('roundpot').textContent = st.round_pot.toLocaleString();
-  $('yourodds').textContent = (a.odds_pct ? a.odds_pct.toFixed(1) : '0.0') + '%';
+  $('yourodds').textContent = (a.win_chance_pct ? a.win_chance_pct.toFixed(1) : '0.0') + '%';
   $('yourin').textContent = (a.your_contribution || 0).toLocaleString();
   $('winner').textContent = st.last_winner ? short(st.last_winner) : '—';
   if ($('betchips')) $('betchips').classList.toggle('disabled', !a.registered);

@@ -714,7 +714,11 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
             out["account"] = json!({
                 "registered": registered, "registery_index": reg_index, "balance": balance,
                 "your_contribution": your,
+                // share of the round pot (= share of the WIN payout, conditional on a win).
                 "odds_pct": if round_total > 0 { (your as f64) * 100.0 / (round_total as f64) } else { 0.0 },
+                // actual probability YOU win the pot, including the house's rollover region:
+                // your_contribution / space, space = round_total * (ODDS_DENOM + 1).
+                "win_chance_pct": if round_total > 0 { (your as f64) * 100.0 / ((round_total * (ODDS_DENOM + 1)) as f64) } else { 0.0 },
                 "deposit": deposit_json,
                 // your spendable claim in the current on-chain pot (summed over your
                 // allocations; 0 if no covenant) — gates withdraw / force-exit / exit-kit.
