@@ -263,11 +263,11 @@ async function doClaimWinnings() {
 
 // ---- betting: clicking a chip (5k/10k/25k/ALL IN) places that bet immediately ----
 let betting = false;
-// The VM keeps a small fixed per-call reserve, so you can't stake your very last
-// sats (measured at ~12; we leave a safe margin). Cap every bet — including
-// "ALL IN" — at balance − reserve so it never fails with "balance would go below
-// zero".
-const BET_RESERVE = 50;
+// An `enter` call costs a fixed entry fee (call_entry_base_fee 10 + a small
+// constant calldata fee = 12 sats), charged on top of the stake. Reserve EXACTLY
+// that so ALL IN stakes the real max (balance − fee) and leaves ~0 — not a chunky
+// cushion — while never failing with "balance would go below zero".
+const BET_RESERVE = 12;
 async function doEnterBet(betSpec) {
   if (betting) return;
   const bal = (lastState && lastState.account && lastState.account.balance) || 0;
@@ -299,6 +299,9 @@ async function maybeClaimDeposit(d) {
     if (r.ok && r.credited > 0) {
       if (r.registery_index !== undefined) { ME.registeryIndex = r.registery_index; saveMe(); }
       flash(`Deposit credited — ${Number(r.credited).toLocaleString()} sats added to your balance.`, 'ok');
+      // the deposit fully landed — close the whole add-funds UI (address QR /
+      // Lightning invoice / sub-buttons) so it doesn't linger after crediting.
+      ['fundsub', 'depositaddr', 'lnbox', 'lnresult', 'depositstatus'].forEach((id) => { const e = $(id); if (e) e.style.display = 'none'; });
     }
   } catch (e) { /* a later push will retry */ }
   claiming = false;
@@ -648,6 +651,21 @@ function renderRound(d) {
       <div>draw <code>r = seed mod space</code> = <b>${Number(d.r).toLocaleString()}</b>
         ${recomputed !== null ? `<span class="${ok ? 'okv' : 'errv'}">${ok ? '✓ recomputed in your browser' : '✗ recompute=' + recomputed}</span>` : ''}</div>
     </div>
+    ${(() => {
+      const segs = d.segments || [];
+      if (!segs.length) return '';
+      const rows = segs.slice().sort((a, b) => Number(b.contribution) - Number(a.contribution)).map((s) => {
+        const c = Number(s.contribution);
+        const chance = d.space > 0 ? (c * 100) / d.space : 0;
+        const isMe = (s.key || '').toLowerCase() === mine;
+        const who = isMe ? 'You' : short(s.key);
+        const cls = s.winner ? 'win' : (isMe ? 'me' : '');
+        return `<div class="seg ${cls}"><div class="seginfo"><span>${who}${s.winner ? ' 🏆' : ''}</span><span class="segrange">${c.toLocaleString()} sats · ${chance.toFixed(2)}% to win</span></div></div>`;
+      }).join('');
+      const houseChance = d.space > 0 ? (d.house * 100) / d.space : 0;
+      const houseRow = `<div class="seg house"><div class="seginfo"><span>house (no winner)</span><span class="segrange">${Number(d.house).toLocaleString()} · ${houseChance.toFixed(2)}%</span></div></div>`;
+      return `<div class="feedtitle" style="margin-top:16px">who was in this round</div><div class="segs">${rows}${houseRow}</div>`;
+    })()}
   </div>`;
 }
 // One draw-feed row (shared by the home feed and the full-history page).
