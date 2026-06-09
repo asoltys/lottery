@@ -138,6 +138,15 @@
           <div id="lnresult" style="display:none;margin-top:10px;text-align:center"></div>
         </div>
         <div id="withdrawbox" style="display:none;margin-top:8px">
+          <div id="winningsbox" style="display:none;background:#11251a;border:1px solid #2c6b45;border-radius:8px;padding:10px 12px;margin-bottom:10px;line-height:1.5">
+            <div style="font-size:13px;color:#7ef0a8;font-weight:600">🎉 You won the jackpot!</div>
+            <div id="winningsamt" style="font-size:11px;color:#a9d8bd;margin:4px 0 8px"></div>
+            <div class="enter-row">
+              <input id="winaddr" placeholder="your Bitcoin address (tb1…)" autocomplete="off" autocapitalize="off" spellcheck="false" />
+              <button id="claimbtn" style="background:#2c9c5e;color:#fff;flex:0 0 auto">Claim winnings</button>
+            </div>
+            <div style="margin-top:6px;font-size:11px;color:#6b7689">takes the whole pot on-chain with your key alone — broadcasts the unroll and sweeps every loser leaf (no one else need cooperate). Your own stake leaf follows after its CSV delay.</div>
+          </div>
           <div id="wdnotice" style="display:none;font-size:11px;color:#e3b8c9;background:#2a1518;border:1px solid #5a2a2a;border-radius:8px;padding:8px 10px;margin-bottom:8px;line-height:1.5"></div>
           <div class="enter-row">
             <input id="wdaddr" placeholder="your Bitcoin address (tb1…)" autocomplete="off" autocapitalize="off" spellcheck="false" />
@@ -221,6 +230,6 @@
 
     <div id="round" style="display:none"></div>
   </div>
-  <script type="module" src="/bundle.js?v=fb37afab"></script>
+  <script type="module" src="/bundle.js?v=e9491194"></script>
 </body>
 </html>

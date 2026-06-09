@@ -11,7 +11,7 @@ import { wordlist } from '@scure/bip39/wordlists/english.js';
 import { bech32, bech32m } from '@scure/base';
 import qrcode from 'qrcode-generator';
 import { attachCosign, setPendingWithdrawSpk } from './cosign_client.mjs';
-import { unilateralExit } from './dispute.mjs';
+import { unilateralExit, claimWinnings } from './dispute.mjs';
 
 const Fr = bls.fields.Fr;
 const enc = new TextEncoder();
@@ -200,6 +200,65 @@ function render(st) {
     }
     ['withdrawbtn', 'forceexitbtn', 'downloadkitbtn'].forEach((id) => { const b = $(id); if (b) b.disabled = claim <= 0; });
   }
+  refreshWinnings();
+}
+
+// Poll /api/winnings for this account; if we won the last round, surface the
+// one-click claim. The winner-sweep takes the whole pot on-chain with our key
+// alone, so it works even when the cooperative withdraw shows "no on-chain claim"
+// (a win zeroes covenant claims — the winnings live in the settle bundle).
+let lastWinnings = null;
+async function refreshWinnings() {
+  const box = $('winningsbox'); if (!box) return;
+  try {
+    const w = await api(`/api/winnings?account=${ME.accountKey}`, null);
+    if (w && w.you_won) {
+      lastWinnings = w;
+      const swept = (w.sweep_leaves || []).reduce((s, l) => s + Number(l.value || 0), 0);
+      const own = w.own_leaf ? Number(w.own_leaf.value || 0) : 0;
+      $('winningsamt').textContent = `≈ ${Number(swept + own).toLocaleString()} sats — claim it to your own Bitcoin address.`;
+      box.style.display = '';
+      const wb = $('withdrawbox'); if (wb) wb.style.display = ''; // make sure it's visible
+    } else { lastWinnings = null; box.style.display = 'none'; }
+  } catch (e) { /* keep prior state */ }
+}
+
+// One-click claim: broadcast the pre-signed unroll, sweep every loser leaf with the
+// VALID label + our key (no cooperation, no CSV), then CSV-exit our own stake leaf.
+async function doClaimWinnings() {
+  if (!lastWinnings || !lastWinnings.you_won) return flash('no winnings to claim', 'err');
+  const address = ($('winaddr').value || $('wdaddr').value || '').trim();
+  if (!address) return flash('enter a destination address', 'err');
+  let destSpk;
+  try { destSpk = addressToSpk(address); } catch (e) { return flash('invalid Bitcoin address', 'err'); }
+  $('claimbtn').disabled = true;
+  try {
+    const broadcast = async (hex) => {
+      const r = await api('/api/broadcast', { tx_hex: hex });
+      if (r && r.ok) return r.txid;
+      throw new Error((r && r.error) || 'broadcast failed');
+    };
+    const confs = async (utxid) => {
+      try { const st = await api(`/api/txstatus?txid=${utxid}&vout=0`); if (typeof st.confirmations === 'number') return st.confirmations; } catch (e) {}
+      return 0;
+    };
+    const waitFor = async (utxid, n, msg) => {
+      for (let i = 0; i < 300; i++) { if (await confs(utxid) >= n) return; if (i % 4 === 0) flash(msg); await new Promise((r) => setTimeout(r, 4000)); }
+    };
+    const exitDelay = (lastWinnings.own_leaf && lastWinnings.own_leaf.exit_delay) || 1;
+    let fee = 600; try { const fr = await api('/api/feerate'); if (fr && fr.exit_sweep_fee > 0) fee = fr.exit_sweep_fee; } catch (e) {}
+    flash('Claiming: broadcasting the unroll & sweeping the pot to your address…');
+    const res = await claimWinnings({
+      winnings: lastWinnings, secpHex: ME.secp, destSpk, broadcast, fee,
+      afterUnrollConfirm: (utxid) => waitFor(utxid, 1, 'Waiting for the unroll to confirm…'),
+      afterUnrollMature: (utxid) => waitFor(utxid, exitDelay, `Waiting out the CSV delay for your own stake leaf (${exitDelay} blocks)…`),
+    });
+    const total = Number(res.sweptTotal || 0) + Number(res.ownValue || 0);
+    flash(`Claimed ${total.toLocaleString()} sats to your address! swept ${res.sweeps.length} leaf(s)` + (res.ownExitTxid ? ` + your stake` : ''), 'ok');
+    $('winningsbox').style.display = 'none';
+    lastWinnings = null;
+  } catch (e) { flash('Claim error: ' + e.message, 'err'); }
+  $('claimbtn').disabled = false;
 }
 
 // ---- betting: clicking a chip (5k/10k/25k/ALL IN) places that bet immediately ----
@@ -715,6 +774,7 @@ function main() {
     const box = $('withdrawbox'); box.style.display = box.style.display === 'none' ? '' : 'none';
   };
   const febtn = $('forceexitbtn'); if (febtn) febtn.onclick = doForceExit;
+  const cbtn = $('claimbtn'); if (cbtn) cbtn.onclick = doClaimWinnings;
   const dkbtn = $('downloadkitbtn'); if (dkbtn) dkbtn.onclick = downloadExitKit;
   document.querySelectorAll('#betchips .chip').forEach((c) => {
     c.onclick = () => doEnterBet(c.dataset.bet === 'all' ? 'all' : parseInt(c.dataset.bet, 10));

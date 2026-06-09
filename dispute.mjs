@@ -59,6 +59,77 @@ export async function unilateralExit({ unrollTxHex, unrollTxid, leaf, secpHex, d
   return { unrollTxid: utxid, sweepTxid, outValue };
 }
 
+// CLAIM WINNINGS (no cooperation): the BitVM3 winner-sweep cash-out. Given the
+// /api/winnings bundle for a WINNER, broadcast the pre-signed unroll, then sweep
+// EVERY loser leaf to `destSpk` with the garbled VALID label + only your key
+// (winner-sweep path — no CSV wait), and finally CSV-exit your OWN leaf (your
+// returned stake) after it matures. Takes the whole pot on-chain with no one's
+// cooperation. `afterUnrollConfirm(utxid)` resolves at >=1 conf (needed before
+// spending any leaf — the unroll is TRUC); `afterUnrollMature(utxid)` resolves at
+// >= own_leaf.exit_delay confs (for the CSV exit). Returns
+// { unrollTxid, sweeps:[{txid,value}], sweptTotal, ownExitTxid, ownValue }.
+export async function claimWinnings({ winnings, secpHex, destSpk, broadcast, afterUnrollConfirm, afterUnrollMature, fee = 600 }) {
+  let utxid = winnings.unroll_txid;
+  try { utxid = await broadcast(winnings.unroll_tx_hex); } catch (_e) { /* already broadcast */ }
+  if (afterUnrollConfirm) await afterUnrollConfirm(utxid);
+  const inTxidInternal = reverseHex(utxid);
+
+  // sweep every loser leaf via its winner-sweep path: [sig, valid_label, script, cb].
+  const sweeps = [];
+  let sweptTotal = 0;
+  for (const leaf of (winnings.sweep_leaves || [])) {
+    const outValue = leaf.value - fee;
+    if (outValue <= 0) continue;
+    const tapleafHash = bytesToHex(taggedHash('TapLeaf', cat(
+      Uint8Array.from([0xc0]),
+      compactSize(hexToBytes(leaf.winner_sweep_script).length),
+      hexToBytes(leaf.winner_sweep_script),
+    )));
+    const sighashHex = scriptPathSighash({
+      version: 2, lockTime: 0, inputIndex: 0,
+      inputs: [{ txid: inTxidInternal, vout: leaf.vout, value: leaf.value, spk: leaf.scriptpubkey, sequence: 0xffffffff }],
+      outputs: [{ value: outValue, spk: destSpk }],
+    }, tapleafHash);
+    const sig = bytesToHex(schnorr.sign(hexToBytes(sighashHex), hexToBytes(secpHex)));
+    const txHex = serializeSpend({
+      inTxidInternal, vout: leaf.vout,
+      witnessItems: [sig, winnings.valid_label, leaf.winner_sweep_script, leaf.winner_sweep_control_block],
+      outValue, outSpk: destSpk,
+    });
+    const txid = await broadcast(txHex);
+    sweeps.push({ txid, value: outValue });
+    sweptTotal += outValue;
+  }
+
+  // your own leaf (your returned stake) via the CSV exit path, after it matures.
+  let ownExitTxid = null, ownValue = 0;
+  const own = winnings.own_leaf;
+  if (own && own.exit_script) {
+    if (afterUnrollMature) await afterUnrollMature(utxid);
+    const outValue = own.value - fee;
+    if (outValue > 0) {
+      const tapleafHash = bytesToHex(taggedHash('TapLeaf', cat(
+        Uint8Array.from([0xc0]),
+        compactSize(hexToBytes(own.exit_script).length),
+        hexToBytes(own.exit_script),
+      )));
+      const sighashHex = scriptPathSighash({
+        version: 2, lockTime: 0, inputIndex: 0,
+        inputs: [{ txid: inTxidInternal, vout: own.vout, value: own.value, spk: own.scriptpubkey, sequence: own.exit_delay }],
+        outputs: [{ value: outValue, spk: destSpk }],
+      }, tapleafHash);
+      const sig = bytesToHex(schnorr.sign(hexToBytes(sighashHex), hexToBytes(secpHex)));
+      const txHex = serializeSpend({
+        inTxidInternal, vout: own.vout, sequence: own.exit_delay,
+        witnessItems: [sig, own.exit_script, own.exit_control_block], outValue, outSpk: destSpk,
+      });
+      ownExitTxid = await broadcast(txHex);
+      ownValue = outValue;
+    }
+  }
+  return { unrollTxid: utxid, sweeps, sweptTotal, ownExitTxid, ownValue };
+}
+
 // Verify a settle and, on fraud, reclaim the tab's own leaf. Returns
 // { fraud:false } | { fraud:true, secret, unrollTxid, reclaimTxid, outValue }.
 export async function disputeAndReclaim({ assertion, trueRg, unrollTxHex, unrollTxid, leaf, secpHex, destSpk, broadcast, afterUnroll, fee = 600 }) {
