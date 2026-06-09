@@ -808,6 +808,7 @@ function main() {
       parts.forEach((e) => { if (e) e.style.display = 'none'; });
       const lr = $('lnresult'); if (lr) lr.style.display = 'none';
     } else {
+      const wb = $('withdrawbox'); if (wb) wb.style.display = 'none'; // deposit & withdraw are mutually exclusive
       if ($('fundsub')) $('fundsub').style.display = '';
       const ln = $('lnbox'); if (ln) ln.style.display = 'none';
       showDepositAddress();
@@ -838,7 +839,10 @@ function main() {
     };
   });
   const wbtn = $('withdrawbtn2'); if (wbtn) wbtn.onclick = () => {
-    const box = $('withdrawbox'); box.style.display = box.style.display === 'none' ? '' : 'none';
+    const box = $('withdrawbox'); const opening = box.style.display === 'none';
+    box.style.display = opening ? '' : 'none';
+    // deposit & withdraw are mutually exclusive — hide the deposit UI when opening withdraw.
+    if (opening) ['fundsub', 'depositaddr', 'lnbox', 'lnresult'].forEach((id) => { const e = $(id); if (e) e.style.display = 'none'; });
   };
   const febtn = $('forceexitbtn'); if (febtn) febtn.onclick = doForceExit;
   const cbtn = $('claimbtn'); if (cbtn) cbtn.onclick = doClaimWinnings;
