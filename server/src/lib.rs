@@ -645,8 +645,10 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
             // deposit has already joined the on-chain pot covenant.
             let dep = { s.deposit_watch.lock().await.get(&account_key).cloned() };
             let acct_hex_lc = hex::encode(account_key);
-            let joined_sats = match s.covenant.current().await {
-                Some(cov) => cov.allocations.iter().find(|(h, _)| h.eq_ignore_ascii_case(&acct_hex_lc)).map(|(_, v)| *v).unwrap_or(0),
+            // SUM (not find) — an account can legitimately appear in >1 allocation
+            // (e.g. two deposits); first-match undercounts.
+            let joined_sats: u64 = match s.covenant.current().await {
+                Some(cov) => cov.allocations.iter().filter(|(h, _)| h.eq_ignore_ascii_case(&acct_hex_lc)).map(|(_, v)| *v).sum(),
                 None => 0,
             };
             // How much of the confirmed deposit hasn't been credited to the L2
@@ -673,8 +675,8 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
                 "your_contribution": your,
                 "odds_pct": if round_total > 0 { (your as f64) * 100.0 / (round_total as f64) } else { 0.0 },
                 "deposit": deposit_json,
-                // your spendable claim in the current on-chain pot (0 if no covenant
-                // or you're not in it) — gates withdraw / force-exit / exit-kit.
+                // your spendable claim in the current on-chain pot (summed over your
+                // allocations; 0 if no covenant) — gates withdraw / force-exit / exit-kit.
                 "onchain_claim": joined_sats,
             });
         }
@@ -1405,7 +1407,19 @@ async fn do_genesis(s: &ArcadeState) -> Result<(String, u64, usize), String> {
     let gdeposits: Vec<cosign::GenesisDeposit> = deposits.iter().map(|d| cosign::GenesisDeposit {
         account_key: d.account, prev_txid: d.txid_internal, prev_vout: d.vout, prev_value: d.value,
     }).collect();
-    let mut allocs: Vec<([u8; 32], u64)> = deposits.iter().map(|d| (d.account, d.value)).collect();
+    // Merge allocations by account: an account may fund the pot with several
+    // deposits, but the covenant must hold exactly ONE leaf per account. Duplicate
+    // (key,value) leaves would force a single cosign client to represent two
+    // projected identities in one MuSig2 session — which it can't — so any later
+    // refresh/withdraw would hang collecting partials. Inputs stay per-deposit;
+    // only the output allocation ledger is consolidated.
+    let mut allocs: Vec<([u8; 32], u64)> = Vec::new();
+    for d in &deposits {
+        match allocs.iter_mut().find(|(a, _)| a == &d.account) {
+            Some(e) => e.1 += d.value,
+            None => allocs.push((d.account, d.value)),
+        }
+    }
     let fee = s.estimate_fee(genesis_vsize(deposits.len() as u64));
     if let Some(max) = allocs.iter_mut().max_by_key(|(_, v)| *v) { max.1 = max.1.saturating_sub(fee); }
     let tip = { s.sync_manager.lock().await.bitcoin_sync_height_tip() };
@@ -1748,7 +1762,10 @@ async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawRe
     let _guard = s.exec_lock.lock().await;
     let cov = match s.covenant.current().await { Some(c) => c, None => return err("no on-chain pot yet — nothing to exit (your funds aren't pooled on-chain)") };
     let acct_hex = hex::encode(account_key);
-    let alloc = match cov.allocations.iter().find(|(h, _)| h.eq_ignore_ascii_case(&acct_hex)) { Some((_, v)) => *v, None => return err("you have no claim in the on-chain pot") };
+    // SUM over all of this account's allocations (an account may appear more than
+    // once, e.g. multiple deposits) — first-match would undercount the claim.
+    let alloc: u64 = cov.allocations.iter().filter(|(h, _)| h.eq_ignore_ascii_case(&acct_hex)).map(|(_, v)| *v).sum();
+    if alloc == 0 { return err("you have no claim in the on-chain pot"); }
     let balance = s.coin_manager.lock().await.get_account_balance(account_key).unwrap_or(0);
     if balance == 0 { return err("nothing to withdraw"); }
     // pay out your balance, capped by your on-chain claim and the authorized amount.

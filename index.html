@@ -61,6 +61,8 @@
   .kv { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 6px; font-size: 12px; }
   .kvk { color: #6b7689; width: 34px; flex: 0 0 auto; padding-top: 7px; }
   .kvv { color: #d7dce5; word-break: break-all; flex: 1; background: #0f141d; border: 1px solid #1d2531; border-radius: 6px; padding: 6px 8px; line-height: 1.5; }
+  /* the seed phrase must wrap between words, never mid-word (unlike addresses/hashes). */
+  #phraseout { word-break: normal; overflow-wrap: normal; white-space: normal; }
   .mini { background: #222b39; color: #aab4c4; font-size: 11px; padding: 4px 10px; flex: 0 0 auto; align-self: flex-start; }
   .restore-row { display: flex; gap: 8px; margin-top: 10px; }
   .restore-row input { flex: 1; background: #0f141d; border: 1px solid #2b3545; border-radius: 8px; color: #fff; font-family: inherit; font-size: 12px; padding: 9px 10px; }
