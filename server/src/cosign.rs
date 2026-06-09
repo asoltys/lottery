@@ -187,6 +187,12 @@ pub struct LeafInfo {
     /// round's garbled "invalid" label — empty otherwise.
     pub disprove_script: String,
     pub disprove_control_block: String,
+    /// The winner-sweep spend path on a LOSER leaf, present when this settle is
+    /// enforced — empty on the winner's own leaf and on unsettled unrolls. The
+    /// proven winner spends it with the garbled VALID label to take the pot with
+    /// no loser cooperation.
+    pub winner_sweep_script: String,
+    pub winner_sweep_control_block: String,
 }
 
 /// Result of pre-signing + assembling the unroll (covenant -> per-participant
@@ -537,6 +543,10 @@ impl CosignHub {
         exit_delay: u16,
         fee: u64,
         disprove_hash: Option<[u8; 32]>,
+        // `(winner_key, valid_hash)` for a settle unroll: attaches a winner-sweep
+        // path to every LOSER leaf so the proven winner can take the pot with no
+        // loser cooperation. `None` on genesis/refresh unrolls (no winner yet).
+        winner_sweep: Option<([u8; 32], [u8; 32])>,
         round_timeout: Duration,
     ) -> Result<UnrollResult, String> {
         allocations.sort_by(|a, b| a.0.cmp(&b.0));
@@ -544,7 +554,10 @@ impl CosignHub {
         // garbled "invalid" label as its disprove lock — so any participant who can
         // disprove the settle reclaims their own VTXO leaf.
         let disprove_hashes: Option<Vec<[u8; 32]>> = disprove_hash.map(|h| vec![h; allocations.len()]);
-        let tree = TimeoutTree::build(self.engine_key, &allocations, expiry, exit_delay, disprove_hashes.as_deref())
+        // build_with_sweep takes (valid_hash, winner_key); our param is
+        // (winner_key, valid_hash) to match the settle call site (winner + label).
+        let tree_sweep = winner_sweep.map(|(wk, vh)| (vh, wk));
+        let tree = TimeoutTree::build_with_sweep(self.engine_key, &allocations, expiry, exit_delay, disprove_hashes.as_deref(), tree_sweep)
             .ok_or("timeout tree build failed")?;
         let mut outs = tree.unroll_outputs().ok_or("unroll outputs")?;
         if outs.is_empty() {
@@ -603,6 +616,11 @@ impl CosignHub {
                 Some((_dlh, ds, dcb)) => (hex::encode(ds), hex::encode(dcb)),
                 None => (String::new(), String::new()),
             };
+            // the winner-sweep path, present iff this is a LOSER leaf in a settle.
+            let (winner_sweep_script, winner_sweep_cb) = match leaf.winner_sweep_spend_elements() {
+                Some((_wlh, ws, wcb)) => (hex::encode(ws), hex::encode(wcb)),
+                None => (String::new(), String::new()),
+            };
             out_json.push(json!({
                 "value": outs[k].value.to_sat(),
                 "spk": hex::encode(outs[k].script_pubkey.as_bytes()),
@@ -618,6 +636,8 @@ impl CosignHub {
                 exit_delay,
                 disprove_script,
                 disprove_control_block: disprove_cb,
+                winner_sweep_script,
+                winner_sweep_control_block: winner_sweep_cb,
             });
         }
         let alloc_json = Value::Array(
@@ -632,6 +652,10 @@ impl CosignHub {
             "prev_vout": prev_vout,
             "prev_value": prev_value,
             "outputs": out_json,
+            // settle unrolls only: lets a cosigner recompute the same tree (incl.
+            // each loser leaf's winner-sweep path) and verify what it signs.
+            "winner": winner_sweep.map(|(wk, _)| hex::encode(wk)),
+            "valid_hash": winner_sweep.map(|(_, vh)| hex::encode(vh)),
         });
 
         let agg_sig = self

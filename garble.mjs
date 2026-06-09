@@ -129,12 +129,37 @@ export function verifyCutChoose(settle) {
     const tables = garbleTables(v, wires);
     if (hex(tablesCommit(tables)) !== inst.tables_commit) throw new Error(`cut-and-choose: instance ${i} tables mismatch (dishonest garbler)`);
     if (hex(sha256(wires[v.valid][0])) !== inst.disprove_hash) throw new Error(`cut-and-choose: instance ${i} disprove hash mismatch (dishonest garbler)`);
+    // valid label (index 1) integrity too — protects the winner-sweep lock from a
+    // garbler that fakes it to grief the winner. Older engines omit it; skip then.
+    if (inst.valid_hash !== undefined && hex(sha256(wires[v.valid][1])) !== inst.valid_hash) throw new Error(`cut-and-choose: instance ${i} valid hash mismatch (dishonest garbler)`);
   }
-  // the settle instance must be unopened and its lock must match the assertion.
+  // the settle instance must be unopened and its locks must match the assertion.
   const si = settle.settle_instance;
   if (settle.instances[si].opened) throw new Error('cut-and-choose: settle used an opened instance');
   if (settle.instances[si].disprove_hash !== settle.disprove_hash) throw new Error('cut-and-choose: settle disprove hash mismatch');
+  if (settle.valid_hash !== undefined && settle.instances[si].valid_hash !== settle.valid_hash) throw new Error('cut-and-choose: settle valid hash mismatch');
   return opened;
+}
+
+// The MIRROR of `challenge`: on an HONEST settle the evaluated output IS the valid
+// label — returned here (hex) as the WINNER-SWEEP secret the proven winner uses to
+// open each loser leaf's winner-sweep lock. Returns null on a wrong settle (no
+// sweep; use `challenge` for the disprove secret). Throws on a faked draw.
+export function winnerLabel(a, trueRg) {
+  const v = buildVerifier(a.lo, a.hi);
+  const active = new Map();
+  for (const [wireIdx, lab] of a.revealed) active.set(wireIdx, toBytes(lab));
+  const rg = BigInt(trueRg);
+  for (let k = 0; k < VALUE_BITS; k++) {
+    const lab = active.get(v.rg[k]);
+    if (!lab) throw new Error('missing rg label');
+    const bit = Number((rg >> BigInt(k)) & 1n);
+    const want = toBytes(a.rg_commitments[k][bit]);
+    if (!eqBytes(sha256(lab), want)) throw new Error('revealed rg does not match the true public draw');
+  }
+  const out = evalActive(v, a.tables, active);
+  const validHash = toBytes(a.valid_hash);
+  return eqBytes(sha256(out), validHash) ? hex(out) : null;
 }
 
 // Challenge a SettleAssertion (parsed JSON from /api/settle[_assertion]) against the

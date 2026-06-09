@@ -1452,7 +1452,7 @@ async fn presign_unroll(s: &ArcadeState, cov_txid: &str, cov_vout: u32, cov_valu
     let mut canon = allocs.to_vec();
     canon.sort_by(|a, b| a.0.cmp(&b.0));
     let fee = s.estimate_fee(unroll_vsize(canon.len() as u64));
-    if let Ok(u) = s.cosign_hub.run_unroll(canon, expiry, txid_internal, cov_vout, cov_value, COVENANT_EXIT_DELAY, fee, None, std::time::Duration::from_secs(30)).await {
+    if let Ok(u) = s.cosign_hub.run_unroll(canon, expiry, txid_internal, cov_vout, cov_value, COVENANT_EXIT_DELAY, fee, None, None, std::time::Duration::from_secs(30)).await {
         let cov_txid = cov_txid.to_string();
         let _ = s.covenant.update(|st| {
             st.unroll = Some(covenant_manager::PreSignedUnroll { covenant_txid: cov_txid, unroll_txid: u.txid, unroll_tx_hex: u.signed_tx_hex });
@@ -1504,7 +1504,7 @@ async fn post_refresh(State(s): State<ArcadeState>, Json(b): Json<RefreshReq>) -
     let new_value: u64 = canonical.iter().map(|(_, v)| v).sum();
     let alloc_pairs: Vec<(String, u64)> = canonical.iter().map(|(k, v)| (hex::encode(k), *v)).collect();
     let new_txid_internal = match bitcoin::Txid::from_str(&refresh_txid) { Ok(t) => t.to_byte_array(), Err(_) => return Json(json!({"ok":false,"error":"bad refresh txid"})) };
-    let unroll = match s.cosign_hub.run_unroll(canonical.clone(), new_expiry, new_txid_internal, 0, new_value, COVENANT_EXIT_DELAY, unroll_fee, None, std::time::Duration::from_secs(30)).await {
+    let unroll = match s.cosign_hub.run_unroll(canonical.clone(), new_expiry, new_txid_internal, 0, new_value, COVENANT_EXIT_DELAY, unroll_fee, None, None, std::time::Duration::from_secs(30)).await {
         Ok(u) => u, Err(e) => return Json(json!({"ok":false,"error":format!("unroll presign: {e}")})),
     };
     let _ = s.covenant.update(|st| {
@@ -1655,7 +1655,7 @@ async fn post_settle(State(s): State<ArcadeState>, Json(b): Json<SettleAssertReq
     for i in 0..K {
         let wires = v.wires(seed ^ (0x00c0_ffee_0000_0000u64 + i as u64));
         let tables = v.garble(&wires);
-        commits.push(InstanceCommit { tables_commit: v.tables_commit(&tables), disprove_hash: v.disprove_hash(&wires) });
+        commits.push(InstanceCommit { tables_commit: v.tables_commit(&tables), disprove_hash: v.disprove_hash(&wires), valid_hash: v.valid_hash(&wires) });
         all_wires.push(wires);
         all_tables.push(tables);
     }
@@ -1666,10 +1666,18 @@ async fn post_settle(State(s): State<ArcadeState>, Json(b): Json<SettleAssertReq
     };
     let assertion = v.assert_settle(&all_wires[settle_idx], &all_tables[settle_idx], rg, claimed);
     let disprove_hash = assertion.disprove_hash;
+    // The winner-sweep lock for this round: the garbled VALID-label hash, plus the
+    // claimed winner's account key. On an HONEST settle the winner derives the valid
+    // label by evaluating the circuit and sweeps every loser leaf — no cooperation.
+    // (allocs is account-sorted, matching the bands and run_unroll's leaf order, so
+    // allocs[claimed] is exactly the won leaf.)
+    let valid_hash = assertion.valid_hash;
+    let winner_key = allocs[claimed as usize].0;
     let instances: Vec<Value> = (0..K)
         .map(|i| json!({
             "tables_commit": hex::encode(commits[i].tables_commit),
             "disprove_hash": hex::encode(commits[i].disprove_hash),
+            "valid_hash": hex::encode(commits[i].valid_hash),
             "opened": opened[i],
             "wires": if opened[i] { serde_json::to_value(&all_wires[i]).ok() } else { None },
         }))
@@ -1683,7 +1691,7 @@ async fn post_settle(State(s): State<ArcadeState>, Json(b): Json<SettleAssertReq
     let settle_unroll_fee = s.estimate_fee(unroll_vsize(allocs.len() as u64));
     let unroll = match s
         .cosign_hub
-        .run_unroll(allocs.clone(), cov.expiry, prev_txid_internal, cov.vout, cov.value, COVENANT_EXIT_DELAY, settle_unroll_fee, Some(disprove_hash), std::time::Duration::from_secs(30))
+        .run_unroll(allocs.clone(), cov.expiry, prev_txid_internal, cov.vout, cov.value, COVENANT_EXIT_DELAY, settle_unroll_fee, Some(disprove_hash), Some((winner_key, valid_hash)), std::time::Duration::from_secs(30))
         .await
     {
         Ok(u) => u,
@@ -1704,6 +1712,11 @@ async fn post_settle(State(s): State<ArcadeState>, Json(b): Json<SettleAssertReq
         "engine_key": hex::encode(s.engine_key),
         "expiry": cov.expiry, "exit_delay": COVENANT_EXIT_DELAY,
         "disprove_hash": hex::encode(disprove_hash),
+        // winner-sweep: the claimed winner + the round's VALID-label hash. The
+        // winner derives the valid label (winner_label over the assertion) and
+        // sweeps each loser leaf (those leaves carry winner_sweep_* in `leaves`).
+        "valid_hash": hex::encode(valid_hash),
+        "winner_key": hex::encode(winner_key),
         "k": K, "settle_instance": settle_idx, "instances": instances,
         "unroll_txid": unroll.txid,
         "unroll_tx_hex": unroll.signed_tx_hex,
