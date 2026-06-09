@@ -381,7 +381,7 @@ async function lnDeposit() {
     const bolt11 = r.bolt11;
     const res = $('lnresult');
     res.innerHTML = `${qrSvg(bolt11)}
-      <div style="margin-top:8px;font-size:11px;color:#6b7689">pay this ${amt.toLocaleString()}-sats invoice from any Mutinynet Lightning wallet — your balance updates automatically when it arrives.</div>
+      <div class="depcap">pay this ${amt.toLocaleString()}-sats invoice from any Mutinynet Lightning wallet — your balance updates automatically when it arrives.</div>
       <div class="kv" style="margin-top:8px"><div class="kvv" style="text-align:left">${bolt11}</div><button class="mini" id="lncopy">copy</button></div>
       <a href="lightning:${bolt11}" class="rlink" style="font-size:12px;color:#6b8cff">open in wallet →</a>`;
     res.style.display = '';
@@ -397,10 +397,13 @@ async function showDepositAddress() {
   try {
     const d = await api(`/api/deposit_address?account=${ME.accountKey}`);
     if (d.address) {
+      // BIP21 URI (any amount): the QR holds the compact address-only form (max wallet
+      // compatibility); the "open in wallet" link carries the labelled BIP21 URI.
+      const uri = `bitcoin:${d.address}?label=Cube%20Jackpot`;
       el.innerHTML = `${qrSvg('bitcoin:' + d.address)}
-        <div style="margin-top:8px;font-size:11px;color:#6b7689">send any amount of Bitcoin to this address — your balance updates automatically once it confirms.</div>
+        <div class="depcap">send any amount of Bitcoin to this address — your balance updates automatically once it confirms.</div>
         <div class="kv" style="margin-top:8px"><div class="kvv" style="text-align:left">${d.address}</div><button class="mini" id="btccopy">copy</button></div>
-        <a href="bitcoin:${d.address}" class="rlink" style="font-size:12px;color:#6b8cff">open in wallet →</a>`;
+        <a href="${uri}" class="rlink" style="font-size:12px;color:#6b8cff">open in wallet →</a>`;
       el.style.display = '';
       const cb = $('btccopy'); if (cb) cb.onclick = () => copyText(d.address);
     } else { el.textContent = d.error || 'unavailable'; el.style.display = ''; }
@@ -789,12 +792,19 @@ function main() {
   $('withdrawbtn').onclick = doWithdraw;
   const dbtn = $('depositbtn'); if (dbtn) dbtn.onclick = () => {
     dismissDepositStatus();
-    // toggle the whole deposit UI: if anything is showing (sub-buttons or an
-    // address/Lightning screen), hide it all; otherwise reveal the sub-buttons.
+    // toggle the whole deposit UI: if anything is showing, hide it all; otherwise
+    // open it and default STRAIGHT to the on-chain QR + address (the common case),
+    // with the Bitcoin/Lightning toggle still shown so you can switch to Lightning.
     const parts = [$('fundsub'), $('depositaddr'), $('lnbox')];
     const anyOpen = parts.some((e) => e && e.style.display !== 'none');
-    if (anyOpen) parts.forEach((e) => { if (e) e.style.display = 'none'; });
-    else if ($('fundsub')) $('fundsub').style.display = '';
+    if (anyOpen) {
+      parts.forEach((e) => { if (e) e.style.display = 'none'; });
+      const lr = $('lnresult'); if (lr) lr.style.display = 'none';
+    } else {
+      if ($('fundsub')) $('fundsub').style.display = '';
+      const ln = $('lnbox'); if (ln) ln.style.display = 'none';
+      showDepositAddress();
+    }
   };
   const btcbtn = $('btcdepositbtn'); if (btcbtn) btcbtn.onclick = () => {
     dismissDepositStatus();

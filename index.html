@@ -58,6 +58,9 @@
   .foot a:hover { text-decoration: underline; }
   #exportbtn { background: #222b39; color: #aab4c4; font-size: 12px; padding: 8px 14px; }
   .warn { color: #f3b6ae; font-size: 11px; margin: 10px 0 8px; }
+  /* deposit captions wrap on whole words only (the card forces break-anywhere for
+     long addresses; captions opt back out so prose never breaks mid-word). */
+  .depcap { margin-top: 8px; font-size: 11px; color: #6b7689; line-height: 1.5; overflow-wrap: normal; word-break: normal; }
   .kv { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 6px; font-size: 12px; }
   .kvk { color: #6b7689; width: 34px; flex: 0 0 auto; padding-top: 7px; }
   .kvv { color: #d7dce5; word-break: break-all; flex: 1; background: #0f141d; border: 1px solid #1d2531; border-radius: 6px; padding: 6px 8px; line-height: 1.5; }
@@ -127,12 +130,12 @@
           <button id="btcdepositbtn" style="background:#222b39;color:#cdd6e5;font-size:13px">₿ Bitcoin</button>
           <button id="lndepositbtn" style="display:none;background:#3a2f10;color:#ffd75e;font-size:13px;margin-left:8px">⚡ Lightning</button>
         </div>
-        <div id="depositaddr" style="display:none;margin-top:8px;word-break:break-all"></div>
+        <div id="depositaddr" style="display:none;margin-top:8px;text-align:center"></div>
         <div id="depositstatus" style="display:none;margin-top:8px;padding:8px 10px;border:1px solid #2a3550;border-radius:8px;background:#0a1018;color:#bcd0ec"></div>
         <div id="lnbox" style="display:none;margin-top:8px">
-          <div class="enter-row">
+          <div class="enter-row" style="flex-wrap:wrap">
             <input id="lnamount" type="number" inputmode="numeric" min="5000" placeholder="sats (min 5,000)" autocomplete="off" />
-            <button id="lncreatebtn" style="background:#ffd75e;color:#1a1300;flex:0 0 auto">Create invoice</button>
+            <button id="lncreatebtn" style="background:#ffd75e;color:#1a1300;flex:1 1 100%">Create invoice</button>
           </div>
           <div style="margin-top:6px;font-size:11px;color:#6b7689">deposit over Lightning — paid in, swapped on-chain into your non-custodial claim.</div>
           <div id="lnresult" style="display:none;margin-top:10px;text-align:center"></div>
@@ -230,6 +233,6 @@
 
     <div id="round" style="display:none"></div>
   </div>
-  <script type="module" src="/bundle.js?v=f8f14b85"></script>
+  <script type="module" src="/bundle.js?v=e5533170"></script>
 </body>
 </html>
