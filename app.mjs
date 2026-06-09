@@ -383,8 +383,12 @@ async function showDepositAddress() {
   try {
     const d = await api(`/api/deposit_address?account=${ME.accountKey}`);
     if (d.address) {
-      el.innerHTML = `Send BTC to this address to add funds:<br><code>${d.address}</code>`;
+      el.innerHTML = `${qrSvg('bitcoin:' + d.address)}
+        <div style="margin-top:8px;font-size:11px;color:#6b7689">send any amount of Bitcoin to this address — your balance updates automatically once it confirms.</div>
+        <div class="kv" style="margin-top:8px"><div class="kvv" style="text-align:left">${d.address}</div><button class="mini" id="btccopy">copy</button></div>
+        <a href="bitcoin:${d.address}" class="rlink" style="font-size:12px;color:#6b8cff">open in wallet →</a>`;
       el.style.display = '';
+      const cb = $('btccopy'); if (cb) cb.onclick = () => copyText(d.address);
     } else { el.textContent = d.error || 'unavailable'; el.style.display = ''; }
   } catch (e) { el.textContent = 'error: ' + e.message; el.style.display = ''; }
 }
