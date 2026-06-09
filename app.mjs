@@ -203,10 +203,9 @@ function render(st) {
       noticeEl.textContent = 'No on-chain funds to withdraw or exit yet. Deposit first — then you can withdraw with your key (and once your funds are pooled into the jackpot, force-exit them unilaterally too).';
       noticeEl.style.display = '';
     }
-    // Withdraw works for an un-pooled deposit (2-of-2 spend) OR a pooled claim.
+    // One Withdraw button: cooperative if possible, unilateral exit otherwise. Works
+    // for an un-pooled deposit (2-of-2 spend) OR a pooled claim.
     const wb = $('withdrawbtn'); if (wb) wb.disabled = !canWithdraw;
-    // Force-exit / exit-kit act on a covenant VTXO leaf, so they need a pooled claim.
-    ['forceexitbtn', 'downloadkitbtn'].forEach((id) => { const b = $(id); if (b) b.disabled = claim <= 0; });
   }
   refreshWinnings();
 }
@@ -486,141 +485,90 @@ function addressToSpk(addr) {
   return hx(Uint8Array.from([op, prog.length, ...prog]));
 }
 
-// Withdraw your whole (not-in-play) balance to a Bitcoin address — NON-CUSTODIAL:
-// a cooperative covenant refresh pays you out from your own on-chain claim. We tell
-// the cosign client the exact destination spk so our key won't sign a redirected payout.
+// Withdraw your whole (not-in-play) balance to a Bitcoin address — NON-CUSTODIAL,
+// ONE button: try the cooperative path first (instant — a covenant refresh if pooled,
+// or a 2-of-2 deposit spend if not), and if that can't run (operator/other members
+// offline) automatically fall back to a UNILATERAL exit you can complete with your
+// key alone, after a short on-chain delay. We tell the cosign client the exact
+// destination spk so our key won't sign a redirected payout.
 async function doWithdraw() {
   const address = ($('wdaddr').value || '').trim();
-  const amount = (lastState && lastState.account && lastState.account.balance) || 0;
+  const acct = (lastState && lastState.account) || {};
+  const amount = acct.balance || 0;
   if (!address) return flash('enter a destination address', 'err');
   if (amount < 1) return flash('nothing to withdraw', 'err');
   let spk;
   try { spk = addressToSpk(address); } catch (e) { return flash('invalid Bitcoin address', 'err'); }
   $('withdrawbtn').disabled = true;
-  flash(`Withdrawing to ${address.slice(0, 16)}… (co-signing your exit)`);
+  // 1) cooperative (instant) — co-signed by the engine (+ online members for a pool).
+  flash(`Withdrawing to ${address.slice(0, 16)}…`);
   setPendingWithdrawSpk(spk);
+  let coop = null;
   try {
     const sig = sign(fromHex(ME.secp), withdrawSighash(ME.accountKey, amount, address));
-    const r = await api('/api/withdraw', {
-      account_key: ME.accountKey, bls_key: ME.blsKey, address, amount, bls_signature: hx(sig),
-    });
-    if (r.ok) { flash(`Withdrew ${Number(r.withdrawn || amount).toLocaleString()} sats! tx ${short(r.txid)}`, 'ok'); $('wdaddr').value = ''; $('withdrawbox').style.display = 'none'; }
-    else flash('Withdraw failed: ' + friendly(r.error), 'err');
-  } catch (e) { flash('Withdraw error: ' + e.message, 'err'); }
+    coop = await api('/api/withdraw', { account_key: ME.accountKey, bls_key: ME.blsKey, address, amount, bls_signature: hx(sig) });
+  } catch (e) { coop = { ok: false, error: e.message }; }
   setPendingWithdrawSpk(null);
+  if (coop && coop.ok) {
+    flash(`Withdrew ${Number(coop.withdrawn || amount).toLocaleString()} sats! tx ${short(coop.txid)}`, 'ok');
+    $('wdaddr').value = ''; $('withdrawbox').style.display = 'none';
+    $('withdrawbtn').disabled = false; return;
+  }
+  // 2) cooperative couldn't run. If your funds are POOLED, fall back automatically to
+  // a unilateral exit (your key alone) — it just takes a short on-chain delay.
+  if ((acct.onchain_claim || 0) > 0) {
+    try { await unilateralExitFlow(address, spk); }
+    catch (e) { flash('Withdraw error: ' + e.message, 'err'); }
+  } else {
+    flash('Withdraw failed: ' + friendly((coop && coop.error) || 'cooperative withdraw unavailable — try again shortly'), 'err');
+  }
   $('withdrawbtn').disabled = false;
 }
 
-// UNILATERAL escape hatch: broadcast your pre-signed unroll and sweep your own VTXO
-// leaf with only your key — works with no other players (and, once cached, even if
-// the operator vanishes). Disincentivized by the CSV wait + self-paid fees.
-async function doForceExit() {
-  const address = ($('wdaddr').value || '').trim();
-  if (!address) return flash('enter a destination address', 'err');
-  let destSpk;
-  try { destSpk = addressToSpk(address); } catch (e) { return flash('invalid Bitcoin address', 'err'); }
-  $('forceexitbtn').disabled = true;
-  try {
-    // fetch the exit kit (and cache it for an operator-gone future); fall back to cache.
-    let kit = null;
-    try { kit = await api(`/api/exit_kit?account=${ME.accountKey}`); if (kit && kit.ok) localStorage.setItem('exitkit:' + ME.accountKey, JSON.stringify(kit)); } catch (e) {}
-    if (!kit || !kit.ok) { const c = localStorage.getItem('exitkit:' + ME.accountKey); if (c) kit = JSON.parse(c); }
-    if (!kit || !kit.ok || !kit.leaf) return flash((kit && kit.error) || 'no exit kit available yet', 'err');
-    const mp = (kit.mempool_api || '').replace(/\/$/, ''); // public broadcaster, if any
-    // Broadcast: prefer the operator's node; if it's gone, push straight to the
-    // public mempool API (esplora /tx accepts a raw-hex body, returns the txid).
-    const broadcast = async (hex) => {
-      try { const r = await api('/api/broadcast', { tx_hex: hex }); if (r && r.ok) return r.txid; if (r && r.error) throw new Error(r.error); } catch (e) {}
-      if (!mp) throw new Error('operator broadcast failed and no public broadcaster for this network');
-      const res = await fetch(mp + '/tx', { method: 'POST', headers: { 'content-type': 'text/plain' }, body: hex });
-      const txt = (await res.text()).trim();
-      if (!res.ok || !/^[0-9a-f]{64}$/i.test(txt)) throw new Error('public broadcast rejected: ' + txt.slice(0, 200));
-      return txt;
-    };
-    // Confirmation depth of utxid: try the operator first, else esplora
-    // (confirmations = tip_height - block_height + 1).
-    const confirmations = async (utxid) => {
-      try { const st = await api(`/api/txstatus?txid=${utxid}&vout=${kit.leaf.vout}`); if (typeof st.confirmations === 'number') return st.confirmations; } catch (e) {}
-      if (!mp) return 0;
-      try {
-        const st = await (await fetch(`${mp}/tx/${utxid}/status`)).json();
-        if (!st || !st.confirmed) return 0;
-        const tip = parseInt(await (await fetch(`${mp}/blocks/tip/height`)).text(), 10);
-        return Number.isFinite(tip) && st.block_height ? tip - st.block_height + 1 : 1;
-      } catch (e) { return 0; }
-    };
-    flash('Force exit: broadcasting your unroll, waiting for the CSV delay…');
-    const afterUnroll = async (utxid) => {
-      for (let i = 0; i < 240; i++) {
-        await new Promise((r) => setTimeout(r, 4000));
-        if (await confirmations(utxid) >= kit.leaf.exit_delay) return;
-      }
-    };
-    let fee = 600;
-    try { const fr = await api('/api/feerate'); if (fr && fr.exit_sweep_fee > 0) fee = fr.exit_sweep_fee; } catch (e) {}
-    const res = await unilateralExit({ unrollTxHex: kit.unroll_tx_hex, unrollTxid: kit.unroll_txid, leaf: kit.leaf, secpHex: ME.secp, destSpk, broadcast, afterUnroll, fee });
-    // best-effort: tidy the operator's ledger (no-op / irrelevant if it's gone).
-    try { const sig = hx(sign(fromHex(ME.secp), tag256('Cube/sighash/arcade/exit-done', fromHex(ME.accountKey)))); await api('/api/exit_done', { account_key: ME.accountKey, bls_key: ME.blsKey, bls_signature: sig }); } catch (e) {}
-    flash(`Force-exited ${Number(res.outValue).toLocaleString()} sats to your address! sweep ${short(res.sweepTxid)}`, 'ok');
-    $('wdaddr').value = ''; $('withdrawbox').style.display = 'none';
-  } catch (e) { flash('Force exit error: ' + e.message, 'err'); }
-  $('forceexitbtn').disabled = false;
-}
-
-// Download a self-contained HTML escape hatch: bakes in the current exit kit + this
-// tab's base secret + the bundled exit tool, so the player can force-exit later from
-// their local disk with NO server, NO DNS, NO operator. The file holds a secret key —
-// treat it like a wallet backup.
-async function downloadExitKit() {
-  try {
-    let kit = null;
-    try { kit = await api(`/api/exit_kit?account=${ME.accountKey}`); if (kit && kit.ok) localStorage.setItem('exitkit:' + ME.accountKey, JSON.stringify(kit)); } catch (e) {}
-    if (!kit || !kit.ok) { const c = localStorage.getItem('exitkit:' + ME.accountKey); if (c) kit = JSON.parse(c); }
-    if (!kit || !kit.ok || !kit.leaf) return flash((kit && kit.error) || 'no exit kit available to download yet', 'err');
-    if (!kit.mempool_api) return flash('this network has no public broadcaster — the offline tool needs one', 'err');
-    if (!confirm('This file contains your SECRET KEY in plain text — anyone who opens it can move your exited funds. Save it somewhere private (like a password manager or encrypted drive). Download it?')) return;
-    const tool = await (await fetch('/exit-tool.bundle.js', { headers: { 'ngrok-skip-browser-warning': 'true' } })).text();
-    const payload = JSON.stringify({ kit, secp: ME.secp });
-    const html = exitToolHtml(payload, tool, ME.accountKey);
-    const blob = new Blob([html], { type: 'text/html' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `cube-exit-${ME.accountKey.slice(0, 8)}.html`;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-    flash('Exit kit downloaded — keep it private. It can recover your funds even if this site disappears.', 'ok');
-  } catch (e) { flash('Download error: ' + e.message, 'err'); }
-}
-
-// Assemble the standalone HTML around the injected payload + bundled tool.
-function exitToolHtml(payloadJson, toolJs, account) {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cube — Force Exit (${account.slice(0, 8)})</title>
-<style>
-  body { margin:0; background:#0b0e14; color:#d7dce5; font-family:ui-monospace,Menlo,monospace; display:flex; justify-content:center; }
-  .wrap { width:100%; max-width:560px; padding:28px 20px 60px; }
-  h1 { color:#fff; font-size:20px; } .sub { color:#6b7689; font-size:12px; margin-bottom:16px; line-height:1.5; }
-  .warn { color:#f3b6ae; background:#2a1518; border:1px solid #5a2a2a; border-radius:8px; padding:10px 12px; font-size:12px; margin-bottom:16px; line-height:1.5; }
-  input { width:100%; background:#0f141d; border:1px solid #2b3545; border-radius:10px; color:#fff; font-family:inherit; font-size:15px; padding:12px 14px; box-sizing:border-box; }
-  button { margin-top:12px; width:100%; padding:13px; font-size:15px; font-weight:600; border:0; border-radius:10px; cursor:pointer; background:#ffd75e; color:#1a1300; font-family:inherit; }
-  button:disabled { opacity:.4; cursor:not-allowed; }
-  #summary { color:#8a94a6; font-size:12px; margin:14px 0 8px; line-height:1.5; }
-  #log { margin-top:16px; font-size:12px; }
-  .line { padding:6px 10px; border-left:2px solid #2b3545; margin-bottom:4px; color:#9aa4b5; background:#0f141d; border-radius:0 6px 6px 0; word-break:break-all; }
-  .line.ok { border-color:#5ee08a; color:#bfe9cd; } .line.err { border-color:#f6614f; color:#f3b6ae; }
-</style></head><body><div class="wrap">
-<h1>🎲 Cube — Force Exit</h1>
-<div class="sub">Standalone, offline escape hatch for account <b>${account.slice(0, 8)}…</b>. It broadcasts your pre-signed unroll, waits out the CSV delay, then sweeps your VTXO leaf to your address — with your key alone, no operator needed.</div>
-<div class="warn">⚠️ This file contains your secret key. Anyone who opens it controls your exit. Keep it private.</div>
-<div id="summary">loading…</div>
-<input id="addr" placeholder="your Bitcoin address (tb1…)" autocomplete="off" autocapitalize="off" spellcheck="false" />
-<button id="go">Broadcast &amp; exit</button>
-<div id="log"></div>
-</div>
-<script>window.CUBE_EXIT = ${payloadJson};</script>
-<script>${toolJs}</script>
-</body></html>`;
+// UNILATERAL exit: broadcast your pre-signed unroll and sweep your own VTXO leaf with
+// only your key — works with no other players, and (once the kit is cached) even if
+// the operator/site vanishes. Takes a CSV delay, which we surface to the user.
+async function unilateralExitFlow(address, destSpk) {
+  // fetch the exit kit (and cache it for an operator-gone future); fall back to cache.
+  let kit = null;
+  try { kit = await api(`/api/exit_kit?account=${ME.accountKey}`); if (kit && kit.ok) localStorage.setItem('exitkit:' + ME.accountKey, JSON.stringify(kit)); } catch (e) {}
+  if (!kit || !kit.ok) { const c = localStorage.getItem('exitkit:' + ME.accountKey); if (c) kit = JSON.parse(c); }
+  if (!kit || !kit.ok || !kit.leaf) throw new Error((kit && kit.error) || 'no exit material for your pot yet — try the cooperative withdraw again shortly');
+  const mp = (kit.mempool_api || '').replace(/\/$/, ''); // public broadcaster, if any
+  const blocks = kit.leaf.exit_delay || 0;
+  const mins = Math.max(1, Math.round(blocks * 0.5)); // Mutinynet ≈ 30s blocks
+  const broadcast = async (hex) => {
+    try { const r = await api('/api/broadcast', { tx_hex: hex }); if (r && r.ok) return r.txid; if (r && r.error) throw new Error(r.error); } catch (e) {}
+    if (!mp) throw new Error('operator broadcast failed and no public broadcaster for this network');
+    const res = await fetch(mp + '/tx', { method: 'POST', headers: { 'content-type': 'text/plain' }, body: hex });
+    const txt = (await res.text()).trim();
+    if (!res.ok || !/^[0-9a-f]{64}$/i.test(txt)) throw new Error('public broadcast rejected: ' + txt.slice(0, 200));
+    return txt;
+  };
+  const confirmations = async (utxid) => {
+    try { const st = await api(`/api/txstatus?txid=${utxid}&vout=${kit.leaf.vout}`); if (typeof st.confirmations === 'number') return st.confirmations; } catch (e) {}
+    if (!mp) return 0;
+    try {
+      const st = await (await fetch(`${mp}/tx/${utxid}/status`)).json();
+      if (!st || !st.confirmed) return 0;
+      const tip = parseInt(await (await fetch(`${mp}/blocks/tip/height`)).text(), 10);
+      return Number.isFinite(tip) && st.block_height ? tip - st.block_height + 1 : 1;
+    } catch (e) { return 0; }
+  };
+  flash(`Cooperative withdraw unavailable — starting a unilateral exit with your key alone. Broadcasting your unroll; your funds become sweepable after ~${blocks} blocks (≈${mins} min), then this finishes automatically. Keep this tab open.`);
+  const afterUnroll = async (utxid) => {
+    for (let i = 0; i < 240; i++) {
+      await new Promise((r) => setTimeout(r, 4000));
+      if (await confirmations(utxid) >= kit.leaf.exit_delay) return;
+    }
+  };
+  let fee = 600;
+  try { const fr = await api('/api/feerate'); if (fr && fr.exit_sweep_fee > 0) fee = fr.exit_sweep_fee; } catch (e) {}
+  const res = await unilateralExit({ unrollTxHex: kit.unroll_tx_hex, unrollTxid: kit.unroll_txid, leaf: kit.leaf, secpHex: ME.secp, destSpk, broadcast, afterUnroll, fee });
+  // best-effort: tidy the operator's ledger (no-op / irrelevant if it's gone).
+  try { const sig = hx(sign(fromHex(ME.secp), tag256('Cube/sighash/arcade/exit-done', fromHex(ME.accountKey)))); await api('/api/exit_done', { account_key: ME.accountKey, bls_key: ME.blsKey, bls_signature: sig }); } catch (e) {}
+  flash(`Exited ${Number(res.outValue).toLocaleString()} sats to your address! sweep ${short(res.sweepTxid)}`, 'ok');
+  $('wdaddr').value = ''; $('withdrawbox').style.display = 'none';
 }
 
 // ---- round details (provably-fair page, hash-routed: #round/<n>) ----
@@ -844,9 +792,7 @@ function main() {
     // deposit & withdraw are mutually exclusive — hide the deposit UI when opening withdraw.
     if (opening) ['fundsub', 'depositaddr', 'lnbox', 'lnresult'].forEach((id) => { const e = $(id); if (e) e.style.display = 'none'; });
   };
-  const febtn = $('forceexitbtn'); if (febtn) febtn.onclick = doForceExit;
   const cbtn = $('claimbtn'); if (cbtn) cbtn.onclick = doClaimWinnings;
-  const dkbtn = $('downloadkitbtn'); if (dkbtn) dkbtn.onclick = downloadExitKit;
   document.querySelectorAll('#betchips .chip').forEach((c) => {
     c.onclick = () => doEnterBet(c.dataset.bet === 'all' ? 'all' : parseInt(c.dataset.bet, 10));
   });

@@ -166,15 +166,7 @@
             <input id="wdaddr" placeholder="your Bitcoin address (tb1…)" autocomplete="off" autocapitalize="off" spellcheck="false" />
             <button id="withdrawbtn">Send all</button>
           </div>
-          <div style="margin-top:6px;font-size:11px;color:#6b7689">cooperative withdraw of your balance to this address, with your key.</div>
-          <div style="margin-top:8px;font-size:11px;color:#6b7689">others offline / operator unresponsive?
-            <button id="forceexitbtn" style="background:#3a2330;color:#e3b8c9;font-size:11px;padding:5px 10px;margin-left:4px">Force exit</button>
-            <span style="color:#4b5468"> — broadcasts your unroll &amp; sweeps your leaf with your key alone (slower: CSV delay).</span>
-          </div>
-          <div style="margin-top:6px;font-size:11px;color:#6b7689">worried the site might vanish?
-            <button id="downloadkitbtn" style="background:#1b2230;color:#aab4c4;font-size:11px;padding:5px 10px;margin-left:4px">Download exit kit</button>
-            <span style="color:#4b5468"> — a self-contained file that force-exits offline, no server needed (holds your key — keep it private).</span>
-          </div>
+          <div class="depcap">Withdraws to this address with your key. If the operator or other players are offline, it automatically falls back to a unilateral exit you complete alone — that just takes a short on-chain delay (you'll see it), and it works even if this site disappears.</div>
         </div>
       </div>
     </div>
@@ -244,6 +236,6 @@
 
     <div id="round" style="display:none"></div>
   </div>
-  <script type="module" src="/bundle.js?v=6e3e55bb"></script>
+  <script type="module" src="/bundle.js?v=e1d69bff"></script>
 </body>
 </html>

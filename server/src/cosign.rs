@@ -154,6 +154,16 @@ pub struct RefreshResult {
     pub txid: String,
 }
 
+/// Result of a covenant DISSOLVE: the engine spends the covenant (via its expiry
+/// script path, no member cosign) into one LiftV2 output per member, each of which
+/// its owner can unilaterally sweep with their own key. `outputs` lists each
+/// member's resulting (account, vout, value) so the caller can re-queue them.
+pub struct DissolveResult {
+    pub signed_tx_hex: String,
+    pub txid: String,
+    pub outputs: Vec<([u8; 32], u32, u64)>,
+}
+
 /// Parameters for one LiftV2 deposit lift-in (spend a 2-of-2 account+engine
 /// deposit output into the pot covenant via a cooperative key-path cosign).
 pub struct DepositParams {
@@ -1396,6 +1406,75 @@ impl CosignHub {
             agg_sig: [0u8; 64], message: [0u8; 32], agg_key_xonly: [0u8; 32], valid: true,
             signed_tx_hex: hex::encode(bitcoin::consensus::encode::serialize(&tx)),
             txid: tx.compute_txid().to_string(),
+        })
+    }
+
+    /// DISSOLVE: spend the covenant via its ENGINE-ONLY expiry script path (no member
+    /// cosign) into ONE LiftV2 output per member — returning every member to an output
+    /// they can unilaterally sweep with their own key. Used when liveness has failed
+    /// (a member offline at/after expiry): instead of trapping everyone in a covenant
+    /// nobody can refresh, dissolve it so each member is individually exitable. Online
+    /// members get re-pooled afterward by a fresh genesis (which re-arms a presigned
+    /// unroll). Valid on-chain only once tip >= old_expiry (CLTV); sets nLockTime.
+    pub async fn run_dissolve(
+        &self,
+        mut allocations: Vec<([u8; 32], u64)>,
+        old_expiry: u32,
+        prev_txid: [u8; 32],
+        prev_vout: u32,
+        prev_value: u64,
+        fee: u64,
+    ) -> Result<DissolveResult, String> {
+        if allocations.is_empty() { return Err("no members to dissolve".into()); }
+        if prev_value <= fee { return Err("covenant too small to cover the dissolve fee".into()); }
+        allocations.sort_by(|a, b| a.0.cmp(&b.0));
+        let old_taproot = funding_taproot(self.engine_key, &allocations, old_expiry).ok_or("funding_taproot failed")?;
+        let old_spk = ScriptBuf::from_bytes(old_taproot.spk().ok_or("old spk")?);
+        let tree = old_taproot.tree().ok_or("old tree")?;
+        let leaf = tree.leaves().into_iter().next().ok_or("expiry leaf")?;
+        let expiry_script = leaf.tap_script();
+        let expiry_cb = old_taproot.control_block(0).ok_or("expiry control block")?.to_vec();
+
+        // one LiftV2 output per member, valued at their allocation; the leaver-pays
+        // model doesn't apply (this is a forced eviction), so the fee + any drift come
+        // off the largest allocation so Σ outputs == prev_value − fee exactly.
+        let mut out_vals: Vec<u64> = allocations.iter().map(|(_, v)| *v).collect();
+        let target = prev_value - fee;
+        let cur: u64 = out_vals.iter().sum();
+        let diff = target as i64 - cur as i64;
+        let big = out_vals.iter().enumerate().max_by_key(|(_, v)| **v).map(|(i, _)| i).ok_or("no outputs")?;
+        let adj = out_vals[big] as i64 + diff;
+        if adj < 0 { return Err("dissolve value mismatch".into()); }
+        out_vals[big] = adj as u64;
+
+        let mut outs: Vec<TxOut> = Vec::with_capacity(allocations.len());
+        for (i, (acct, _)) in allocations.iter().enumerate() {
+            let dt = return_liftv2_taproot(*acct, self.engine_key).ok_or("return_liftv2_taproot failed")?;
+            outs.push(TxOut { value: Amount::from_sat(out_vals[i]), script_pubkey: ScriptBuf::from_bytes(dt.spk().ok_or("liftv2 spk")?) });
+        }
+        let prevout = TxOut { value: Amount::from_sat(prev_value), script_pubkey: old_spk };
+        let txin = TxIn {
+            previous_output: OutPoint::new(Txid::from_byte_array(prev_txid), prev_vout),
+            script_sig: ScriptBuf::new(), sequence: Sequence::ENABLE_LOCKTIME_NO_RBF, witness: Witness::new(),
+        };
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::from_height(old_expiry).map_err(|_| "bad expiry height")?,
+            input: vec![txin], output: outs,
+        };
+        let leaf_hash = TapLeafHash::from_script(bitcoin::Script::from_bytes(&expiry_script), LeafVersion::TapScript);
+        let sighash = SighashCache::new(&tx)
+            .taproot_script_spend_signature_hash(0, &Prevouts::All(&[prevout]), leaf_hash, TapSighashType::Default)
+            .map_err(|e| format!("sighash: {e}"))?
+            .to_byte_array();
+        let sig = sign(*self.engine_secret, sighash, SchnorrSigningMode::BIP340).ok_or("engine expiry sign failed")?;
+        { let mut w = Witness::new(); w.push(sig.to_vec()); w.push(expiry_script.clone()); w.push(expiry_cb.clone()); tx.input[0].witness = w; }
+
+        let outputs: Vec<([u8; 32], u32, u64)> = allocations.iter().enumerate().map(|(i, (a, _))| (*a, i as u32, out_vals[i])).collect();
+        Ok(DissolveResult {
+            signed_tx_hex: hex::encode(bitcoin::consensus::encode::serialize(&tx)),
+            txid: tx.compute_txid().to_string(),
+            outputs,
         })
     }
 
