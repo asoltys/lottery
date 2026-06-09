@@ -145,7 +145,8 @@ function renderStatus() {
   const st = lastState;
   if (!st) return;
   let status, cls = '';
-  if (st.participants < st.min_participants) status = 'waiting for the first entry';
+  if (st.participants === 0) status = 'waiting for the first entry';
+  else if (st.participants < st.min_participants) status = 'waiting for another player…';
   else if (displayTimeLeft > 0) status = `drawing in ${displayTimeLeft}s`;
   else status = 'settling…';
   if (st.rollover_streak > 0) status += `  ·  ${st.rollover_streak} rollover${st.rollover_streak > 1 ? 's' : ''}`;
@@ -427,9 +428,8 @@ function connectCosign() {
   cosignWs = new WebSocket(`${proto}://${location.host}/cosign`);
   cosignWs.addEventListener('open', () => {
     cosignDetach = attachCosign(cosignWs, ME.secp, ME.accountKey, (kind, detail) => {
-      if (kind === 'nonce') flash('🔑 co-signing the pot covenant…');
-      else if (kind === 'complete') flash('✅ covenant co-signed', 'ok');
-      else if (kind === 'reject') flash('🛑 refused to sign (verification failed): ' + (detail.errors || []).join('; '), 'err');
+      // cosign happens silently in the background; only surface a refusal.
+      if (kind === 'reject') flash('🛑 refused to sign (verification failed): ' + (detail.errors || []).join('; '), 'err');
     });
   });
   cosignWs.addEventListener('close', () => { if (cosignDetach) { cosignDetach(); cosignDetach = null; } setTimeout(connectCosign, 1500); });
@@ -494,7 +494,7 @@ async function doWithdraw() {
     const r = await api('/api/withdraw', {
       account_key: ME.accountKey, bls_key: ME.blsKey, address, amount, bls_signature: hx(sig),
     });
-    if (r.ok) { flash(`Withdrew ${Number(r.withdrawn || amount).toLocaleString()} sats to your address! tx ${short(r.txid)}`, 'ok'); $('wdaddr').value = ''; $('withdrawbox').style.display = 'none'; }
+    if (r.ok) { flash(`Withdrew ${Number(r.withdrawn || amount).toLocaleString()} sats! tx ${short(r.txid)}`, 'ok'); $('wdaddr').value = ''; $('withdrawbox').style.display = 'none'; }
     else flash('Withdraw failed: ' + friendly(r.error), 'err');
   } catch (e) { flash('Withdraw error: ' + e.message, 'err'); }
   setPendingWithdrawSpk(null);

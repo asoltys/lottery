@@ -76,6 +76,10 @@ const KEY_W: u8 = 0x77; // last-win round number
 
 const ROUND_DURATION: u64 = 120; // seconds (must match the contract)
 const MIN_PARTICIPANTS: u64 = 1; // contract requires >= 1 entrant
+// Arcade draw policy: a round only DRAWS once at least this many DISTINCT players
+// have entered — a solo player would otherwise face ~80% rollover odds against
+// nobody, so we hold the draw (and the countdown) until a second player joins.
+const MIN_PLAYERS: u64 = 2;
 const FAUCET_GRANT: u64 = 10_000;
 const ODDS_DENOM: u64 = 4; // house = round_total * 4 -> 1/5 = 20% per-round win odds (match contract)
 const RAKE_PERCENT: u64 = 1; // operator rake taken from the pot on a win
@@ -148,6 +152,11 @@ struct ArcadeState {
     ln_invoices: Arc<tokio::sync::Mutex<HashMap<String, LnInvoice>>>,
     // Serializes auto-genesis attempts from the watcher loop (no concurrent runs).
     auto_genesis_lock: Arc<tokio::sync::Mutex<()>>,
+    // When the current round (keyed by its round-start index `rs`) first reached the
+    // MIN_PLAYERS quorum: Some((rs, unix_ts)). The draw countdown runs from this
+    // timestamp, not the first entry — so the round gets a full window once a second
+    // player joins, instead of drawing the instant a late joiner enters.
+    round_quorum_at: Arc<tokio::sync::Mutex<Option<(u64, u64)>>>,
 }
 
 // A confirmed LiftV2 deposit UTXO awaiting inclusion in the pot covenant.
@@ -585,14 +594,32 @@ fn feed_event(d: &Value) -> Value {
     }
 }
 
+// Distinct players who have entered the current round [rs, g) — what a human means
+// by "players", vs. `count` (= g - rs) which is the number of entries.
+async fn distinct_players(s: &ArcadeState, rs: u64, g: u64) -> u64 {
+    let mut seen = std::collections::HashSet::new();
+    for i in rs..g {
+        if let Some(p) = s.read_participant(i).await { seen.insert(p); }
+    }
+    seen.len() as u64
+}
+
 async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
     let (g, rs, t, k, d, w, total, b, count, _seed) = round_view(s).await;
+    let _ = t;
     let round_total = total.saturating_sub(b);
     let treasury = { s.coin_manager.lock().await.get_contract_balance(s.contract_id).unwrap_or(0) };
     let now = Utc::now().timestamp() as u64;
     let closed = k == d + 1;
     let streak = d.saturating_sub(w); // rounds since the last win (rollover streak)
-    let time_left = if count == 0 { ROUND_DURATION } else { (t + ROUND_DURATION).saturating_sub(now) };
+    // "participants" reported to the UI is DISTINCT players; the draw waits for the
+    // MIN_PLAYERS quorum, and the countdown runs from when that quorum was reached.
+    let players = distinct_players(s, rs, g).await;
+    let quorum_ts = { match *s.round_quorum_at.lock().await { Some((qrs, ts)) if qrs == rs => Some(ts), _ => None } };
+    let time_left = match quorum_ts {
+        Some(ts) if players >= MIN_PLAYERS => (ts + ROUND_DURATION).saturating_sub(now),
+        _ => ROUND_DURATION, // not enough players yet — countdown hasn't started
+    };
     let tip = { s.sync_manager.lock().await.cube_batch_sync_height_tip() };
     let contract_ri = s.contract_registery_index().await;
 
@@ -602,8 +629,9 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
         "batch_height_tip": tip,
         "jackpot": treasury,
         "round_pot": round_total,
-        "participants": count,
-        "min_participants": MIN_PARTICIPANTS,
+        "participants": players,
+        "entries": count,
+        "min_participants": MIN_PLAYERS,
         "round_duration": ROUND_DURATION,
         "time_left": time_left,
         "closed": closed,
@@ -2260,10 +2288,23 @@ async fn reconcile_covenant(s: &ArcadeState, winner: Option<[u8; 32]>) {
 async fn lifecycle(s: ArcadeState) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let (g, rs, t, k, d, w, total, b, count, _seed) = round_view(&s).await;
+        let (g, rs, _t, k, d, w, total, b, count, _seed) = round_view(&s).await;
         let now = Utc::now().timestamp() as u64;
         let closed = k == d + 1;
-        if closed || count < MIN_PARTICIPANTS || now < t + ROUND_DURATION {
+        // Hold the draw until at least MIN_PLAYERS DISTINCT players have entered, and
+        // run the countdown from when that quorum was first reached (not first entry).
+        let players = distinct_players(&s, rs, g).await;
+        let quorum_ts = {
+            let mut q = s.round_quorum_at.lock().await;
+            match *q {
+                Some((qrs, ts)) if qrs == rs => Some(ts),
+                _ => {
+                    if players >= MIN_PLAYERS { *q = Some((rs, now)); Some(now) } else { *q = None; None }
+                }
+            }
+        };
+        let ripe = players >= MIN_PLAYERS && quorum_ts.map_or(false, |ts| now >= ts + ROUND_DURATION);
+        if closed || count < MIN_PARTICIPANTS || !ripe {
             continue;
         }
         // 1) close (snapshots the seed from the current block hash)
@@ -2592,6 +2633,7 @@ pub async fn run_arcade(
         coinos_webhook_url: std::env::var("COINOS_WEBHOOK_URL").ok().filter(|v| !v.is_empty()),
         ln_invoices: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         auto_genesis_lock: Arc::new(tokio::sync::Mutex::new(())),
+        round_quorum_at: Arc::new(tokio::sync::Mutex::new(None)),
     };
 
     tokio::spawn(lifecycle(state.clone()));
