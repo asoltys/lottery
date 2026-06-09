@@ -761,7 +761,12 @@ function main() {
   $('withdrawbtn').onclick = doWithdraw;
   const dbtn = $('depositbtn'); if (dbtn) dbtn.onclick = () => {
     dismissDepositStatus();
-    const s = $('fundsub'); s.style.display = s.style.display === 'none' ? '' : 'none';
+    // toggle the whole deposit UI: if anything is showing (sub-buttons or an
+    // address/Lightning screen), hide it all; otherwise reveal the sub-buttons.
+    const parts = [$('fundsub'), $('depositaddr'), $('lnbox')];
+    const anyOpen = parts.some((e) => e && e.style.display !== 'none');
+    if (anyOpen) parts.forEach((e) => { if (e) e.style.display = 'none'; });
+    else if ($('fundsub')) $('fundsub').style.display = '';
   };
   const btcbtn = $('btcdepositbtn'); if (btcbtn) btcbtn.onclick = () => {
     dismissDepositStatus();
