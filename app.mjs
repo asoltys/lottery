@@ -334,6 +334,9 @@ function renderDeposit(d) {
   if (!parts.length) { el.style.display = 'none'; return; }
   el.innerHTML = parts.join('<br>');
   el.style.display = '';
+  // A payment landed (incoming/received) — the Lightning QR + invoice have done
+  // their job, so hide them; the pending status now carries the deposit through.
+  const lnr = $('lnresult'); if (lnr) lnr.style.display = 'none';
 }
 
 // Register our deposit address with the server (so it starts watching the chain
