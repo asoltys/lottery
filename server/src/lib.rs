@@ -179,7 +179,12 @@ const DEPOSIT_WATCH_WALLET: &str = "lotto-deposit-watch";
 
 // Covenant lifecycle tuning (regtest-friendly small values).
 const COVENANT_EXIT_DELAY: u16 = 6; // CSV blocks for the demo (vs 144 in prod)
-const COVENANT_EXPIRY_WINDOW: u64 = 12_960; // CLTV engine-reclaim window above tip
+// The covenant's CLTV epoch: after this many blocks the engine can reform it via
+// the expiry path (absorb joiners / carry balances) WITHOUT any member cosigning,
+// so offline/abandoned members can't deadlock new joins. Short enough to drop
+// stragglers promptly; comfortably above COVENANT_EXIT_DELAY so a member can always
+// force-exit before expiry. ~72 min on Mutinynet (30s blocks); ~1 day on mainnet.
+const COVENANT_EXPIRY_WINDOW: u64 = 144;
 
 // --- dynamic fee estimation (mainnet-grade) ---
 // Fees are estimated from the node's estimatesmartfee × the tx's vsize, with a
@@ -1041,7 +1046,25 @@ async fn deposit_watcher(s: ArcadeState) {
                     // N-of-N); skips otherwise and retries on the next tick.
                     match do_join(&s).await {
                         Ok((txid, v, n)) => eprintln!("auto-join: absorbed deposits -> covenant {txid} value {v} ({n} claimants)"),
-                        Err(e) => eprintln!("auto-join skipped: {e}"),
+                        Err(e) => {
+                            eprintln!("auto-join skipped: {e}");
+                            // Cooperative join needs every old member online (input 0 is
+                            // N-of-N). If members are offline/abandoned AND the covenant has
+                            // reached its epoch expiry, the engine reforms it unilaterally via
+                            // the expiry script path — no member cosign required — so absent
+                            // members can't deadlock new joins/withdrawals forever.
+                            let tip = { s.sync_manager.lock().await.bitcoin_sync_height_tip() };
+                            let reform_ready = match s.covenant.current().await {
+                                Some(cov) => (tip as u32) >= cov.expiry,
+                                None => false,
+                            };
+                            if reform_ready {
+                                match do_epoch_reform(&s).await {
+                                    Ok((txid, v, n)) => eprintln!("auto-reform: epoch reform -> covenant {txid} value {v} ({n} claimants)"),
+                                    Err(e) => eprintln!("auto-reform skipped: {e}"),
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1505,6 +1528,56 @@ async fn do_join(s: &ArcadeState) -> Result<(String, u64, usize), String> {
     { let absorbed: std::collections::HashSet<_> = deposits.iter().map(|d| (d.txid_internal, d.vout)).collect();
       s.pending_deposits.lock().await.retain(|d| !absorbed.contains(&(d.txid_internal, d.vout))); }
     presign_unroll(s, &txid, 0, cov_value, &canonical, expiry).await;
+    s.notify();
+    Ok((txid, cov_value, canonical.len()))
+}
+
+// EPOCH REFORM: the liveness-independent version of do_join. Once the covenant is at
+// or past its CLTV expiry, the engine reforms it via the expiry script path (no
+// member cosign) — carrying every existing claim into a fresh covenant + absorbing
+// online deposits + setting a new expiry. This is what stops an offline/abandoned
+// member from deadlocking new joins forever: cooperative do_join is tried first; if
+// it can't run (someone offline) and the covenant has reached expiry, this takes
+// over. Only the new depositors need to be online (they cosign their own inputs).
+async fn do_epoch_reform(s: &ArcadeState) -> Result<(String, u64, usize), String> {
+    let cov = match s.covenant.current().await { Some(c) => c, None => return Err("no covenant".into()) };
+    let tip = { s.sync_manager.lock().await.bitcoin_sync_height_tip() };
+    if (tip as u32) < cov.expiry {
+        return Err(format!("covenant not at expiry yet (tip {} < expiry {})", tip, cov.expiry));
+    }
+    let all_deposits = { s.pending_deposits.lock().await.clone() };
+    let connected: std::collections::HashSet<[u8; 32]> = s.cosign_hub.connected().await.into_iter().collect();
+    // only depositors who are online (they must cosign their own deposit inputs).
+    let deposits: Vec<PendingDeposit> = all_deposits.iter().filter(|d| connected.contains(&d.account)).cloned().collect();
+    let gdeposits: Vec<cosign::GenesisDeposit> = deposits.iter().map(|d| cosign::GenesisDeposit {
+        account_key: d.account, prev_txid: d.txid_internal, prev_vout: d.vout, prev_value: d.value,
+    }).collect();
+    // carry every existing claim, merge in the new deposits.
+    let old_allocs: Vec<([u8; 32], u64)> = cov.allocations.iter().filter_map(|(h, v)| parse_hex::<32>(h).map(|a| (a, *v))).collect();
+    let mut new_allocs: Vec<([u8; 32], u64)> = old_allocs.clone();
+    for d in &deposits {
+        match new_allocs.iter_mut().find(|(a, _)| a == &d.account) { Some(e) => e.1 += d.value, None => new_allocs.push((d.account, d.value)) }
+    }
+    let new_expiry = (tip + COVENANT_EXPIRY_WINDOW) as u32;
+    let fee = s.estimate_fee(genesis_vsize(deposits.len() as u64 + 1));
+    if let Some(max) = new_allocs.iter_mut().max_by_key(|(_, v)| *v) { max.1 = max.1.saturating_sub(fee); }
+    let prev_txid = match bitcoin::Txid::from_str(&cov.txid) { Ok(t) => t.to_byte_array(), Err(_) => return Err("bad covenant txid".into()) };
+    let res = s.cosign_hub.run_epoch_reform(old_allocs, cov.expiry, prev_txid, cov.vout, cov.value, gdeposits, new_allocs.clone(), new_expiry, fee, std::time::Duration::from_secs(30)).await?;
+    let txid = s.broadcast(&res.signed_tx_hex).map_err(|e| format!("broadcast: {e}"))?;
+    s.mine(1);
+    let mut canonical = new_allocs.clone();
+    canonical.sort_by(|a, b| a.0.cmp(&b.0));
+    let cov_value: u64 = canonical.iter().map(|(_, v)| v).sum();
+    let alloc_pairs: Vec<(String, u64)> = canonical.iter().map(|(k, v)| (hex::encode(k), *v)).collect();
+    let st_txid = txid.clone();
+    let _ = s.covenant.update(move |st| {
+        st.covenant = Some(covenant_manager::CovenantState { txid: st_txid, vout: 0, value: cov_value, allocations: alloc_pairs, expiry: new_expiry });
+        st.unroll = None;
+        st.last_settle = None;
+    }).await;
+    { let absorbed: std::collections::HashSet<_> = deposits.iter().map(|d| (d.txid_internal, d.vout)).collect();
+      s.pending_deposits.lock().await.retain(|d| !absorbed.contains(&(d.txid_internal, d.vout))); }
+    presign_unroll(s, &txid, 0, cov_value, &canonical, new_expiry).await;
     s.notify();
     Ok((txid, cov_value, canonical.len()))
 }

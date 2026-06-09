@@ -149,17 +149,22 @@ function verifyJoin(ctx, message, myAccountHex) {
   try {
     const me = myAccountHex.toLowerCase();
     const ci = ctx.covenant_in || {};
+    // a join (lock_time 0) uses final sequences (0xffffffff); an epoch reform sets
+    // nLockTime = old_expiry and so must use a non-final sequence (0xfffffffe) on
+    // every input, or nLockTime isn't enforced and the sighash won't match the engine's.
+    const lockTime = Number(ctx.lock_time || 0);
+    const seq = lockTime > 0 ? 0xfffffffe : 0xffffffff;
     const inputs = [{
       txid: ci.txid, vout: Number(ci.vout), value: Number(ci.value),
-      spk: covenantSpk(ctx.engine, ci.allocations, Number(ci.expiry)).spk, sequence: 0xffffffff,
+      spk: covenantSpk(ctx.engine, ci.allocations, Number(ci.expiry)).spk, sequence: seq,
     }];
     for (const d of (ctx.deposits || [])) {
-      inputs.push({ txid: d.txid, vout: Number(d.vout), value: Number(d.value), spk: liftV2Spk(d.account, ctx.engine).spk, sequence: 0xffffffff });
+      inputs.push({ txid: d.txid, vout: Number(d.vout), value: Number(d.value), spk: liftV2Spk(d.account, ctx.engine).spk, sequence: seq });
     }
     const nextSpk = covenantSpk(ctx.engine, ctx.new_allocations, Number(ctx.new_expiry)).spk;
     const outputs = [{ value: Number(ctx.out_value), spk: nextSpk }];
     const idx = Number(ctx.input_index);
-    mySighash = keyPathSighash({ version: 2, lockTime: 0, inputIndex: idx, inputs, outputs });
+    mySighash = keyPathSighash({ version: 2, lockTime, inputIndex: idx, inputs, outputs });
     if (mySighash.toLowerCase() !== (message || '').toLowerCase())
       errors.push('sighash mismatch — not the join described');
     if (Number(ctx.out_value || 0) !== sumAlloc(ctx.new_allocations || []))

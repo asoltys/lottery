@@ -36,6 +36,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use bitcoin::hashes::Hash as _;
 use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+use bitcoin::taproot::{LeafVersion, TapLeafHash};
 use bitcoin::transaction::Version;
 use bitcoin::{
     absolute::LockTime, Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
@@ -52,7 +53,7 @@ use cube::constructive::txout_types::timeout_tree::refresh::{
 use cube::transmutative::hash::{Hash, HashTag};
 use cube::transmutative::musig::session::MusigSessionCtx;
 use cube::transmutative::secp::into::{IntoPoint, IntoScalar};
-use cube::transmutative::secp::schnorr::{verify_xonly, LiftScalar, SchnorrSigningMode};
+use cube::transmutative::secp::schnorr::{sign, verify_xonly, LiftScalar, SchnorrSigningMode};
 use secp::{Point, Scalar};
 
 // ---------- wire protocol ----------
@@ -1206,6 +1207,7 @@ impl CosignHub {
         let base_ctx = json!({
             "kind": "join",
             "engine": hex::encode(self.engine_key),
+            "lock_time": 0,
             "covenant_in": { "txid": hex::encode(prev_txid), "vout": prev_vout, "value": prev_value, "allocations": alloc_json(&old_allocations), "expiry": old_expiry },
             "deposits": deposits_json,
             "out_value": out_value,
@@ -1288,6 +1290,106 @@ impl CosignHub {
             let sig = self.cosign_deposit_input(d.account_key, sighashes[i + 1], c, "join", "join", round_timeout).await?;
             let mut w = Witness::new(); w.push(sig.to_vec());
             tx.input[i + 1].witness = w;
+        }
+
+        Ok(RefreshResult {
+            agg_sig: [0u8; 64], message: [0u8; 32], agg_key_xonly: [0u8; 32], valid: true,
+            signed_tx_hex: hex::encode(bitcoin::consensus::encode::serialize(&tx)),
+            txid: tx.compute_txid().to_string(),
+        })
+    }
+
+    /// EPOCH REFORM: like `run_join`, but spend the covenant via its ENGINE-ONLY
+    /// EXPIRY script path (`<expiry> CLTV DROP <engine> CHECKSIG`) instead of the
+    /// N-of-N key path — so the engine carries every member's balance into a fresh
+    /// covenant AND absorbs online joiners WITHOUT any existing member cosigning
+    /// (they may be offline/abandoned). Valid on-chain only once tip >= `old_expiry`
+    /// (CLTV); the tx sets nLockTime = old_expiry. Deposit inputs are still each
+    /// depositor's own 2-of-2 (they're online). Members keep their pre-signed unroll
+    /// to exit before expiry if they distrust the reform.
+    pub async fn run_epoch_reform(
+        &self,
+        mut old_allocations: Vec<([u8; 32], u64)>,
+        old_expiry: u32,
+        prev_txid: [u8; 32],
+        prev_vout: u32,
+        prev_value: u64,
+        deposits: Vec<GenesisDeposit>,
+        mut new_allocations: Vec<([u8; 32], u64)>,
+        new_expiry: u32,
+        fee: u64,
+        round_timeout: Duration,
+    ) -> Result<RefreshResult, String> {
+        old_allocations.sort_by(|a, b| a.0.cmp(&b.0));
+        new_allocations.sort_by(|a, b| a.0.cmp(&b.0));
+        let old_taproot = funding_taproot(self.engine_key, &old_allocations, old_expiry).ok_or("funding_taproot(old) failed")?;
+        let old_spk = ScriptBuf::from_bytes(old_taproot.spk().ok_or("old spk")?);
+        // the engine-spendable expiry leaf (the single script path on the covenant).
+        let tree = old_taproot.tree().ok_or("old tree")?;
+        let leaf = tree.leaves().into_iter().next().ok_or("expiry leaf")?;
+        let expiry_script = leaf.tap_script();
+        let expiry_cb = old_taproot.control_block(0).ok_or("expiry control block")?.to_vec();
+        let new_spk = covenant_scriptpubkey(self.engine_key, &new_allocations, new_expiry).ok_or("covenant_scriptpubkey(new) failed")?;
+        let out_value: u64 = new_allocations.iter().map(|(_, v)| v).sum();
+        let total_in: u64 = prev_value + deposits.iter().map(|d| d.prev_value).sum::<u64>();
+        if total_in != out_value + fee {
+            return Err(format!("reform value mismatch: in {} != out {} + fee {}", total_in, out_value, fee));
+        }
+
+        let mut prevouts: Vec<TxOut> = vec![TxOut { value: Amount::from_sat(prev_value), script_pubkey: old_spk }];
+        let mut txins: Vec<TxIn> = vec![TxIn {
+            previous_output: OutPoint::new(Txid::from_byte_array(prev_txid), prev_vout),
+            script_sig: ScriptBuf::new(), sequence: Sequence::ENABLE_LOCKTIME_NO_RBF, witness: Witness::new(),
+        }];
+        for d in &deposits {
+            let dt = return_liftv2_taproot(d.account_key, self.engine_key).ok_or("liftv2 taproot")?;
+            prevouts.push(TxOut { value: Amount::from_sat(d.prev_value), script_pubkey: ScriptBuf::from_bytes(dt.spk().ok_or("deposit spk")?) });
+            txins.push(TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array(d.prev_txid), d.prev_vout),
+                script_sig: ScriptBuf::new(), sequence: Sequence::ENABLE_LOCKTIME_NO_RBF, witness: Witness::new(),
+            });
+        }
+        let mut tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::from_height(old_expiry).map_err(|_| "bad expiry height")?,
+            input: txins,
+            output: vec![TxOut { value: Amount::from_sat(out_value), script_pubkey: ScriptBuf::from_bytes(new_spk) }],
+        };
+        // input 0: engine signs the expiry SCRIPT path (no member cosign needed).
+        let leaf_hash = TapLeafHash::from_script(bitcoin::Script::from_bytes(&expiry_script), LeafVersion::TapScript);
+        let sighash0 = SighashCache::new(&tx)
+            .taproot_script_spend_signature_hash(0, &Prevouts::All(&prevouts), leaf_hash, TapSighashType::Default)
+            .map_err(|e| format!("sighash0: {e}"))?
+            .to_byte_array();
+        let engine_sig = sign(*self.engine_secret, sighash0, SchnorrSigningMode::BIP340).ok_or("engine expiry sign failed")?;
+        { let mut w = Witness::new(); w.push(engine_sig.to_vec()); w.push(expiry_script.clone()); w.push(expiry_cb.clone()); tx.input[0].witness = w; }
+
+        // deposit inputs (1..N): each depositor's 2-of-2, verified via the "join" ctx
+        // (carrying nLockTime = old_expiry so the depositor recomputes the same sighash).
+        let alloc_json = |allocs: &[([u8; 32], u64)]| -> Value {
+            Value::Array(allocs.iter().map(|(k, v)| json!({ "account": hex::encode(k), "value": v })).collect())
+        };
+        let deposits_json: Vec<Value> = deposits.iter().map(|d| json!({
+            "account": hex::encode(d.account_key), "txid": hex::encode(d.prev_txid), "vout": d.prev_vout, "value": d.prev_value,
+        })).collect();
+        let base_ctx = json!({
+            "kind": "join",
+            "engine": hex::encode(self.engine_key),
+            "lock_time": old_expiry,
+            "covenant_in": { "txid": hex::encode(prev_txid), "vout": prev_vout, "value": prev_value, "allocations": alloc_json(&old_allocations), "expiry": old_expiry },
+            "deposits": deposits_json,
+            "out_value": out_value,
+            "new_allocations": alloc_json(&new_allocations),
+            "new_expiry": new_expiry,
+        });
+        for (i, d) in deposits.iter().enumerate() {
+            let sighash_i = SighashCache::new(&tx)
+                .taproot_key_spend_signature_hash(i + 1, &Prevouts::All(&prevouts), TapSighashType::Default)
+                .map_err(|e| format!("sighash[{}]: {e}", i + 1))?
+                .to_byte_array();
+            let mut c = base_ctx.clone(); c["input_index"] = json!(i + 1); c["account"] = json!(hex::encode(d.account_key));
+            let sig = self.cosign_deposit_input(d.account_key, sighash_i, c, "epoch-reform", "join", round_timeout).await?;
+            let mut w = Witness::new(); w.push(sig.to_vec()); tx.input[i + 1].witness = w;
         }
 
         Ok(RefreshResult {
