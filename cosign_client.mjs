@@ -184,6 +184,39 @@ function verifyJoin(ctx, message, myAccountHex) {
   }
 }
 
+// Verify a DEPOSIT WITHDRAW: spend my own un-pooled LiftV2 deposit UTXOs straight
+// to the address I authorized. Every input is a 2-of-2 LiftV2 of (me, engine); the
+// single output MUST go to the spk I set before withdrawing (so the operator can't
+// redirect it), value must be conserved, and the input I'm signing must be mine.
+function verifyDepositWithdraw(ctx, message, myAccountHex) {
+  const errors = [];
+  let mySighash = null;
+  try {
+    const me = myAccountHex.toLowerCase();
+    if ((ctx.account || '').toLowerCase() !== me) errors.push('deposit-withdraw account is not mine');
+    const idx = Number(ctx.input_index);
+    const myInput = (ctx.inputs || [])[idx];
+    if (!myInput || (myInput.account || '').toLowerCase() !== me)
+      errors.push('my input index does not spend my deposit');
+    const inputs = (ctx.inputs || []).map((i) => ({
+      txid: i.txid, vout: Number(i.vout), value: Number(i.value),
+      spk: liftV2Spk(i.account, ctx.engine).spk, sequence: 0xffffffff,
+    }));
+    const outputs = (ctx.outputs || []).map((o) => ({ value: Number(o.value), spk: o.spk }));
+    mySighash = keyPathSighash({ version: 2, lockTime: 0, inputIndex: idx, inputs, outputs });
+    if (mySighash.toLowerCase() !== (message || '').toLowerCase())
+      errors.push('sighash mismatch — not the withdrawal described');
+    if (outputs.length !== 1) errors.push('expected exactly one withdraw output');
+    if (!pendingWithdrawSpk || (outputs[0]?.spk || '').toLowerCase() !== pendingWithdrawSpk)
+      errors.push('payout does not go to the address I authorized');
+    const totalIn = inputs.reduce((s, i) => s + Number(i.value), 0);
+    if (totalIn < outputs.reduce((s, o) => s + Number(o.value), 0)) errors.push('negative fee (Σ inputs < Σ outputs)');
+    return { ok: errors.length === 0, errors, mySighash };
+  } catch (e) {
+    return { ok: false, errors: ['verify exception: ' + e.message], mySighash };
+  }
+}
+
 // Attach cosign handling to an open WebSocket. `secpHex` is the player's 32-byte
 // base secret; `accountKeyHex` is their 32-byte x-only account key (even-Y).
 // `onEvent(kind, detail)` is an optional progress callback. Returns a function to
@@ -218,6 +251,10 @@ export function attachCosign(ws, secpHex, accountKeyHex, onEvent = () => {}) {
           mySighash = v.mySighash;
         } else if (msg.ctx && msg.ctx.kind === 'join') {
           const v = verifyJoin(msg.ctx, msg.message, accountKeyHex);
+          if (!v.ok) { onEvent('reject', { session: msg.session, errors: v.errors }); break; }
+          mySighash = v.mySighash;
+        } else if (msg.ctx && msg.ctx.kind === 'deposit-withdraw') {
+          const v = verifyDepositWithdraw(msg.ctx, msg.message, accountKeyHex);
           if (!v.ok) { onEvent('reject', { session: msg.session, errors: v.errors }); break; }
           mySighash = v.mySighash;
         }

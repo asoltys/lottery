@@ -675,6 +675,14 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
                 "claimable_sats": claimable_sats,
             }));
 
+            // Funds you've deposited but that AREN'T pooled into the covenant yet
+            // (waiting on a join/reform) still sit at your 2-of-2 LiftV2 deposit
+            // address — recoverable directly without the covenant. Only offer it
+            // when your L2 balance fully backs them (no gameplay loss owed to the
+            // pot), so a player can always get an un-played deposit straight back.
+            let pending_dep_sum: u64 = { s.pending_deposits.lock().await.iter().filter(|d| d.account == account_key).map(|d| d.value).sum() };
+            let deposit_withdrawable: u64 = if pending_dep_sum > 0 && balance >= pending_dep_sum { pending_dep_sum } else { 0 };
+
             out["account"] = json!({
                 "registered": registered, "registery_index": reg_index, "balance": balance,
                 "your_contribution": your,
@@ -683,6 +691,9 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
                 // your spendable claim in the current on-chain pot (summed over your
                 // allocations; 0 if no covenant) — gates withdraw / force-exit / exit-kit.
                 "onchain_claim": joined_sats,
+                // un-pooled deposits you can withdraw directly via the 2-of-2 LiftV2
+                // spend (no covenant needed) — also gates the Withdraw button.
+                "deposit_withdrawable": deposit_withdrawable,
             });
         }
     }
@@ -1966,6 +1977,41 @@ struct WithdrawReq {
 // claim, released by an N-of-N cosign of the current pot members (each verifies the
 // tx before signing). Capped at the player's on-chain claim (winnings beyond it
 // need a settle, not yet wired). Authorized by the player's BLS signature.
+// Withdraw an UN-POOLED balance: the player deposited but hasn't been absorbed into
+// the covenant yet (join blocked by an offline member, or reform not due). Their
+// funds still sit at their 2-of-2 LiftV2 deposit address — spend those UTXOs
+// straight to `dest_spk` with just the depositor's cosign. Only offered when the L2
+// balance fully backs the deposits (no gameplay loss owed to the pot); otherwise the
+// surplus belongs to the pot and the funds must be pooled (joined/reformed) first.
+async fn withdraw_from_deposits(s: &ArcadeState, account_key: [u8; 32], dest_spk: &[u8]) -> Json<Value> {
+    let err = |m: &str| Json(json!({ "ok": false, "error": m }));
+    let deposits: Vec<PendingDeposit> = { s.pending_deposits.lock().await.iter().filter(|d| d.account == account_key).cloned().collect() };
+    if deposits.is_empty() { return err("no on-chain funds to withdraw yet (deposit not confirmed, or already pooled)"); }
+    let dep_sum: u64 = deposits.iter().map(|d| d.value).sum();
+    let balance = s.coin_manager.lock().await.get_account_balance(account_key).unwrap_or(0);
+    if balance == 0 { return err("nothing to withdraw"); }
+    // Refuse if there's a gameplay loss: the on-chain deposit is larger than the L2
+    // balance backs, so part of it belongs to the pot — that requires pooling first.
+    if balance < dep_sum { return err("you've played some of these funds — they must be pooled into the jackpot before withdrawal (wait a moment for the pot to absorb them, then try again)"); }
+    let fee = s.estimate_fee(genesis_vsize(deposits.len() as u64));
+    if dep_sum <= fee { return err("deposit too small to cover its on-chain exit fee"); }
+
+    let dvec: Vec<([u8; 32], u32, u64)> = deposits.iter().map(|d| (d.txid_internal, d.vout, d.value)).collect();
+    let res = match s.cosign_hub.run_deposit_withdraw(account_key, dvec, dest_spk.to_vec(), fee, std::time::Duration::from_secs(30)).await {
+        Ok(r) => r, Err(e) => return err(&e),
+    };
+    let txid = match s.broadcast(&res.signed_tx_hex) { Ok(t) => t, Err(e) => return err(&format!("broadcast: {e}")) };
+    s.mine(1);
+    // drop the spent deposits from the absorb queue so they're never re-pooled.
+    { let spent: std::collections::HashSet<_> = deposits.iter().map(|d| (d.txid_internal, d.vout)).collect();
+      s.pending_deposits.lock().await.retain(|d| !spent.contains(&(d.txid_internal, d.vout))); }
+    // debit the L2 balance by the full deposit sum (the whole UTXO left the system).
+    { let mut cm = s.coin_manager.lock().await; let _ = cm.account_balance_down(account_key, dep_sum.min(balance)); let _ = cm.apply_changes(); }
+    s.notify();
+    let new_balance = s.coin_manager.lock().await.get_account_balance(account_key).unwrap_or(0);
+    Json(json!({ "ok": true, "txid": txid, "withdrawn": dep_sum - fee, "balance": new_balance }))
+}
+
 async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawReq>) -> Json<Value> {
     let err = |m: &str| Json(json!({ "ok": false, "error": m }));
     let account_key = match parse_hex::<32>(&body.account_key) { Some(a) => a, None => return err("bad account key") };
@@ -1984,12 +2030,19 @@ async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawRe
     if !bls_verify(&bls_key, sighash, signature) { return err("signature verification failed"); }
 
     let _guard = s.exec_lock.lock().await;
-    let cov = match s.covenant.current().await { Some(c) => c, None => return err("no on-chain pot yet — nothing to exit (your funds aren't pooled on-chain)") };
     let acct_hex = hex::encode(account_key);
-    // SUM over all of this account's allocations (an account may appear more than
-    // once, e.g. multiple deposits) — first-match would undercount the claim.
-    let alloc: u64 = cov.allocations.iter().filter(|(h, _)| h.eq_ignore_ascii_case(&acct_hex)).map(|(_, v)| *v).sum();
-    if alloc == 0 { return err("you have no claim in the on-chain pot"); }
+    // Is this account pooled into the covenant? SUM over all its allocations (an
+    // account can appear more than once, e.g. multiple deposits) — first-match
+    // would undercount the claim.
+    let cov_opt = s.covenant.current().await;
+    let alloc: u64 = cov_opt.as_ref().map(|cov| cov.allocations.iter().filter(|(h, _)| h.eq_ignore_ascii_case(&acct_hex)).map(|(_, v)| *v).sum()).unwrap_or(0);
+    if alloc == 0 {
+        // Not pooled (deposited but not yet joined/reformed). Withdraw straight from
+        // the un-absorbed LiftV2 deposit UTXOs (2-of-2) — no covenant, no other
+        // members. This is what makes a freshly-deposited balance always recoverable.
+        return withdraw_from_deposits(&s, account_key, &dest_spk).await;
+    }
+    let cov = cov_opt.unwrap();
     let balance = s.coin_manager.lock().await.get_account_balance(account_key).unwrap_or(0);
     if balance == 0 { return err("nothing to withdraw"); }
     // pay out your balance, capped by your on-chain claim and the authorized amount.

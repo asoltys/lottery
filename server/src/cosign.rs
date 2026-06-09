@@ -1399,6 +1399,70 @@ impl CosignHub {
         })
     }
 
+    /// DEPOSIT WITHDRAW: spend one account's un-pooled LiftV2 deposit UTXOs (each a
+    /// 2-of-2 account+engine key path) straight to `dest_spk`, paying the whole sum
+    /// minus `fee`. Covenant-independent and liveness-independent (only the one
+    /// depositor cosigns) — so a freshly-deposited, not-yet-pooled balance is always
+    /// recoverable cooperatively. Each input is cosigned by the depositor via the
+    /// "deposit-withdraw" client verifier (which checks the output is the address
+    /// they authorized).
+    pub async fn run_deposit_withdraw(
+        &self,
+        account_key: [u8; 32],
+        deposits: Vec<([u8; 32], u32, u64)>, // (prev_txid, prev_vout, prev_value)
+        dest_spk: Vec<u8>,
+        fee: u64,
+        round_timeout: Duration,
+    ) -> Result<RefreshResult, String> {
+        if deposits.is_empty() { return Err("no deposits to withdraw".into()); }
+        let total_in: u64 = deposits.iter().map(|(_, _, v)| v).sum();
+        if total_in <= fee { return Err("deposit too small to cover its on-chain exit fee".into()); }
+        let out_value = total_in - fee;
+
+        let dt = return_liftv2_taproot(account_key, self.engine_key).ok_or("return_liftv2_taproot failed")?;
+        let dspk = ScriptBuf::from_bytes(dt.spk().ok_or("deposit spk")?);
+        let mut prevouts: Vec<TxOut> = Vec::with_capacity(deposits.len());
+        let mut txins: Vec<TxIn> = Vec::with_capacity(deposits.len());
+        for (txid, vout, value) in &deposits {
+            prevouts.push(TxOut { value: Amount::from_sat(*value), script_pubkey: dspk.clone() });
+            txins.push(TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array(*txid), *vout),
+                script_sig: ScriptBuf::new(), sequence: Sequence::MAX, witness: Witness::new(),
+            });
+        }
+        let mut tx = Transaction {
+            version: Version::TWO, lock_time: LockTime::ZERO, input: txins,
+            output: vec![TxOut { value: Amount::from_sat(out_value), script_pubkey: ScriptBuf::from_bytes(dest_spk.clone()) }],
+        };
+
+        let inputs_json: Vec<Value> = deposits.iter().map(|(t, v, val)| json!({
+            "account": hex::encode(account_key), "txid": hex::encode(t), "vout": v, "value": val,
+        })).collect();
+        let base_ctx = json!({
+            "kind": "deposit-withdraw",
+            "engine": hex::encode(self.engine_key),
+            "account": hex::encode(account_key),
+            "lock_time": 0,
+            "inputs": inputs_json,
+            "outputs": [{ "value": out_value, "spk": hex::encode(&dest_spk) }],
+        });
+        for i in 0..deposits.len() {
+            let sighash_i = SighashCache::new(&tx)
+                .taproot_key_spend_signature_hash(i, &Prevouts::All(&prevouts), TapSighashType::Default)
+                .map_err(|e| format!("sighash[{i}]: {e}"))?
+                .to_byte_array();
+            let mut c = base_ctx.clone(); c["input_index"] = json!(i);
+            let sig = self.cosign_deposit_input(account_key, sighash_i, c, "deposit-withdraw", "deposit-withdraw", round_timeout).await?;
+            let mut w = Witness::new(); w.push(sig.to_vec()); tx.input[i].witness = w;
+        }
+
+        Ok(RefreshResult {
+            agg_sig: [0u8; 64], message: [0u8; 32], agg_key_xonly: [0u8; 32], valid: true,
+            signed_tx_hex: hex::encode(bitcoin::consensus::encode::serialize(&tx)),
+            txid: tx.compute_txid().to_string(),
+        })
+    }
+
     async fn abort_one(
         &self,
         session_id: &str,

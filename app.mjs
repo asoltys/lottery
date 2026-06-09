@@ -191,14 +191,21 @@ function render(st) {
   // (no covenant, or you're not in it) there's nothing to exit — say so plainly
   // instead of erroring after the click.
   const claim = a.onchain_claim || 0;
+  // funds you deposited but that aren't pooled into the covenant yet still sit at
+  // your 2-of-2 LiftV2 address — withdrawable directly (no covenant needed).
+  const depWd = a.deposit_withdrawable || 0;
+  const canWithdraw = claim > 0 || depWd > 0;
   const noticeEl = $('wdnotice');
   if (noticeEl) {
-    if (claim > 0) { noticeEl.style.display = 'none'; }
+    if (canWithdraw) { noticeEl.style.display = 'none'; }
     else {
-      noticeEl.textContent = 'No on-chain funds to withdraw or exit yet. Deposit and play — once your funds are pooled in the on-chain jackpot, you can withdraw or force-exit them with your key.';
+      noticeEl.textContent = 'No on-chain funds to withdraw or exit yet. Deposit first — then you can withdraw with your key (and once your funds are pooled into the jackpot, force-exit them unilaterally too).';
       noticeEl.style.display = '';
     }
-    ['withdrawbtn', 'forceexitbtn', 'downloadkitbtn'].forEach((id) => { const b = $(id); if (b) b.disabled = claim <= 0; });
+    // Withdraw works for an un-pooled deposit (2-of-2 spend) OR a pooled claim.
+    const wb = $('withdrawbtn'); if (wb) wb.disabled = !canWithdraw;
+    // Force-exit / exit-kit act on a covenant VTXO leaf, so they need a pooled claim.
+    ['forceexitbtn', 'downloadkitbtn'].forEach((id) => { const b = $(id); if (b) b.disabled = claim <= 0; });
   }
   refreshWinnings();
 }
