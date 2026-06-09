@@ -34,6 +34,39 @@ pub struct PreSignedUnroll {
     pub unroll_tx_hex: String,
 }
 
+/// One leaf of a settled unroll, with the data needed to spend it: the winner's
+/// winner-sweep path (set on LOSER leaves) and the disprove path (every leaf).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SettleLeaf {
+    pub account: String,
+    pub value: u64,
+    pub vout: u32,
+    pub scriptpubkey: String,
+    pub exit_script: String,
+    pub exit_control_block: String,
+    pub exit_delay: u16,
+    pub winner_sweep_script: String,
+    pub winner_sweep_control_block: String,
+    pub disprove_script: String,
+    pub disprove_control_block: String,
+}
+
+/// The winner-sweep bundle from the most recent WIN settle, persisted so the
+/// winner can cash out on-chain at any time (not just from the live settle
+/// response): broadcast `unroll_tx_hex`, then sweep every loser leaf with
+/// `valid_label` (the garbled VALID secret — usable only by the winner's key).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SettleBundle {
+    pub covenant_txid: String, // the covenant this settle's unroll spends
+    pub winner_key: String,    // x-only hex of the claimed winner
+    pub valid_label: String,   // the winner-sweep secret (hex)
+    pub rg: u64,               // the public draw (for independent re-derivation)
+    pub total: u64,            // the pot
+    pub unroll_txid: String,
+    pub unroll_tx_hex: String,
+    pub leaves: Vec<SettleLeaf>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PersistedState {
     /// The confirmed current pot covenant, if any.
@@ -45,6 +78,10 @@ pub struct PersistedState {
     /// chain (confirmed -> promote to `covenant`; missing -> safe to retry)
     /// instead of blindly re-signing and risking a double-spend attempt.
     pub pending_refresh_txid: Option<String>,
+    /// The most recent WIN settle's winner-sweep bundle (cleared when a new
+    /// covenant forms). Lets a winner fetch their cash-out anytime via /api/winnings.
+    #[serde(default)]
+    pub last_settle: Option<SettleBundle>,
 }
 
 #[derive(Clone)]

@@ -1434,6 +1434,7 @@ async fn do_genesis(s: &ArcadeState) -> Result<(String, u64, usize), String> {
     let _ = s.covenant.update(|st| {
         st.covenant = Some(covenant_manager::CovenantState { txid: txid.clone(), vout: 0, value: cov_value, allocations: alloc_pairs, expiry });
         st.unroll = None;
+        st.last_settle = None; // a fresh pot — any prior settle's cash-out is stale
     }).await;
     { s.pending_deposits.lock().await.clear(); }
     // Pre-sign the unroll now (everyone's online) so each player holds the trustless
@@ -1510,6 +1511,7 @@ async fn post_refresh(State(s): State<ArcadeState>, Json(b): Json<RefreshReq>) -
     let _ = s.covenant.update(|st| {
         st.covenant = Some(covenant_manager::CovenantState { txid: refresh_txid.clone(), vout: 0, value: new_value, allocations: alloc_pairs, expiry: new_expiry });
         st.unroll = Some(covenant_manager::PreSignedUnroll { covenant_txid: refresh_txid.clone(), unroll_txid: unroll.txid.clone(), unroll_tx_hex: unroll.signed_tx_hex.clone() });
+        st.last_settle = None;
     }).await;
     s.notify();
     Json(json!({
@@ -1697,12 +1699,28 @@ async fn post_settle(State(s): State<ArcadeState>, Json(b): Json<SettleAssertReq
         Ok(u) => u,
         Err(e) => return Json(json!({"ok":false,"error":format!("unroll pre-sign: {e}")})),
     };
+    // The winner's cash-out secret: the garbled VALID label of the settle instance.
+    // Only the winner's key can spend with it, so persisting it is safe; it lets the
+    // winner fetch + execute their winner-sweep later via /api/winnings.
+    let valid_label_hex = hex::encode(v.valid_label(&all_wires[settle_idx]));
+    let settle_leaves: Vec<covenant_manager::SettleLeaf> = unroll.leaves.iter().map(|l| covenant_manager::SettleLeaf {
+        account: l.account.clone(), value: l.value, vout: l.vout, scriptpubkey: l.scriptpubkey.clone(),
+        exit_script: l.exit_script.clone(), exit_control_block: l.control_block.clone(), exit_delay: l.exit_delay,
+        winner_sweep_script: l.winner_sweep_script.clone(), winner_sweep_control_block: l.winner_sweep_control_block.clone(),
+        disprove_script: l.disprove_script.clone(), disprove_control_block: l.disprove_control_block.clone(),
+    }).collect();
+    let bundle = covenant_manager::SettleBundle {
+        covenant_txid: cov.txid.clone(), winner_key: hex::encode(winner_key), valid_label: valid_label_hex,
+        rg, total, unroll_txid: unroll.txid.clone(), unroll_tx_hex: unroll.signed_tx_hex.clone(),
+        leaves: settle_leaves,
+    };
     let _ = s.covenant.update(|st| {
         st.unroll = Some(covenant_manager::PreSignedUnroll {
             covenant_txid: cov.txid.clone(),
             unroll_txid: unroll.txid.clone(),
             unroll_tx_hex: unroll.signed_tx_hex.clone(),
         });
+        st.last_settle = Some(bundle);
     }).await;
     s.notify();
     Json(json!({
@@ -1722,6 +1740,61 @@ async fn post_settle(State(s): State<ArcadeState>, Json(b): Json<SettleAssertReq
         "unroll_tx_hex": unroll.signed_tx_hex,
         "leaves": serde_json::to_value(&unroll.leaves).unwrap_or(Value::Null),
         "assertion": assertion,
+    }))
+}
+
+// A WIN's winner-sweep cash-out bundle, persisted at settle so the winner can claim
+// any time (not just from the live /api/settle response). For the winner it returns:
+// the pre-signed unroll to broadcast, the VALID label (the sweep secret — only the
+// winner's key can spend with it), each LOSER leaf's winner-sweep spend elements,
+// and the winner's OWN leaf's CSV-exit elements. The winner broadcasts the unroll,
+// sweeps every loser leaf, and CSV-exits its own leaf — taking the whole pot on-chain
+// with NO cooperation. This is the non-custodial "withdraw my winnings": the covenant
+// shadow ledger zeroes claims on a win, so winnings live in the settle bundle, not as
+// a live covenant allocation. (The cooperative covenant reconcile is intentionally
+// NOT used — it would force losers to surrender disprove-protected claims.)
+async fn get_winnings(State(s): State<ArcadeState>, Query(params): Query<HashMap<String, String>>) -> Json<Value> {
+    let st = s.covenant.snapshot().await;
+    let bundle = match st.last_settle {
+        Some(b) => b,
+        None => return Json(json!({ "winnings": false, "note": "no recent win to claim" })),
+    };
+    // Only valid while the settle's unroll still spends the CURRENT covenant; once the
+    // pot moves (a new genesis/refresh), the bundle is stale.
+    let current_txid = st.covenant.as_ref().map(|c| c.txid.as_str());
+    if current_txid != Some(bundle.covenant_txid.as_str()) {
+        return Json(json!({ "winnings": false, "note": "the pot has moved since this settle" }));
+    }
+    let acct = match params.get("account") {
+        Some(a) => a.to_lowercase(),
+        None => return Json(json!({ "error": "bad account" })),
+    };
+    let winner = bundle.winner_key.to_lowercase();
+    if acct != winner {
+        return Json(json!({ "winnings": false, "you_won": false, "note": "not the winner of the last round" }));
+    }
+    // the winner: every LOSER leaf is sweepable with the valid label + the winner's key.
+    let sweep_leaves: Vec<Value> = bundle.leaves.iter()
+        .filter(|l| l.account.to_lowercase() != winner)
+        .map(|l| json!({
+            "account": l.account, "value": l.value, "vout": l.vout, "scriptpubkey": l.scriptpubkey,
+            "winner_sweep_script": l.winner_sweep_script,
+            "winner_sweep_control_block": l.winner_sweep_control_block,
+        }))
+        .collect();
+    // the winner's OWN leaf is taken via the CSV exit path (their key, after the delay).
+    let own_leaf = bundle.leaves.iter().find(|l| l.account.to_lowercase() == winner).map(|l| json!({
+        "value": l.value, "vout": l.vout, "scriptpubkey": l.scriptpubkey,
+        "exit_script": l.exit_script, "exit_control_block": l.exit_control_block, "exit_delay": l.exit_delay,
+    }));
+    Json(json!({
+        "winnings": true, "you_won": true,
+        "pot": bundle.total, "rg": bundle.rg, "winner_key": bundle.winner_key,
+        "valid_label": bundle.valid_label,
+        "unroll_txid": bundle.unroll_txid, "unroll_tx_hex": bundle.unroll_tx_hex,
+        "own_leaf": own_leaf,
+        "sweep_leaves": sweep_leaves,
+        "note": "broadcast unroll_tx_hex, then spend each sweep_leaf with [your_sig, valid_label, winner_sweep_script, winner_sweep_control_block]; take your own_leaf via its CSV exit path after exit_delay.",
     }))
 }
 
@@ -2244,6 +2317,7 @@ pub async fn run_arcade(
         .route("/api/round/:n", get(get_round))
         .route("/api/history", get(get_history))
         .route("/api/exit", get(get_exit))
+        .route("/api/winnings", get(get_winnings))
         .route("/api/covenant", get(get_covenant))
         .route("/api/feerate", get(get_feerate))
         .route("/api/txstatus", get(get_txstatus))
