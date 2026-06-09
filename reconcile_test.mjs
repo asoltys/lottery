@@ -87,22 +87,30 @@ async function main() {
     const r = await post('/api/call', { account_key: p.accountKey, registery_index: call.registeryIndex, bls_key: p.blsKey, method_index: 0, calldata: [{ type: 'payable', value: sat(0.30) }], ops_price: 100, target: call.target, bls_signature: sig });
     if (!r.ok) fail('enter', JSON.stringify(r));
   }
-  console.log('both entered 0.30; waiting for the round to close + settle + reconcile (~120s)…');
+  console.log('both entered 0.30; mining + waiting for the WIN (players stay connected so the reconcile can cosign)…');
 
-  // wait for the lifecycle to settle this round (round_no advances) + reconcile.
-  const startRounds = (await get('/api/state')).rollover_streak; // any monotone marker
-  let settled = false;
-  for (let i = 0; i < 60; i++) {
-    await sleep(5000);
-    cli('-generate 1'); // nudge the chain so close/settle targets advance
+  // Wait for the lifecycle to close+settle this round into a WIN, mining steadily so
+  // the batch/close targets advance. Keep the WS open so the post-settle reconcile
+  // (N-of-N over the covenant members) can cosign.
+  let won = false;
+  for (let i = 0; i < 80; i++) {
+    cli('-generate 2'); // advance the chain so close/settle apply
+    await sleep(3000);
     const st = await get('/api/state');
-    if (st.last_winner || (st.recent_draws || []).length) { settled = true; break; }
+    if (st.last_winner) { won = true; console.log(`  won after ~${i * 3}s: winner ${String(st.last_winner).slice(0, 12)}…`); break; }
   }
-  if (!settled) fail('round did not settle in time');
-  await sleep(4000);
+  if (!won) fail('round did not produce a win in time');
+
+  // the reconcile fires right after the settle; wait for the covenant txid to change.
+  let cov1 = cov0;
+  for (let i = 0; i < 20; i++) {
+    cli('-generate 1'); await sleep(2000);
+    const c = (await get('/api/covenant')).covenant;
+    if (c && c.txid !== cov0.txid) { cov1 = c; break; }
+    cov1 = c || cov1;
+  }
 
   // after settle+reconcile, the covenant should match the players' (+operator) balances.
-  const cov1 = (await get('/api/covenant')).covenant;
   if (!cov1) fail('covenant gone after reconcile');
   console.log(`reconciled covenant ${cov1.value} (${cov1.allocations.length} claimants)`);
   if (cov1.txid === cov0.txid) fail('covenant was NOT reconciled (txid unchanged) — reconcile did not run');

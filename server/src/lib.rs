@@ -1980,61 +1980,88 @@ async fn post_exit_done(State(s): State<ArcadeState>, Json(b): Json<ExitDoneReq>
 async fn reconcile_covenant(s: &ArcadeState, winner: Option<[u8; 32]>) {
     let _guard = s.exec_lock.lock().await;
     let cov = match s.covenant.current().await { Some(c) => c, None => return };
-    // accounts to (re)attribute: every current covenant member, plus the winner.
+    let operator = parse_hex::<32>(OPERATOR_ACCOUNT_HEX);
+    // PLAYER accounts to (re)attribute: current covenant members + the winner, but
+    // NOT the operator (the engine doesn't hold the operator's cosign key, so the
+    // operator can't be a covenant member — its rake is paid OUT instead, below).
     let mut accounts: Vec<[u8; 32]> = cov.allocations.iter().filter_map(|(h, _)| parse_hex::<32>(h)).collect();
     accounts.sort(); accounts.dedup();
     if let Some(w) = winner { if !accounts.contains(&w) { accounts.push(w); } }
-    // the operator holds the 1% rake (paid to its native account on a win) — include
-    // it so the rake is covered and Σ balances == covenant value (conservation).
-    if let Some(op) = parse_hex::<32>(OPERATOR_ACCOUNT_HEX) { if !accounts.contains(&op) { accounts.push(op); } }
-    // their current spendable L2 balances; keep the non-zero ones.
+    accounts.retain(|a| Some(*a) != operator);
+    // each player's current spendable L2 balance; keep the non-zero ones.
     let mut new_allocs: Vec<([u8; 32], u64)> = {
         let cm = s.coin_manager.lock().await;
         accounts.iter().map(|a| (*a, cm.get_account_balance(*a).unwrap_or(0))).filter(|(_, v)| *v > 0).collect()
     };
     if new_allocs.is_empty() { return; }
     new_allocs.sort_by(|a, b| a.0.cmp(&b.0));
-    // conservation: only reconcile when the balances exactly back the covenant value.
-    let bal_sum: u64 = new_allocs.iter().map(|(_, v)| v).sum();
-    if bal_sum != cov.value {
-        eprintln!("arcade: reconcile skipped — Σ balances {} != covenant {} (decoupled deposits?)", bal_sum, cov.value);
+    // skip if the covenant already reflects the players' balances (nothing to do).
+    let bal_pairs: Vec<(String, u64)> = new_allocs.iter().map(|(k, v)| (hex::encode(k), *v)).collect();
+    let mut old_pairs = cov.allocations.clone(); old_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    if old_pairs == bal_pairs { return; }
+    let player_sum: u64 = new_allocs.iter().map(|(_, v)| v).sum();
+
+    // the operator's accrued rake (its native L2 balance) is paid OUT on-chain to the
+    // operator's address, so it leaves the covenant; dust rakes are deferred (kept in
+    // L2) so we don't emit an unspendable output.
+    let op_rake = match operator { Some(op) => s.coin_manager.lock().await.get_account_balance(op).unwrap_or(0), None => 0 };
+    let mine_spk = bitcoin::Address::from_str(&s.mine_address).ok().map(|a| a.assume_checked().script_pubkey().to_bytes());
+    let payout_amt = if op_rake >= 546 && mine_spk.is_some() { op_rake } else { 0 };
+
+    // CONSERVATION: payout + new covenant == covenant value − fee. The L2 ledger
+    // doesn't track on-chain fees, so Σ (players + paid rake) drifts slightly from
+    // the covenant (the genesis/refresh fees were paid on-chain); absorb that small
+    // drift off the largest player claim. A large gap means the covenant is
+    // decoupled from the ledger (post-genesis deposits elsewhere) — SKIP.
+    let fee = s.estimate_fee(refresh_vsize() + VB_TAPROOT_OUT + if payout_amt > 0 { VB_TAPROOT_OUT } else { 0 });
+    let target = cov.value.saturating_sub(fee);          // on-chain value to distribute
+    let player_target = target.saturating_sub(payout_amt); // ... minus the rake payout
+    const MAX_RECONCILE_DRIFT: u64 = 1_000_000;
+    let adjust = player_sum as i64 - player_target as i64; // remove this from players (>0) or add (<0)
+    if adjust.abs() as u64 > MAX_RECONCILE_DRIFT {
+        eprintln!("arcade: reconcile skipped — players {} vs target {} off by {} (decoupled?)", player_sum, player_target, adjust);
         return;
     }
-    // no-op if the covenant already matches (e.g. a rollover changed nothing).
-    let new_pairs: Vec<(String, u64)> = new_allocs.iter().map(|(k, v)| (hex::encode(k), *v)).collect();
-    let mut old_pairs = cov.allocations.clone(); old_pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    if old_pairs == new_pairs { return; }
-    // the refresh fee comes off the largest new allocation (Σ outputs = value − fee).
-    let fee = s.estimate_fee(refresh_vsize() + VB_TAPROOT_OUT);
-    match new_allocs.iter_mut().max_by_key(|(_, v)| *v) {
-        Some(max) if max.1 > fee => max.1 -= fee,
-        _ => { eprintln!("arcade: reconcile skipped — largest claim <= fee"); return; }
+    // apply the drift to the largest player claim (keep it positive).
+    {
+        let max = match new_allocs.iter_mut().max_by_key(|(_, v)| *v) { Some(m) => m, None => return };
+        let adjusted = max.1 as i64 - adjust;
+        if adjusted <= 0 { eprintln!("arcade: reconcile skipped — drift exceeds largest claim"); return; }
+        max.1 = adjusted as u64;
     }
     let old_allocs: Vec<([u8; 32], u64)> = cov.allocations.iter().filter_map(|(h, v)| parse_hex::<32>(h).map(|a| (a, *v))).collect();
     let old_txid = match bitcoin::Txid::from_str(&cov.txid) { Ok(t) => t.to_byte_array(), Err(_) => return };
+    let payout = match (payout_amt > 0, operator, mine_spk) {
+        (true, Some(op), Some(spk)) => Some((op, payout_amt, spk)),
+        _ => None,
+    };
     let params = cosign::RefreshParams {
         old_allocations: old_allocs, old_expiry: cov.expiry,
         new_allocations: new_allocs.clone(), new_expiry: cov.expiry,
         prev_txid: old_txid, prev_vout: cov.vout, prev_value: cov.value,
-        fee, override_out_spk: None, payout: None,
+        fee, override_out_spk: None, payout,
     };
     let res = match s.cosign_hub.run_refresh(params, "arcade-reconcile", std::time::Duration::from_secs(30)).await {
         Ok(r) => r, Err(e) => { eprintln!("arcade: reconcile cosign failed: {}", e); return; }
     };
     let txid = match s.broadcast(&res.signed_tx_hex) { Ok(t) => t, Err(e) => { eprintln!("arcade: reconcile broadcast: {}", e); return; } };
     s.mine(1);
+    // the rake left the contract on-chain (payout) — debit the operator's L2 balance.
+    if payout_amt > 0 { if let Some(op) = operator { let mut cm = s.coin_manager.lock().await; let _ = cm.account_balance_down(op, payout_amt); let _ = cm.apply_changes(); } }
+    // a payout sits at output 0, so the new covenant is output 1 (else output 0).
+    let cov_vout: u32 = if payout_amt > 0 { 1 } else { 0 };
     let new_value: u64 = new_allocs.iter().map(|(_, v)| v).sum();
     let mut canon = new_allocs.clone(); canon.sort_by(|a, b| a.0.cmp(&b.0));
     let alloc_pairs: Vec<(String, u64)> = canon.iter().map(|(k, v)| (hex::encode(k), *v)).collect();
     let expiry = cov.expiry;
     let st_txid = txid.clone();
     let _ = s.covenant.update(move |st| {
-        st.covenant = Some(covenant_manager::CovenantState { txid: st_txid, vout: 0, value: new_value, allocations: alloc_pairs, expiry });
+        st.covenant = Some(covenant_manager::CovenantState { txid: st_txid, vout: cov_vout, value: new_value, allocations: alloc_pairs, expiry });
         st.unroll = None;
         st.last_settle = None;
     }).await;
-    presign_unroll(s, &txid, 0, new_value, &canon, expiry).await;
-    eprintln!("arcade: reconciled covenant to {} balances ({} -> {})", canon.len(), &cov.txid[..cov.txid.len().min(12)], &txid[..txid.len().min(12)]);
+    presign_unroll(s, &txid, cov_vout, new_value, &canon, expiry).await;
+    eprintln!("arcade: reconciled covenant to {} player balances + {} rake payout ({} -> {})", canon.len(), payout_amt, &cov.txid[..cov.txid.len().min(12)], &txid[..txid.len().min(12)]);
     s.notify();
 }
 
