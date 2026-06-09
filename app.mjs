@@ -391,6 +391,13 @@ async function lnDeposit() {
   $('lncreatebtn').disabled = false;
 }
 
+// Reflect which deposit method is active on the tab buttons: Bitcoin orange when
+// active, Lightning gold when active, both neutral otherwise.
+function setDepositTab(which) {
+  const b = $('btcdepositbtn'); if (b) b.classList.toggle('on-btc', which === 'btc');
+  const l = $('lndepositbtn'); if (l) l.classList.toggle('on-ln', which === 'ln');
+}
+
 async function showDepositAddress() {
   const el = $('depositaddr');
   if (!el) return;
@@ -804,17 +811,20 @@ function main() {
       if ($('fundsub')) $('fundsub').style.display = '';
       const ln = $('lnbox'); if (ln) ln.style.display = 'none';
       showDepositAddress();
+      setDepositTab('btc');
     }
   };
   const btcbtn = $('btcdepositbtn'); if (btcbtn) btcbtn.onclick = () => {
     dismissDepositStatus();
     const ln = $('lnbox'); if (ln) ln.style.display = 'none'; // Bitcoin & Lightning are mutually exclusive
     showDepositAddress();
+    setDepositTab('btc');
   };
   const lnbtn = $('lndepositbtn'); if (lnbtn) lnbtn.onclick = () => {
     dismissDepositStatus();
     const da = $('depositaddr'); if (da) da.style.display = 'none';
-    const box = $('lnbox'); box.style.display = box.style.display === 'none' ? '' : 'none';
+    const box = $('lnbox'); if (box) box.style.display = '';
+    setDepositTab('ln');
   };
   const lncbtn = $('lncreatebtn'); if (lncbtn) lncbtn.onclick = lnDeposit;
   const wbtn = $('withdrawbtn2'); if (wbtn) wbtn.onclick = () => {

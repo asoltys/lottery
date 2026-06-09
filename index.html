@@ -40,6 +40,10 @@
   #betchips.busy .chip { opacity: .5; pointer-events: none; }
   #depositbtn, #withdrawbtn2 { background: #222b39; color: #cdd6e5; font-size: 13px; }
   #withdrawbtn2 { margin-left: 8px; }
+  /* deposit method tabs: neutral when inactive, branded (orange / gold) when active. */
+  .dtab { background: #222b39; color: #cdd6e5; font-size: 13px; }
+  .dtab.on-btc { background: #3a2810; color: #f7931a; }
+  .dtab.on-ln { background: #3a2f10; color: #ffd75e; }
   .me { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #8a94a6; }
   .me b { color: #d7dce5; }
   #newbtn { background: #222b39; color: #aab4c4; font-size: 12px; padding: 8px 14px; }
@@ -127,8 +131,8 @@
         <button id="depositbtn">Add funds</button>
         <button id="withdrawbtn2">Withdraw</button>
         <div id="fundsub" style="display:none;margin-top:8px">
-          <button id="btcdepositbtn" style="background:#222b39;color:#cdd6e5;font-size:13px">₿ Bitcoin</button>
-          <button id="lndepositbtn" style="display:none;background:#3a2f10;color:#ffd75e;font-size:13px;margin-left:8px">⚡ Lightning</button>
+          <button id="btcdepositbtn" class="dtab on-btc">₿ Bitcoin</button>
+          <button id="lndepositbtn" class="dtab" style="display:none;margin-left:8px">⚡ Lightning</button>
         </div>
         <div id="depositaddr" style="display:none;margin-top:8px;text-align:center"></div>
         <div id="depositstatus" style="display:none;margin-top:8px;padding:8px 10px;border:1px solid #2a3550;border-radius:8px;background:#0a1018;color:#bcd0ec"></div>
@@ -233,6 +237,6 @@
 
     <div id="round" style="display:none"></div>
   </div>
-  <script type="module" src="/bundle.js?v=e5533170"></script>
+  <script type="module" src="/bundle.js?v=883b46dc"></script>
 </body>
 </html>
