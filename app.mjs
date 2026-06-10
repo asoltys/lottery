@@ -144,6 +144,13 @@ let displayTimeLeft = 0;
 function renderStatus() {
   const st = lastState;
   if (!st) return;
+  // network badge (top-right) from the engine's CUBE_NETWORK_LABEL.
+  const nb = $('netbadge');
+  if (nb) {
+    const label = (st.network_label || '').trim();
+    if (label) { nb.textContent = '⚡ ' + label; nb.style.display = ''; }
+    else nb.style.display = 'none';
+  }
   let status, cls = '';
   if (st.participants === 0) status = 'waiting for the first entry';
   else if (st.participants < st.min_participants) status = 'waiting for another player…';

@@ -628,6 +628,9 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
         // round_total / (round_total*(ODDS_DENOM+1)) = 1/(ODDS_DENOM+1).
         "round_win_odds_pct": 100.0 / (ODDS_DENOM as f64 + 1.0),
         "rake_percent": RAKE_PERCENT,
+        // display label for the network badge (e.g. "MAINNET" / "MUTINYNET"); set per
+        // deployment via CUBE_NETWORK_LABEL so the shared client shows the right chain.
+        "network_label": std::env::var("CUBE_NETWORK_LABEL").unwrap_or_default(),
         "last_winner": s.last_winner.lock().await.clone(),
         "recent_draws": s.recent_draws.lock().await.clone(),
         "entry_cost_hint": FAUCET_GRANT,
