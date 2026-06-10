@@ -15,8 +15,17 @@
   h1 { font-size: 22px; margin: 0 0 4px; color: #fff; letter-spacing: .5px; }
   .sub { color: #6b7689; font-size: 12px; margin-bottom: 20px; }
   .hdr { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-  .netbadge { flex: 0 0 auto; font-size: 10px; font-weight: 800; letter-spacing: 1.5px; color: #ffcf5e;
+  .netwrap { position: relative; flex: 0 0 auto; }
+  .netbadge { font-size: 10px; font-weight: 800; letter-spacing: 1.5px; color: #ffcf5e; cursor: pointer;
               background: #3a2f10; border: 1px solid #8a6a16; border-radius: 999px; padding: 5px 10px; white-space: nowrap; }
+  .netbadge:hover { filter: brightness(1.15); }
+  .netmenu { position: absolute; right: 0; top: 100%; margin-top: 5px; background: #141a24; border: 1px solid #2b3545;
+             border-radius: 8px; padding: 4px; z-index: 20; min-width: 150px; box-shadow: 0 6px 20px #0008; }
+  .netitem { display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px; font-size: 11px; font-weight: 700;
+             letter-spacing: 1px; color: #cdd6e5; border-radius: 6px; cursor: pointer; white-space: nowrap; text-decoration: none; }
+  .netitem:hover { background: #1b2230; }
+  .netitem.current { color: #ffcf5e; cursor: default; }
+  .netitem .sub { font-weight: 400; letter-spacing: 0; color: #6b7689; }
   .card { background: #141a24; border: 1px solid #222b39; border-radius: 12px; padding: 18px 20px; margin-bottom: 14px; }
   .jackpot { text-align: center; }
   .jackpot .amt { font-size: 46px; font-weight: 800; color: #ffd75e; line-height: 1.1; }
@@ -107,7 +116,10 @@
   <div class="wrap">
     <div class="hdr">
       <h1 id="logo" style="cursor:pointer;margin:0">🎰 Cube Jackpot</h1>
-      <span class="netbadge" id="netbadge" style="display:none"></span>
+      <div class="netwrap">
+        <span class="netbadge" id="netbadge" style="display:none"></span>
+        <div class="netmenu" id="netmenu" style="display:none"></div>
+      </div>
     </div>
     <div class="sub">a non-custodial Bitcoin jackpot · <a href="#help" style="color:#6b8cff;text-decoration:none">how it works</a></div>
 
@@ -233,8 +245,8 @@
             </div>
           </details>
           <p style="margin:12px 0 0;font-size:11px;color:#6b7689">
-            Running on Mutinynet, a Bitcoin signet with 30-second blocks · forked
-            <a href="https://github.com/asoltys/cube" target="_blank" rel="noopener" style="color:#6b8cff">Cube</a> engine
+            Forked <a href="https://github.com/asoltys/cube" target="_blank" rel="noopener" style="color:#6b8cff">Cube</a> engine ·
+            <a class="explorer-link" href="https://explorer.cubepot.org" target="_blank" rel="noopener" style="color:#6b8cff">browse the batch explorer →</a>
           </p>
         </div>
       </div>
@@ -242,6 +254,6 @@
 
     <div id="round" style="display:none"></div>
   </div>
-  <script type="module" src="/bundle.js?v=fc18f17f"></script>
+  <script type="module" src="/bundle.js?v=96042e80"></script>
 </body>
 </html>

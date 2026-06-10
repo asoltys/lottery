@@ -141,16 +141,39 @@ let displayTimeLeft = 0;
 
 // Status line is re-derived every second from the cached state + a local
 // countdown, so the timer ticks smoothly without any network traffic.
+// The live deployments, for the network switcher + explorer links.
+const NETWORKS = [
+  { label: 'MAINNET', url: 'https://cubepot.org', explorer: 'https://explorer.cubepot.org' },
+  { label: 'MUTINYNET', url: 'https://mutiny.cubepot.org', explorer: 'https://mutiny-explorer.cubepot.org' },
+];
+let netMenuWired = false;
+// Render the network badge as a dropdown that switches to the other site.
+function renderNetBadge(label) {
+  const nb = $('netbadge'), menu = $('netmenu');
+  if (!nb) return;
+  if (!label) { nb.style.display = 'none'; if (menu) menu.style.display = 'none'; return; }
+  nb.innerHTML = '⚡ ' + label + ' <span style="opacity:.55">▾</span>';
+  nb.style.display = '';
+  // also point any explorer links at the current network's explorer.
+  const cur = NETWORKS.find((n) => n.label === label);
+  if (cur) document.querySelectorAll('a.explorer-link').forEach((a) => { a.href = cur.explorer; });
+  if (menu && !netMenuWired) {
+    menu.innerHTML = NETWORKS.map((n) => n.label === label
+      ? `<span class="netitem current">⚡ ${n.label} <span class="sub">current</span></span>`
+      : `<a class="netitem" href="${n.url}">⚡ ${n.label} <span class="sub">switch →</span></a>`).join('');
+    nb.onclick = (e) => { e.stopPropagation(); menu.style.display = menu.style.display === 'none' ? '' : 'none'; };
+    menu.onclick = (e) => e.stopPropagation();
+    document.addEventListener('click', () => { menu.style.display = 'none'; });
+    netMenuWired = true;
+  }
+}
+
 function renderStatus() {
   const st = lastState;
   if (!st) return;
-  // network badge (top-right) from the engine's CUBE_NETWORK_LABEL.
-  const nb = $('netbadge');
-  if (nb) {
-    const label = (st.network_label || '').trim();
-    if (label) { nb.textContent = '⚡ ' + label; nb.style.display = ''; }
-    else nb.style.display = 'none';
-  }
+  // network badge (top-right) from the engine's CUBE_NETWORK_LABEL — a dropdown to
+  // switch between the live sites.
+  renderNetBadge((st.network_label || '').trim());
   let status, cls = '';
   if (st.participants === 0) status = 'waiting for the first entry';
   else if (st.participants < st.min_participants) status = 'waiting for another player…';
