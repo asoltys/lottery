@@ -436,10 +436,15 @@ async function showDepositAddress() {
       // BIP21 URI (any amount): the QR holds the compact address-only form (max wallet
       // compatibility); the "open in wallet" link carries the labelled BIP21 URI.
       const uri = `bitcoin:${d.address}?label=Cube%20Jackpot`;
+      // on Mutinynet (test sats), point players at the faucet to fund the address.
+      const isMutiny = ((lastState && lastState.network_label) || '').toUpperCase().includes('MUTINY');
+      const faucet = isMutiny
+        ? `<div class="depcap">no test sats? grab some from the <a href="https://faucet.mutinynet.com/" target="_blank" rel="noopener" class="rlink" style="color:#6b8cff">Mutinynet faucet →</a> and send them to the address above.</div>`
+        : '';
       el.innerHTML = `${qrSvg('bitcoin:' + d.address)}
         <div class="depcap">send any amount of Bitcoin to this address — your balance updates automatically once it confirms.</div>
         <div class="kv" style="margin-top:8px"><div class="kvv" style="text-align:left">${d.address}</div><button class="mini" id="btccopy">copy</button></div>
-        <a href="${uri}" class="rlink" style="font-size:12px;color:#6b8cff">open in wallet →</a>`;
+        <a href="${uri}" class="rlink" style="font-size:12px;color:#6b8cff">open in wallet →</a>${faucet}`;
       el.style.display = '';
       const cb = $('btccopy'); if (cb) cb.onclick = () => copyText(d.address);
     } else { el.textContent = d.error || 'unavailable'; el.style.display = ''; }
