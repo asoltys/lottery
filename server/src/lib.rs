@@ -631,6 +631,9 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
         // display label for the network badge (e.g. "MAINNET" / "MUTINYNET"); set per
         // deployment via CUBE_NETWORK_LABEL so the shared client shows the right chain.
         "network_label": std::env::var("CUBE_NETWORK_LABEL").unwrap_or_default(),
+        // the operator-controlled account that carries the accumulating jackpot as a
+        // covenant allocation; the client watches it for the conservation check.
+        "jackpot_account": hex::encode(s.cosign_hub.jackpot_account()),
         "last_winner": s.last_winner.lock().await.clone(),
         "recent_draws": s.recent_draws.lock().await.clone(),
         "entry_cost_hint": FAUCET_GRANT,

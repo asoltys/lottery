@@ -244,6 +244,27 @@ impl CosignHub {
         self.engine_key
     }
 
+    /// The JACKPOT account's secret, derived deterministically from the engine
+    /// secret (so the operator needs no extra stored key). A separate, operator-
+    /// controlled account that carries the accumulating jackpot as an ordinary
+    /// covenant allocation; cosigned by a headless operator client (NOT a special
+    /// coordinator path), so a contract-held balance can live in the covenant.
+    /// Mirror in JS: tag256("Cube/arcade/jackpot/v1", engine_secret).
+    fn jackpot_secret(&self) -> Scalar {
+        self.engine_secret
+            .as_ref()
+            .to_vec()
+            .hash(Some(HashTag::CustomString("Cube/arcade/jackpot/v1".to_string())))
+            .into_reduced_scalar()
+            .expect("jackpot scalar")
+    }
+
+    /// The JACKPOT account's x-only (even-Y) public key — used as an ordinary
+    /// covenant participant key by `reconcile_covenant` to allocate the accumulator.
+    pub fn jackpot_account(&self) -> [u8; 32] {
+        self.jackpot_secret().lift().base_point_mul().serialize_xonly()
+    }
+
     // Deterministic, message-bound engine nonce secrets (never reused across
     // sighashes; each refresh has a unique sighash → unique nonces). Safe for a
     // single-engine signer; not safe to copy for a multi-engine setup.
