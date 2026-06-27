@@ -594,7 +594,8 @@ fn feed_event(d: &Value) -> Value {
     if d["kind"].as_str() == Some("rollover") {
         json!({ "round": round, "kind": "rollover", "amount": amount, "ts": ts })
     } else {
-        json!({ "round": round, "kind": "win", "winner": d["winner"].as_str().unwrap_or(""), "amount": amount, "ts": ts })
+        json!({ "round": round, "kind": "win", "winner": d["winner"].as_str().unwrap_or(""), "amount": amount, "ts": ts,
+            "strike": d["strike"].as_bool().unwrap_or(false), "jackpot_won": d["jackpot_won"].as_u64().unwrap_or(0) })
     }
 }
 

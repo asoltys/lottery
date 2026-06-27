@@ -189,6 +189,7 @@ function render(st) {
   lastState = st;
   displayTimeLeft = st.time_left;
   $('jackpot').textContent = st.jackpot.toLocaleString();
+  if (st.jackpot_strike_pct != null) { const se = $('strikeodds'); if (se) se.textContent = st.jackpot_strike_pct.toFixed(2); }
   const a = st.account || {};
   $('balance').textContent = (a.balance || 0).toLocaleString();
   // The free faucet + custodial on-chain cash-out are regtest-only. On signet/
@@ -620,61 +621,58 @@ function renderRound(d) {
   // Client-side recompute of the draw from the public seed (LE, as the VM reads it).
   let recomputed = null, ok = false;
   try {
-    const r = leToBig(fromHex(d.seed_hex)) % BigInt(d.space);
+    const r = leToBig(fromHex(d.seed_hex)) % BigInt(Number(d.round_total) || 1);
     recomputed = r.toString();
     ok = Number(r) === d.r;
   } catch (e) {}
-  const odds = d.space > 0 ? (d.round_total * 100) / d.space : 0;
-  const rakePct = d.rake_percent != null ? d.rake_percent : 1;
-  const rake = Math.floor((d.amount || 0) * rakePct / 100);
-  const winnerAmt = (d.amount || 0) - rake;
+  const rt = Number(d.round_total) || 0;
+  const sDenom = Number(d.strike_denom) || 10000, sNum = Number(d.strike_num) || 21;
+  const strikePct = (sNum * 100) / sDenom;
+  let qmRecomp = null;
+  try { qmRecomp = Number((leToBig(fromHex(d.seed_hex)) / BigInt(rt || 1)) % BigInt(sDenom)); } catch (e) {}
   const winnerName = (d.winner || '').toLowerCase() === mine ? 'You' : short(d.winner);
-  const outcome = d.rollover
-    ? `🎲 <b>No winner</b> — the draw missed every entry, so the entire ${Number(d.amount).toLocaleString()}-sats jackpot rolled into the next round.`
-    : `🏆 <b>${winnerName}</b> won the round. The ${Number(d.amount).toLocaleString()}-sats pot paid out <b>${Number(winnerAmt).toLocaleString()}</b> to the winner and a ${rakePct}% operator rake of <b>${Number(rake).toLocaleString()}</b>.`;
+  const strike = !!d.strike;
+  const outcome = `🏆 <b>${winnerName}</b> won the round. The ${rt.toLocaleString()}-sats pot paid <b>${Number(d.round_payout).toLocaleString()}</b> to the winner, <b>${Number(d.jackpot_cut).toLocaleString()}</b> into the jackpot, and a ${d.rake_percent != null ? d.rake_percent : 1}% rake of <b>${Number(d.rake).toLocaleString()}</b>.`
+    + (strike ? ` ⚡ <b>JACKPOT STRIKE!</b> ${winnerName} also took the <b>${Number(d.jackpot_won).toLocaleString()}</b>-sats jackpot.` : '');
   return `<div class="card round">
     <a class="back" href="#">← back to the jackpot</a>
     <h2>Round ${d.round}</h2>
     <p class="rsum">${outcome}</p>
-    <div class="feedtitle">how the winner was chosen — provably fair</div>
+    <div class="feedtitle">how it was decided — provably fair</div>
     <p class="rexp">Every entry claims a slice of the number line sized to its contribution. At close, the contract
-    snapshots a <b>Bitcoin block hash</b> as the random seed — nobody (not even the operator) can predict or
-    pick it. The draw is <code>r = seed mod space</code>; whichever slice contains <code>r</code> wins the pot
-    (minus a ${rakePct}% operator rake). A large <b>house zone</b> past the entries makes the per-round win
-    chance about <b>${odds.toFixed(2)}%</b>, so most rounds miss and roll the pot forward into a bigger
-    jackpot. You can recompute it all yourself from the values below.</p>
+    snapshots a <b>Bitcoin block hash</b> as the random seed — nobody (not even the operator) can predict it.
+    The winner is <code>r = seed mod pot</code>; whichever slice contains <code>r</code> wins (every round has a
+    winner). The <b>jackpot strike</b> is a second, independent digit of the same seed: <code>q = seed ÷ pot</code>,
+    a strike when <code>q mod ${sDenom.toLocaleString()} &lt; ${sNum}</code> (${strikePct.toFixed(2)}%). Recompute it all below.</p>
     <div class="kv"><span class="kvk">seed</span><code class="kvv">${d.seed_hex}</code></div>
     <div class="rmath">
-      <div>round contributions = <b>${Number(d.round_total).toLocaleString()}</b></div>
-      <div>house zone = <b>${Number(d.house).toLocaleString()}</b></div>
-      <div>space = contributions + house = <b>${Number(d.space).toLocaleString()}</b> → win chance <b>${odds.toFixed(2)}%</b></div>
-      <div>draw <code>r = seed mod space</code> = <b>${Number(d.r).toLocaleString()}</b>
+      <div>round pot = <b>${rt.toLocaleString()}</b></div>
+      <div>winner draw <code>r = seed mod pot</code> = <b>${Number(d.r).toLocaleString()}</b>
         ${recomputed !== null ? `<span class="${ok ? 'okv' : 'errv'}">${ok ? '✓ recomputed in your browser' : '✗ recompute=' + recomputed}</span>` : ''}</div>
+      <div>strike draw <code>(seed ÷ pot) mod ${sDenom.toLocaleString()}</code> = <b>${Number(d.q_mod).toLocaleString()}</b> ${strike ? `⚡ &lt; ${sNum} → STRIKE` : `≥ ${sNum} → no strike`}
+        ${qmRecomp !== null ? `<span class="${qmRecomp === Number(d.q_mod) ? 'okv' : 'errv'}">${qmRecomp === Number(d.q_mod) ? '✓' : '✗ ' + qmRecomp}</span>` : ''}</div>
     </div>
     ${(() => {
       const segs = d.segments || [];
       if (!segs.length) return '';
       const rows = segs.slice().sort((a, b) => Number(b.contribution) - Number(a.contribution)).map((s) => {
         const c = Number(s.contribution);
-        const chance = d.space > 0 ? (c * 100) / d.space : 0;
+        const chance = rt > 0 ? (c * 100) / rt : 0;
         const isMe = (s.key || '').toLowerCase() === mine;
         const who = isMe ? 'You' : short(s.key);
         const cls = s.winner ? 'win' : (isMe ? 'me' : '');
         return `<div class="seg ${cls}"><div class="seginfo"><span>${who}${s.winner ? ' 🏆' : ''}</span><span class="segrange">${c.toLocaleString()} sats · ${chance.toFixed(2)}% to win</span></div></div>`;
       }).join('');
-      const houseChance = d.space > 0 ? (d.house * 100) / d.space : 0;
-      const houseRow = `<div class="seg house"><div class="seginfo"><span>house (no winner)</span><span class="segrange">${Number(d.house).toLocaleString()} · ${houseChance.toFixed(2)}%</span></div></div>`;
-      return `<div class="feedtitle" style="margin-top:16px">who was in this round</div><div class="segs">${rows}${houseRow}</div>`;
+      return `<div class="feedtitle" style="margin-top:16px">who was in this round</div><div class="segs">${rows}</div>`;
     })()}
   </div>`;
 }
 // One draw-feed row (shared by the home feed and the full-history page).
 function drawRow(dr, mine) {
   const rlink = `<a class="rlink" href="#round/${dr.round}">round ${dr.round}</a>`;
-  if (dr.kind === 'rollover')
-    return `<div class="draw roll">${rlink} · 🎲 no winner — ${Number(dr.amount).toLocaleString()} rolled over</div>`;
   const won = (dr.winner || '').toLowerCase() === mine;
-  return `<div class="draw ${won ? 'mywin' : 'win'}">${rlink} · 🏆 ${won ? 'YOU' : short(dr.winner)} won ${Number(dr.amount).toLocaleString()}</div>`;
+  const strike = dr.strike ? ' ⚡ +JACKPOT' : '';
+  return `<div class="draw ${won ? 'mywin' : 'win'}">${rlink} · 🏆 ${won ? 'YOU' : short(dr.winner)} won ${Number(dr.amount).toLocaleString()}${strike}</div>`;
 }
 
 // Full jackpot history page (#history): every persisted round, newest first.
