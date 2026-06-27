@@ -27,7 +27,7 @@ export function setPendingWithdrawSpk(spkHex) { pendingWithdrawSpk = spkHex ? sp
 // keep an exitable claim. For a cooperative WITHDRAW (extra payout output): if I'm
 // the leaver, the payout must go to the address I authorized; otherwise I must keep
 // my claim. Returns { ok, errors, mySighash, myNewValue }.
-function verifyRefresh(ctx, message, myAccountHex) {
+function verifyRefresh(ctx, message, myAccountHex, opts = {}) {
   const errors = [];
   let mySighash = null;
   try {
@@ -57,7 +57,10 @@ function verifyRefresh(ctx, message, myAccountHex) {
       // I'm withdrawing — the payout MUST go to the address I authorized.
       if (!pendingWithdrawSpk || (ctx.payout_spk || '').toLowerCase() !== pendingWithdrawSpk)
         errors.push('payout does not go to the address I authorized');
-    } else if (!mine) {
+    } else if (!mine && !opts.allowClaimLoss) {
+      // the jackpot cosigner (allowClaimLoss) legitimately loses its claim on a
+      // strike payout, so it doesn't require keeping a claim — value conservation
+      // (checked above) still guards it.
       errors.push('no exitable claim for me in the new covenant');
     }
     return { ok: errors.length === 0, errors, mySighash, myNewValue: mine ? Number(mine.value) : 0 };
@@ -143,7 +146,7 @@ function verifyDeposit(ctx, message, myAccountHex) {
 // sighash, that value is conserved, and that we keep an exitable claim in the new
 // covenant. Works for both an old member (signing input 0, the key path) and a new
 // depositor (signing their deposit input).
-function verifyJoin(ctx, message, myAccountHex) {
+function verifyJoin(ctx, message, myAccountHex, opts = {}) {
   const errors = [];
   let mySighash = null;
   try {
@@ -171,7 +174,7 @@ function verifyJoin(ctx, message, myAccountHex) {
       errors.push('covenant value != Σ new allocations (value would leak)');
     const totalIn = inputs.reduce((s, i) => s + Number(i.value), 0);
     if (totalIn < Number(ctx.out_value || 0)) errors.push('outputs exceed inputs (negative fee)');
-    if (!(ctx.new_allocations || []).find((a) => a.account.toLowerCase() === me))
+    if (!opts.allowClaimLoss && !(ctx.new_allocations || []).find((a) => a.account.toLowerCase() === me))
       errors.push('no exitable claim for me in the joined covenant');
     // if this is my deposit input, it must spend MY deposit.
     if (idx > 0) {
@@ -221,7 +224,7 @@ function verifyDepositWithdraw(ctx, message, myAccountHex) {
 // base secret; `accountKeyHex` is their 32-byte x-only account key (even-Y).
 // `onEvent(kind, detail)` is an optional progress callback. Returns a function to
 // detach. The client says hello immediately so the coordinator can find it.
-export function attachCosign(ws, secpHex, accountKeyHex, onEvent = () => {}) {
+export function attachCosign(ws, secpHex, accountKeyHex, onEvent = () => {}, opts = {}) {
   const sessions = new Map(); // session_id -> { pubkeys, tweak, message, me }
 
   const send = (obj) => ws.send(JSON.stringify(obj));
@@ -238,7 +241,7 @@ export function attachCosign(ws, secpHex, accountKeyHex, onEvent = () => {}) {
         // covenant + sighash from the context; refuse (sign nothing) on mismatch.
         let mySighash = msg.message;
         if (msg.ctx && msg.ctx.kind === 'refresh') {
-          const v = verifyRefresh(msg.ctx, msg.message, accountKeyHex);
+          const v = verifyRefresh(msg.ctx, msg.message, accountKeyHex, opts);
           if (!v.ok) { onEvent('reject', { session: msg.session, errors: v.errors }); break; }
           mySighash = v.mySighash;
         } else if (msg.ctx && msg.ctx.kind === 'deposit') {
@@ -250,7 +253,7 @@ export function attachCosign(ws, secpHex, accountKeyHex, onEvent = () => {}) {
           if (!v.ok) { onEvent('reject', { session: msg.session, errors: v.errors }); break; }
           mySighash = v.mySighash;
         } else if (msg.ctx && msg.ctx.kind === 'join') {
-          const v = verifyJoin(msg.ctx, msg.message, accountKeyHex);
+          const v = verifyJoin(msg.ctx, msg.message, accountKeyHex, opts);
           if (!v.ok) { onEvent('reject', { session: msg.session, errors: v.errors }); break; }
           mySighash = v.mySighash;
         } else if (msg.ctx && msg.ctx.kind === 'deposit-withdraw') {

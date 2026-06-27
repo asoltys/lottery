@@ -82,19 +82,32 @@ const MIN_PLAYERS: u64 = 2;
 const FAUCET_GRANT: u64 = 10_000;
 const ODDS_DENOM: u64 = 4; // house = round_total * 4 -> 1/5 = 20% per-round win odds (match contract)
 const RAKE_PERCENT: u64 = 1; // operator rake taken from the pot on a win
+// v5 accumulating jackpot: of each round pot, JACKPOT_PCT% is retained as the
+// jackpot; the round winner also strikes the whole accumulator with probability
+// JACKPOT_STRIKE_NUM / JACKPOT_STRIKE_DENOM. Must match the v5 contract.
+const JACKPOT_PCT: u64 = 4;
+const JACKPOT_STRIKE_NUM: u64 = 21;
+const JACKPOT_STRIKE_DENOM: u64 = 10000;
+// v5 covenant reconcile cadence: at most once per interval (bounds on-chain fees),
+// but forced sooner if any player's covenant claim diverges from their true L2
+// balance by more than the threshold (bounds stale-exit exposure), or on withdraw.
+const RECONCILE_INTERVAL_SECS: u64 = 1800; // 30 min
+const RECONCILE_DIVERGENCE: u64 = 100_000; // sats
 // Exit-tree params for the /api/exit non-custodial proof (VTXO unilateral exit).
 const EXIT_TREE_EXIT_DELAY: u16 = 144; // CSV blocks before a holder can sweep
 const EXIT_TREE_EXPIRY_WINDOW: u64 = 12_960; // CLTV engine-reclaim window above tip
 
-// Lottery v3 program (compiled bytecode) + operator account that accrues the
+// Lottery v5 program (compiled bytecode) + operator account that accrues the
 // 1% rake. The contract is registered on startup if not already present; the
 // operator account is registered so the rake transfers land and the operator
 // (whoever holds the phrase) can withdraw via /api/withdraw.
-// Lottery v4 (non-custodial): stakes are shadow-allocated claims (exitable VTXOs)
-// while the round is live; a win zeroes the claims before paying out. Same
-// draw/rake rules as v3, but 20% win odds (ODDS_DENOM=4). contract_id
-// 8314f710b98817f9581212f03026e21a0c309aa71773099232035d2b4b2128fd
-const V3_BYTES_HEX: &str = "2470657270657475616c206a61636b706f7420763420286e6f6e2d637573746f6469616c29000305656e7465720001092a0076b975c40167ce0172ce8763bd0174cd680154ce9369760154cd01630167ce7ecd01700167ce7eb9757ccd0167ce5193690167cd6505636c6f736500001c000172ce0167ce946951a269bd0174ce01789369a269d30173cd0164ce519369016bcd6506736574746c650001028a006b016bce0164ce51936987690142ce0154ce94697654956993690173ce9669750142ce9369760154cea263750164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd676c009369766b7601637c7ece7c76008763750067517c946901637c7ece687ca569c9c70164cb96697c7576008763756720a55068222783355b755993fe7e1ac0b190d29fa2689a9ebc041ff7252617dd0400cc686c01707c7ececb7c00cc0164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd0164ce0177cd6865";
+// Lottery v5 (accumulating jackpot, non-custodial): stakes are shadow-allocated
+// claims (exitable VTXOs) while the round is live. EVERY round pays a winner the
+// round pot split 95% winner / 1% rake / 4% retained as the accumulating jackpot
+// (the contract balance between rounds); the round winner also wins the whole
+// accumulated jackpot with a 0.21% strike (q = seed÷rt, strike if q mod 10000 < 21).
+// contract_id ab82b22b8d527f371d527edc54e6dec54355ed3615382a74a4840f2f74a47adc
+const V3_BYTES_HEX: &str = "2370657270657475616c206a61636b706f742076352028616363756d756c6174696e6729000305656e7465720001092a0076b975c40167ce0172ce8763bd0174cd680154ce9369760154cd01630167ce7ecd01700167ce7eb9757ccd0167ce5193690167cd6505636c6f736500001c000172ce0167ce946951a269bd0174ce01789369a269d30173cd0164ce519369016bcd6506736574746c65000102b0006b016bce0164ce51936987690142ce0154ce94690152cd0152ce0173ce9669750142ce93696c009369766b7601637c7ece7c76008763750067517c946901637c7ece687ca5696c01707c7ece014fcdc9c701640152ce96697c750151cd0152ce0151ce0164540152ce956996697c7593697c94690150cd0151ce76008763756720a55068222783355b755993fe7e1ac0b190d29fa2689a9ebc041ff7252617dd0400cc680150ce760087637567014fce00cc680152ce0173ce96697c750210277c96697501159f63cb760087637567014fce00cc68680164ce5193690164cd0154ce0142cd0167ce0172cdbd0174cd0164ce0177cd65";
 const OPERATOR_ACCOUNT_HEX: &str = "a55068222783355b755993fe7e1ac0b190d29fa2689a9ebc041ff7252617dd04";
 const OPERATOR_BLS_HEX: &str = "b6b8aa94cee6ea6012dc787a11a1c6101f83fb5eb974a00b9d1defcf2be0e3afa44c09a1b7c06c9907c6f15cb9216a45";
 
@@ -156,6 +169,9 @@ struct ArcadeState {
     // timestamp, not the first entry — so the round gets a full window once a second
     // player joins, instead of drawing the instant a late joiner enters.
     round_quorum_at: Arc<tokio::sync::Mutex<Option<(u64, u64)>>>,
+    // unix ts of the last covenant reconcile. v5 reconciles on a TIMER (not per round)
+    // to bound on-chain fees; a large divergence forces it sooner; a withdraw forces it.
+    last_reconcile: Arc<tokio::sync::Mutex<u64>>,
 }
 
 // A confirmed LiftV2 deposit UTXO awaiting inclusion in the pot covenant.
@@ -615,7 +631,9 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
         "contract_id": hex::encode(s.contract_id),
         "contract_registery_index": contract_ri,
         "batch_height_tip": tip,
-        "jackpot": treasury,
+        // v5: the JACKPOT is the accumulating prize = contract balance minus the live
+        // round pot; the round pot is what this round's winner takes (95% of it).
+        "jackpot": treasury.saturating_sub(round_total),
         "round_pot": round_total,
         "participants": players,
         "entries": count,
@@ -624,9 +642,9 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
         "time_left": time_left,
         "closed": closed,
         "rollover_streak": streak,
-        // per-round chance that the pot is won (vs. rolls over):
-        // round_total / (round_total*(ODDS_DENOM+1)) = 1/(ODDS_DENOM+1).
-        "round_win_odds_pct": 100.0 / (ODDS_DENOM as f64 + 1.0),
+        // v5: every round has a winner; the per-round JACKPOT-strike chance is fixed.
+        "round_win_odds_pct": 100.0,
+        "jackpot_strike_pct": (JACKPOT_STRIKE_NUM as f64) * 100.0 / (JACKPOT_STRIKE_DENOM as f64),
         "rake_percent": RAKE_PERCENT,
         // display label for the network badge (e.g. "MAINNET" / "MUTINYNET"); set per
         // deployment via CUBE_NETWORK_LABEL so the shared client shows the right chain.
@@ -708,11 +726,10 @@ async fn build_state(s: &ArcadeState, account: Option<&str>) -> Value {
             out["account"] = json!({
                 "registered": registered, "registery_index": reg_index, "balance": balance,
                 "your_contribution": your,
-                // share of the round pot (= share of the WIN payout, conditional on a win).
+                // v5: every round has a winner, so your chance to WIN THE ROUND is
+                // exactly your share of the round pot (and it's also your payout share).
                 "odds_pct": if round_total > 0 { (your as f64) * 100.0 / (round_total as f64) } else { 0.0 },
-                // actual probability YOU win the pot, including the house's rollover region:
-                // your_contribution / space, space = round_total * (ODDS_DENOM + 1).
-                "win_chance_pct": if round_total > 0 { (your as f64) * 100.0 / ((round_total * (ODDS_DENOM + 1)) as f64) } else { 0.0 },
+                "win_chance_pct": if round_total > 0 { (your as f64) * 100.0 / (round_total as f64) } else { 0.0 },
                 "deposit": deposit_json,
                 // your spendable claim in the current on-chain pot (summed over your
                 // allocations; 0 if no covenant) — gates withdraw / force-exit / exit-kit.
@@ -2092,6 +2109,11 @@ async fn post_withdraw(State(s): State<ArcadeState>, Json(body): Json<WithdrawRe
     let sighash = preimage.hash(Some(HashTag::CustomString("Cube/sighash/arcade/withdraw".to_string())));
     if !bls_verify(&bls_key, sighash, signature) { return err("signature verification failed"); }
 
+    // v5: the covenant is reconciled on a timer, so it may lag the L2 ledger. Force a
+    // reconcile first (between rounds) so a winner's covenant claim reflects their
+    // winnings before we compute the withdraw. (Takes exec_lock; must run before ours.)
+    maybe_reconcile(&s, true).await;
+
     let _guard = s.exec_lock.lock().await;
     let acct_hex = hex::encode(account_key);
     // Is this account pooled into the covenant? SUM over all its allocations (an
@@ -2235,18 +2257,29 @@ async fn reconcile_covenant(s: &ArcadeState, winner: Option<[u8; 32]>) {
     let _guard = s.exec_lock.lock().await;
     let cov = match s.covenant.current().await { Some(c) => c, None => return };
     let operator = parse_hex::<32>(OPERATOR_ACCOUNT_HEX);
+    let jackpot_account = s.cosign_hub.jackpot_account();
+    // Only reconcile BETWEEN rounds (no live stakes). Mid-round, each player's stake
+    // is a separate shadow claim and the contract balance = jackpot + live stakes;
+    // reconciling then would mis-split. Right after a settle, advance() sets b=total
+    // so round_total==0 and the contract balance is exactly the jackpot accumulator.
+    let round_total = { let (_g, _rs, _t, _k, _d, _w, total, b, _c, _s) = round_view(s).await; total.saturating_sub(b) };
+    if round_total > 0 { return; }
     // PLAYER accounts to (re)attribute: current covenant members + the winner, but
-    // NOT the operator (the engine doesn't hold the operator's cosign key, so the
-    // operator can't be a covenant member — its rake is paid OUT instead, below).
+    // NOT the operator (rake is paid OUT) and NOT the jackpot account (set below).
     let mut accounts: Vec<[u8; 32]> = cov.allocations.iter().filter_map(|(h, _)| parse_hex::<32>(h)).collect();
     accounts.sort(); accounts.dedup();
     if let Some(w) = winner { if !accounts.contains(&w) { accounts.push(w); } }
-    accounts.retain(|a| Some(*a) != operator);
+    accounts.retain(|a| Some(*a) != operator && *a != jackpot_account);
     // each player's current spendable L2 balance; keep the non-zero ones.
     let mut new_allocs: Vec<([u8; 32], u64)> = {
         let cm = s.coin_manager.lock().await;
         accounts.iter().map(|a| (*a, cm.get_account_balance(*a).unwrap_or(0))).filter(|(_, v)| *v > 0).collect()
     };
+    // the accumulating jackpot = the contract balance between rounds, carried in the
+    // covenant as the operator-controlled jackpot account's allocation (cosigned by
+    // the headless jackpot cosigner). This keeps covenant value == Σ allocations.
+    let jackpot = { s.coin_manager.lock().await.get_contract_balance(s.contract_id).unwrap_or(0) };
+    if jackpot > 0 { new_allocs.push((jackpot_account, jackpot)); }
     if new_allocs.is_empty() { return; }
     new_allocs.sort_by(|a, b| a.0.cmp(&b.0));
     // skip if the covenant already reflects the players' balances (nothing to do).
@@ -2319,10 +2352,43 @@ async fn reconcile_covenant(s: &ArcadeState, winner: Option<[u8; 32]>) {
     s.notify();
 }
 
+// Timer + divergence-gated covenant reconcile. Runs only BETWEEN rounds (reconcile
+// itself guards round_total==0). Reconciles when forced (a withdraw), or once per
+// RECONCILE_INTERVAL_SECS, or when any covenant claim diverges from the true L2
+// balance by >= RECONCILE_DIVERGENCE. `reconcile_covenant` no-ops if already synced.
+async fn maybe_reconcile(s: &ArcadeState, force: bool) {
+    let now = Utc::now().timestamp() as u64;
+    let round_total = { let (_g, _rs, _t, _k, _d, _w, total, b, _c, _s) = round_view(s).await; total.saturating_sub(b) };
+    if round_total > 0 { return; } // between rounds only
+    let cov = match s.covenant.current().await { Some(c) => c, None => return };
+    let jackpot_account = s.cosign_hub.jackpot_account();
+    let operator = parse_hex::<32>(OPERATOR_ACCOUNT_HEX);
+    let divergence = {
+        let cm = s.coin_manager.lock().await;
+        let jackpot = cm.get_contract_balance(s.contract_id).unwrap_or(0);
+        let mut maxd = 0u64;
+        for (h, cval) in &cov.allocations {
+            let acct = match parse_hex::<32>(h) { Some(a) => a, None => continue };
+            let truev = if acct == jackpot_account { jackpot }
+                else if Some(acct) == operator { 0 }
+                else { cm.get_account_balance(acct).unwrap_or(0) };
+            maxd = maxd.max(cval.abs_diff(truev));
+        }
+        maxd
+    };
+    let last = *s.last_reconcile.lock().await;
+    if force || now.saturating_sub(last) >= RECONCILE_INTERVAL_SECS || divergence >= RECONCILE_DIVERGENCE {
+        reconcile_covenant(s, None).await;
+        *s.last_reconcile.lock().await = now;
+    }
+}
+
 // The round-lifecycle loop: close + settle when a round is ripe.
 async fn lifecycle(s: ArcadeState) {
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // timer/divergence covenant reconcile (between rounds; no-op if synced).
+        maybe_reconcile(&s, false).await;
         let (g, rs, _t, k, d, w, total, b, count, _seed) = round_view(&s).await;
         let now = Utc::now().timestamp() as u64;
         let closed = k == d + 1;
@@ -2350,35 +2416,37 @@ async fn lifecycle(s: ArcadeState) {
             eprintln!("arcade: close failed: {}", e);
             continue;
         }
-        // 2) compute winner / rollover from the stored seed (mirror the contract)
+        // 2) compute the winner + jackpot strike from the stored seed (mirror v5).
+        // EVERY round has a winner: r = seed mod rt, rg = r + b in [b, total). The
+        // strike is a second independent digit of the same seed: q = seed div rt,
+        // strike if (q mod STRIKE_DENOM) < STRIKE_NUM.
         let (_g2, _rs2, _t2, _k2, _d2, _w2, total2, b2, _c2, seed) = round_view(&s).await;
         let round_total = total2.saturating_sub(b2);
-        let house = round_total * ODDS_DENOM; // win region is 1/(ODDS_DENOM+1) of space
-        let space = (round_total + house).max(1);
+        let rt_su = StackUint::from(round_total.max(1));
         let seed_su = StackItem::new(seed.clone()).to_stack_uint().unwrap_or_else(|| StackUint::from(0u64));
-        let r = (seed_su % StackUint::from(space)).to_u64().unwrap_or(0);
+        let r = (seed_su.clone() % rt_su.clone()).to_u64().unwrap_or(0);
         let rg = r + b2;
-        let rollover = rg >= total2;
-        let idx = if rollover {
-            0u64
-        } else {
-            // find idx in [rs, g) with cum[idx-1] <= rg < cum[idx]
-            let mut found = rs;
-            for i in rs..g {
-                let upper = s.read_cum(i).await;
-                let lower = if i == 0 { 0 } else { s.read_cum(i - 1).await };
-                if lower <= rg && rg < upper {
-                    found = i;
-                    break;
-                }
-            }
-            found
-        };
-        let winner_key = if rollover { None } else { s.read_participant(idx).await.map(hex::encode) };
+        let q = seed_su / rt_su; // second draw digit
+        let qm = (q % StackUint::from(JACKPOT_STRIKE_DENOM)).to_u64().unwrap_or(0);
+        let strike = qm < JACKPOT_STRIKE_NUM;
+        // find idx in [rs, g) with cum[idx-1] <= rg < cum[idx] (always lands on a player)
+        let mut idx = rs;
+        for i in rs..g {
+            let upper = s.read_cum(i).await;
+            let lower = if i == 0 { 0 } else { s.read_cum(i - 1).await };
+            if lower <= rg && rg < upper { idx = i; break; }
+        }
+        let winner_key = s.read_participant(idx).await.map(hex::encode);
+        // pot = contract balance BEFORE settle = jackpot J_prev + this round's stakes rt.
         let pot = { s.coin_manager.lock().await.get_contract_balance(s.contract_id).unwrap_or(0) };
+        let jackpot_before = pot.saturating_sub(round_total); // J_prev (accumulator carried in)
+        let rake = round_total / 100;
+        let jackpot_cut = round_total * JACKPOT_PCT / 100;
+        let round_payout = round_total.saturating_sub(rake).saturating_sub(jackpot_cut);
+        // on a strike the winner also takes the whole accumulator (J_prev + this 4%).
+        let jackpot_won = if strike { jackpot_before + jackpot_cut } else { 0 };
         let round_no = d + 1;
-        // Capture the full settlement breakdown (entry bands + the draw) for the
-        // provably-fair details page, before settle advances the round markers.
+        // Provably-fair breakdown for the details page (before settle advances markers).
         let mut segments: Vec<Value> = Vec::new();
         for i in rs..g {
             let upper = s.read_cum(i).await;
@@ -2386,26 +2454,33 @@ async fn lifecycle(s: ArcadeState) {
             segments.push(json!({
                 "key": s.read_participant(i).await.map(hex::encode).unwrap_or_default(),
                 "contribution": upper - lower,
-                "lower": lower.saturating_sub(b2), // round-local band start
-                "upper": upper.saturating_sub(b2), // round-local band end
-                "winner": !rollover && i == idx,
+                "lower": lower.saturating_sub(b2),
+                "upper": upper.saturating_sub(b2),
+                "winner": i == idx,
             }));
         }
         let detail = json!({
             "round": round_no,
             "ts": now,
-            "kind": if rollover { "rollover" } else { "win" },
+            "kind": "win", // v5: every round has a winner
             "winner": winner_key.clone(),
-            "amount": pot,
-            "seed_hex": hex::encode(&seed), // little-endian, as the VM reads it
+            "amount": round_payout,          // the winner's round payout (95%)
             "round_total": round_total,
-            "house": house,
-            "space": space,
-            "r": r,    // draw position within [0, space)
-            "rg": rg,  // global position (r + b)
+            "round_payout": round_payout,
+            "rake": rake,
+            "jackpot_cut": jackpot_cut,      // 4% added to the accumulator
+            "jackpot_before": jackpot_before,
+            "strike": strike,
+            "jackpot_won": jackpot_won,      // the accumulator paid out (0 unless strike)
+            "seed_hex": hex::encode(&seed),
+            "r": r,
+            "rg": rg,
+            "q_mod": qm,                     // strike draw digit (< STRIKE_NUM => strike)
+            "strike_num": JACKPOT_STRIKE_NUM,
+            "strike_denom": JACKPOT_STRIKE_DENOM,
             "b": b2,
             "total": total2,
-            "rollover": rollover,
+            "rollover": false,
             "rake_percent": RAKE_PERCENT,
             "duration": ROUND_DURATION,
             "segments": segments,
@@ -2416,17 +2491,16 @@ async fn lifecycle(s: ArcadeState) {
             Ok(_) => {
                 s.mine(1);
                 let event = feed_event(&detail);
-                if rollover {
-                    println!("arcade: round {} rolled over (jackpot grows to {})", round_no, pot);
+                let wk = winner_key.clone().unwrap_or_default();
+                if strike {
+                    println!("arcade: round {} winner {} wins {} + JACKPOT STRIKE {}", round_no, &wk[..wk.len().min(12)], round_payout, jackpot_won);
                 } else {
-                    let wk = winner_key.clone().unwrap_or_default();
-                    println!("arcade: round {} winner {} wins {}", round_no, &wk[..wk.len().min(12)], pot);
-                    *s.last_winner.lock().await = winner_key.clone();
+                    println!("arcade: round {} winner {} wins {} (jackpot now {})", round_no, &wk[..wk.len().min(12)], round_payout, jackpot_before + jackpot_cut);
                 }
+                *s.last_winner.lock().await = winner_key.clone();
                 {
                     let mut rd = s.round_details.lock().await;
                     rd.insert(round_no, detail);
-                    // keep the whole jackpot history (bounded generously to cap disk).
                     while rd.len() > 5000 {
                         if let Some(&min) = rd.keys().min() { rd.remove(&min); } else { break; }
                     }
@@ -2438,13 +2512,9 @@ async fn lifecycle(s: ArcadeState) {
                 }
                 s.persist_history().await; // survive restarts
                 s.notify();
-                // re-attribute the on-chain covenant to the new balances so the
-                // winner can withdraw their winnings (best-effort; safe no-op when
-                // it can't conserve value or members are offline).
-                if !rollover {
-                    let w = winner_key.as_deref().and_then(|h| parse_hex::<32>(h));
-                    reconcile_covenant(&s, w).await;
-                }
+                // v5: payouts are L2-native (the contract credits the winner's account).
+                // The covenant is re-attributed on a TIMER (+ before withdraw), not per
+                // round — bounds on-chain fees and stale-exit exposure. See reconcile tick.
             }
             Err(e) => eprintln!("arcade: settle failed: {}", e),
         }
@@ -2669,6 +2739,7 @@ pub async fn run_arcade(
         ln_invoices: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         auto_genesis_lock: Arc::new(tokio::sync::Mutex::new(())),
         round_quorum_at: Arc::new(tokio::sync::Mutex::new(None)),
+        last_reconcile: Arc::new(tokio::sync::Mutex::new(0)),
     };
 
     tokio::spawn(lifecycle(state.clone()));

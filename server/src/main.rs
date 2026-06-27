@@ -21,7 +21,7 @@ use std::io::BufRead;
 // Lottery v3: 2-minute rounds (timer starts at the first entry), 20%
 // per-round win odds (jackpot rolls over until someone hits), and a 1% operator
 // rake on wins. Registered on startup.
-const DEFAULT_CONTRACT: &str = "8314f710b98817f9581212f03026e21a0c309aa71773099232035d2b4b2128fd";
+const DEFAULT_CONTRACT: &str = "ab82b22b8d527f371d527edc54e6dec54355ed3615382a74a4840f2f74a47adc";
 const DEFAULT_MINE_ADDR: &str = "bcrt1q6eveccs27r8ckn76chzwz0ajhe2qje5yp8ks8t";
 
 fn main() {
